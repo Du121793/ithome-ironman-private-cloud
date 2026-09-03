@@ -1,7 +1,5 @@
 # Generated and local working data
 .day-remap-backup-*/
-html/
-source/
 
 # Operating-system and editor files
 .DS_Store

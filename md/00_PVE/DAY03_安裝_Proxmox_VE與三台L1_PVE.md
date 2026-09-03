@@ -1,5 +1,7 @@
 # Day 03｜從單機到三節點實驗環境：Proxmox VE 安裝與巢狀虛擬化
 
+對應正文：[Day 03｜從單機到三節點實驗環境：Proxmox VE 安裝與巢狀虛擬化](https://ithelp.ithome.com.tw/articles/10407253)
+
 本日一次完成實體主機的 `pve-l0`、三台 L1 PVE VM，以及 `pve01`～`pve03` 的安裝。這一天先讓所有 PVE 從現有路由器取得可用網路，OPNsense 與內部 VLAN 留到後續天數處理。
 
 ## 完成後的狀態
@@ -86,6 +88,10 @@ ip route
 cat /etc/resolv.conf
 ```
 
+![確認 pve-l0 的主機名稱、管理位址與外部連線](../../source/Day03/1786288103529-image.png)
+
+*圖（一）確認 pve-l0 的主機名稱、管理位址與外部連線。*
+
 ### 確認巢狀虛擬化
 
 在 `pve-l0` Shell 執行：
@@ -165,6 +171,10 @@ Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
 
 同樣按 `Ctrl+O`、Enter、`Ctrl+X`。
 
+![停用 Enterprise Repository，改用 No-Subscription Repository](../../source/Day03/1786288058598-image.png)
+
+*圖（二）停用 Enterprise Repository，改用 No-Subscription Repository。*
+
 ### 3.4 更新並核對來源
 
 ```bash
@@ -186,13 +196,25 @@ grep -R --line-number --no-messages 'download.proxmox.com\|enterprise.proxmox.co
 5. 勾選 `VLAN aware`，Comment 填 `L1 PVE internal VLAN trunk`。
 6. 按 `Create`，再按 `Apply Configuration`。
 
+![建立供 Lab 內部 VLAN 使用的 vmbr2](../../source/Day03/1786288165569-image.png)
+
+*圖（三）建立供 Lab 內部 VLAN 使用的 vmbr2。*
+
 `vmbr0` 繼續連現有路由器；`vmbr2` 是 Lab 內部 VLAN 10～50 的 Trunk，不直接設定 Host IP 與 Default Gateway。Day 11 若需要從 L0 管理 OPNsense，會另外建立 `vmbr2.10` VLAN 子介面，不會新增 `vmbr3`。
 
 ## 5. 上傳 PVE ISO
 
+![進入 local Storage 的 ISO Images](../../source/Day03/1786288294745-image.png)
+
+*圖（四）進入 local Storage 的 ISO Images。*
+
 1. 選 `pve-l0` → `local (pve-l0)` → `ISO Images`。
 2. 按 `Upload`，選剛下載的 PVE ISO。
 3. 等待 Task 顯示 `OK`。
+
+![上傳 Proxmox VE ISO](../../source/Day03/1786288321934-image.png)
+
+*圖（五）上傳 Proxmox VE ISO。*
 
 ## 6. 建立 pve01
 
@@ -205,9 +227,18 @@ grep -R --line-number --no-messages 'download.proxmox.com\|enterprise.proxmox.co
 7. `Memory`：填 `12288 MiB`，不要啟用 Ballooning。
 8. `Network`：Bridge 選 `vmbr0`、Model 選 `VirtIO`、VLAN Tag 留白。
 9. 在 Confirm 取消 `Start after created`，按 `Finish`。
+
+![建立 pve01 的硬體摘要](../../source/Day03/1786288349117-image.png)
+
+*圖（六）建立 pve01 的硬體摘要。圖中的 6144 MiB Memory 與 100 GiB Disk 是較早的錯誤值，應以本文的 12288 MiB 與 80 GiB 為準。*
+
 10. 選 VM 101 → `Hardware` → `Add` → `Network Device`。
 11. 第二張網卡 Bridge 選 `vmbr2`、Model 選 `VirtIO`、VLAN Tag 留白。
 12. 到 `Options` 確認 `Start at boot` 目前關閉，避免同時吃滿 Lab 記憶體。
+
+![替 pve01 加入連到 vmbr2 的第二張 VirtIO 網卡](../../source/Day03/1786288419034-image.png)
+
+*圖（七）替 pve01 加入連到 vmbr2 的第二張 VirtIO 網卡。*
 
 ## 7. 複製 VM 硬體設定
 
@@ -237,6 +268,10 @@ grep -R --line-number --no-messages 'download.proxmox.com\|enterprise.proxmox.co
 
 建立 `pve02` 與 `pve03` 後，逐台確認兩張 VirtIO NIC 的 MAC Address 都不同。
 
+![由 pve01 複製 pve03 的 VM 硬體設定](../../source/Day03/1786288474057-image.png)
+
+*圖（八）由 pve01 複製 pve03 的 VM 硬體設定。*
+
 ## 8. 安裝 pve01～pve03
 
 三台依序安裝，不要同時執行安裝器。
@@ -248,7 +283,17 @@ grep -R --line-number --no-messages 'download.proxmox.com\|enterprise.proxmox.co
 5. Management Interface 選第一張網卡，也就是連到 `vmbr0` 的 NIC。
 6. Hostname 依序輸入 `pve01.lab.home`、`pve02.lab.home`、`pve03.lab.home`。
 7. IP、Gateway、DNS 保留安裝器從現有路由器取得並自動帶入的值。
+
+![確認 pve03 的安裝摘要與管理位址](../../source/Day03/1786288532178-image.png)
+
+*圖（九）確認 pve03 的安裝摘要與管理位址。*
+
 8. 安裝完成後 Reboot；若仍從 ISO 啟動，到 `Hardware` → `CD/DVD Drive` 選 `Do not use any media`。
+
+![安裝完成後停用虛擬光碟媒體](../../source/Day03/1786288606777-image.png)
+
+*圖（十）安裝完成後停用虛擬光碟媒體。*
+
 9. 從 Console 拍下每台顯示的 Web URL。
 10. 到路由器依 VM 的 net0 MAC 建立固定租約，保留它當下取得的 IP。
 

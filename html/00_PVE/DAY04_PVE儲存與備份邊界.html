@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 04｜從一顆磁碟到共享儲存：檔案系統、RAID、ZFS、快照與備份</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 04｜從一顆磁碟到共享儲存：檔案系統、RAID、ZFS、快照與備份</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/articles/10407538">Day 04｜從一顆磁碟到共享儲存：檔案系統、RAID、ZFS、快照與備份</a></p>
+<p>本日不重裝主機，使用 Day 03 已完成的 <code>pve-l0</code> 與三台巢狀 PVE 說明 <code>local</code>、<code>local-lvm</code>、Snapshot 與 Backup 的責任差異。</p>
+<h2>1. 盤點目前儲存</h2>
+<ol>
+<li>登入 <code>pve-l0</code>。</li>
+<li>選 <code>Datacenter</code> → <code>Storage</code>，確認 <code>local</code> 與 <code>local-lvm</code>。</li>
+<li>選 <code>pve-l0</code> → <code>Disks</code> → <code>LVM-Thin</code>，確認 Thin Pool 狀態。</li>
+<li>選 VM 101 → <code>Hardware</code> → <code>Hard Disk</code>，確認磁碟位於 <code>local-lvm</code>。</li>
+<li>在 Shell 執行：</li>
+</ol>
+<pre><code class="language-bash">pvesm status
+lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
+lvs
+df -h
+</code></pre>
+<p><img src="../../source/Day04/1786288828586-image.png" alt="使用 pvesm status 查看 PVE Storage 狀態"></p>
+<p><em>圖（一）使用 pvesm status 查看 PVE Storage 狀態。</em></p>
+<p><img src="../../source/Day04/1786288828584-image.png" alt="使用 lsblk 查看實體磁碟、分割區與 LVM 結構"></p>
+<p><em>圖（二）使用 lsblk 查看實體磁碟、分割區與 LVM 結構。</em></p>
+<p><img src="../../source/Day04/1786288828594-image.png" alt="使用 lvs 與 df 確認 Logical Volume 與檔案系統用量"></p>
+<p><em>圖（三）使用 lvs 與 df 確認 Logical Volume 與檔案系統用量。</em></p>
+<h2>2. local 與 local-lvm</h2>
+<ul>
+<li><strong>儲存：local</strong><ul>
+<li>用途：ISO、Template、備份檔</li>
+<li>重點：它是檔案型儲存</li>
+</ul>
+</li>
+<li><strong>儲存：local-lvm</strong><ul>
+<li>用途：VM 虛擬磁碟</li>
+<li>重點：支援 Thin Provisioning</li>
+</ul>
+</li>
+</ul>
+<h2>3. Snapshot 實驗</h2>
+<ol>
+<li>啟動一台不重要的測試 VM。如果尚未建立一般 Linux VM，可先用 L0 VM 101 測試 Snapshot 介面。我這裡用 Debian 建立一個測試 VM 示範。</li>
+<li>選 VM → <code>Snapshots</code> → <code>Take Snapshot</code>。</li>
+</ol>
+<p><img src="../../source/Day04/1786288979232-image.png" alt="從測試 VM 建立 Snapshot"></p>
+<p><em>圖（四）從測試 VM 建立 Snapshot。</em></p>
+<ol start="3">
+<li>Name 填 <code>before-storage-demo</code>，Description 填拍攝日期與目的。</li>
+</ol>
+<p><img src="../../source/Day04/1786288996421-image.png" alt="設定 Snapshot 名稱與是否包含記憶體狀態"></p>
+<p><em>圖（五）設定 Snapshot 名稱與是否包含記憶體狀態。</em></p>
+<ol start="4">
+<li>確認 Snapshot 出現在清單中。</li>
+<li>測試 Rollback，可以先新增或修改一個測試文件，再確認 Rollback 後是否回到原本狀態。</li>
+</ol>
+<h2>4. vzdump 備份實驗</h2>
+<ol>
+<li>選 <code>Datacenter</code> → <code>Backup</code> → <code>Add</code>。</li>
+<li>Node 選目前測試節點，Storage 選 <code>local</code>。</li>
+<li>Schedule 先選錄影方便執行的時間，Selection mode 選 <code>Include selected VMs</code>。</li>
+<li>只選測試 VM。Mode 選 <code>Snapshot</code>，Compression 選 <code>ZSTD</code>。</li>
+</ol>
+<p><img src="../../source/Day04/1786289084079-image.png" alt="建立測試用 vzdump Backup Job。圖中的每 30 分鐘排程只供錄影測試"></p>
+<p><em>圖（六）建立測試用 vzdump Backup Job。圖中的每 30 分鐘排程只供錄影測試。</em></p>
+<ol start="5">
+<li>建立後選該 Job，按 <code>Run now</code>。</li>
+</ol>
+<p><img src="../../source/Day04/1786289126027-image.png" alt="手動執行剛建立的 Backup Job"></p>
+<p><em>圖（七）手動執行剛建立的 Backup Job。</em></p>
+<ol start="6">
+<li>到節點 → <code>local</code> → <code>Backups</code> 確認產生備份檔。</li>
+</ol>
+<p><img src="../../source/Day04/1786289145450-image.png" alt="確認 local Storage 已產生 vzdump 備份檔"></p>
+<p><em>圖（八）確認 local Storage 已產生 vzdump 備份檔。</em></p>
+<ol start="7">
+<li>可先在測試 VM 建立一個識別文件，再點選備份測試 <code>Restore</code>。還原時使用另一個未使用的 VMID，不要直接覆蓋原本的測試 VM。開機後確認識別文件存在。</li>
+<li>圖中的 <code>*/30</code> 是錄影用暫時排程，測試完成後停用或刪除這個 Backup Job，避免持續占用 <code>local</code> 空間。</li>
+</ol>
+<p>CLI 可使用：</p>
+<pre><code class="language-bash">vzdump 100 --storage local --mode snapshot --compress zstd
+</code></pre>
+<p>執行先確認 <code>local</code> 空間足夠。</p>
+</main></body>
+</html>

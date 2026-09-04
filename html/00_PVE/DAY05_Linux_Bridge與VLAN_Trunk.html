@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 05｜從實體網卡到虛擬機：Linux Bridge、VLAN Trunk 與 PVE 虛擬網路</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 05｜從實體網卡到虛擬機：Linux Bridge、VLAN Trunk 與 PVE 虛擬網路</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/articles/10407735">Day 05｜從實體網卡到虛擬機：Linux Bridge、VLAN Trunk 與 PVE 虛擬網路</a></p>
+<p>本日把 Day 03 建立在實體宿主機 <code>pve-l0</code> 上的 <code>vmbr0</code> 與 <code>vmbr2</code> 說清楚，在三台巢狀 PVE 裡建立承接 L2 VM 的 VLAN-aware <code>vmbr1</code>，並完成 Day 07 需要的 Ceph <code>10.77.70.0/24</code>、Corosync <code>10.77.80.0/24</code> 以及三顆空白 OSD 磁碟。今天只完成網路與磁碟前置準備，不安裝 Ceph 套件，也不建立 MON、MGR、OSD 或 Pool。注意：<code>pve-l0</code> 的 <code>vmbr2</code> 與 <code>pve01</code>～<code>pve03</code> 裡面的 <code>vmbr2</code> 名稱相同，但位於不同主機，功能也完全不同。</p>
+<ul>
+<li><strong>所在位置：L0 <code>pve-l0</code></strong><ul>
+<li>Bridge：<code>vmbr2</code></li>
+<li>Bridge port／上游：無實體 Port</li>
+<li>用途：交換 Lab 內部 VLAN Trunk 流量</li>
+</ul>
+</li>
+<li><strong>所在位置：L0 <code>pve-l0</code></strong><ul>
+<li>Bridge：<code>vmbr2.10</code></li>
+<li>Bridge port／上游：VLAN Raw Device <code>vmbr2</code></li>
+<li>用途：L0 的 VLAN 10 管理介面，<code>10.77.10.10/24</code>，無 Gateway</li>
+</ul>
+</li>
+<li><strong>所在位置：L0 <code>pve-l0</code></strong><ul>
+<li>Bridge：<code>vmbr4</code></li>
+<li>Bridge port／上游：無實體 Port</li>
+<li>用途：交換 Nested Ceph Storage 流量</li>
+</ul>
+</li>
+<li><strong>所在位置：L0 <code>pve-l0</code></strong><ul>
+<li>Bridge：<code>vmbr5</code></li>
+<li>Bridge port／上游：無實體 Port</li>
+<li>用途：交換 Nested PVE Corosync 流量</li>
+</ul>
+</li>
+<li><strong>所在位置：L1 <code>pve01</code>～<code>pve03</code></strong><ul>
+<li>Bridge：<code>vmbr1</code></li>
+<li>Bridge port／上游：第二張 VirtIO NIC，通常是 <code>ens19</code></li>
+<li>用途：L2 Guest VLAN Trunk</li>
+</ul>
+</li>
+<li><strong>所在位置：L1 <code>pve01</code>～<code>pve03</code></strong><ul>
+<li>Bridge：<code>vmbr1.10</code></li>
+<li>Bridge port／上游：VLAN Raw Device <code>vmbr1</code></li>
+<li>用途：PVE Management VLAN 10，先設 IP、不設 Gateway</li>
+</ul>
+</li>
+<li><strong>所在位置：L1 <code>pve01</code>～<code>pve03</code></strong><ul>
+<li>Bridge：<code>vmbr2</code></li>
+<li>Bridge port／上游：第三張 VirtIO NIC，通常是 <code>ens20</code></li>
+<li>用途：Ceph Storage Network</li>
+</ul>
+</li>
+<li><strong>所在位置：L1 <code>pve01</code>～<code>pve03</code></strong><ul>
+<li>Bridge：第四張 VirtIO NIC</li>
+<li>Bridge port／上游：直接設定 <code>10.77.80.11～13/24</code></li>
+<li>用途：Corosync Link 0，不設 Gateway</li>
+</ul>
+</li>
+</ul>
+<p>介面名稱只是辨識結果，實際操作必須用 MAC Address 對照，不能只看 <code>nic1</code>、<code>ens20</code> 等名稱猜測。同一張 NIC 只能成為一個 Linux Bridge 的 Port。Corosync 第四張 NIC 不加入 L1 Bridge，直接設定固定 IP。本次 pve01 的實際介面名稱是 <code>ens21</code>。</p>
+<h2>0. 防止鎖死自己的操作順序</h2>
+<p>錯誤的配置是有機會讓自己進不去管理畫面的，<del>我自己剛學時大概鎖死自己 3 次</del></p>
+<ol>
+<li>修改前保持 L0 與 L1 Console 開啟。</li>
+<li>一次只改一個 Bridge。</li>
+<li>不移除 <code>vmbr0</code> 的管理位址與實體 Port。</li>
+<li>Apply 後先驗證 Web UI，再改下一個節點。</li>
+</ol>
+<h2>1. 先確認 L0 <code>pve-l0</code> 網路</h2>
+<ol>
+<li>登入 <code>pve-l0</code> → <code>System</code> → <code>Network</code>。</li>
+<li>確認 <code>vmbr0</code> 有實際管理位址與實體 Bridge Port。</li>
+<li>確認這裡看到的是 <code>pve-l0</code> 的 <code>vmbr2</code>：沒有 IP、沒有 Gateway、<code>VLAN aware</code> 已勾選。</li>
+<li>按 <code>Create</code> → <code>Linux Bridge</code>，建立或確認 <code>pve-l0</code> 的 <code>vmbr4</code>：Bridge ports、IPv4/CIDR、Gateway 全部留白，不勾 VLAN aware，Comment 填 <code>Nested Ceph Storage Network</code>。</li>
+<li>再按 <code>Create</code> → <code>Linux Bridge</code>，建立或確認 <code>pve-l0</code> 的 <code>vmbr5</code>：Bridge ports、IPv4/CIDR、Gateway 全部留白，不勾 VLAN aware，Comment 填 <code>Nested PVE Corosync Network</code>。</li>
+<li>按 <code>Create</code> → <code>Linux VLAN</code>，建立或確認 <code>vmbr2.10</code>。</li>
+<li>Name 填 <code>vmbr2.10</code>。VLAN raw device 選 <code>vmbr2</code>。若介面依名稱自動辨識 VLAN Tag，確認結果為 <code>10</code>。</li>
+<li>IPv4/CIDR 填 <code>10.77.10.10/24</code>，IPv4 Gateway 留白，IPv6 不設定，勾選 <code>Autostart</code>，Comment 填 <code>L0 VLAN 10 management path</code>。</li>
+<li>按 <code>Create</code> → <code>Apply Configuration</code>。這個子介面只預先讓 L0 加入 VLAN 10，不會取代 <code>vmbr0</code> 的 Default Gateway。</li>
+<li>確認 <code>vmbr0</code> 的管理位址與實體 Bridge Port 沒有被修改。
+<img src="../../source/Day05/1786299645841-image.png" alt="pve-l0 的 Bridge 與 VLAN 介面"></li>
+</ol>
+<p><em>圖（一）pve-l0 的 vmbr0、內部 Trunk、Ceph 與 Corosync Bridge。</em></p>
+<ol start="11">
+<li>Shell 執行：</li>
+</ol>
+<pre><code class="language-bash">ip -br link
+ip -4 -br address
+bridge link
+bridge vlan show
+cat /etc/network/interfaces
+</code></pre>
+<p>這步驟只是再次確認網卡狀態也練習一下 CLI 命令，/etc/network/interfaces 就是 PVE 實際放置網卡配置的地方。</p>
+<h2>2. 為三台巢狀 PVE 補上 Ceph 網卡</h2>
+<p>先在 L0 依序檢查 VM 101、102、103 的 <code>Hardware</code>。如果已經有 Bridge 指向 <code>vmbr4</code> 的 <code>net2</code>，只記錄 MAC Address，缺少時才執行：</p>
+<ol>
+<li>選 VM → <code>Hardware</code> → <code>Add</code> → <code>Network Device</code>。</li>
+<li>Bridge 選 <code>vmbr4</code>。</li>
+<li>Model 選 <code>VirtIO (paravirtualized)</code>。</li>
+<li>VLAN Tag 留白，Firewall 取消勾選，Disconnect 不勾選。</li>
+<li>按 <code>Add</code>，確認新增的是 <code>net2</code>，並記下它的 MAC Address。</li>
+<li>三台完成後再逐台啟動。</li>
+</ol>
+<p>回到各 VM 的 <code>Hardware</code>，確認三張既有網卡角色：</p>
+<ul>
+<li>net0：Bridge <code>vmbr0</code>，VLAN Tag 留白，Day 03～15 負責 PVE Bootstrap、Web UI 與套件下載。Day 15 移除 Gateway 後只作同網段救援。</li>
+<li>net1：Bridge 選 L0 的 <code>vmbr2</code>，VLAN Tag 留白，承載 L2 Guest VLAN Trunk。進入 Nested PVE 後通常會顯示為 <code>ens19</code>。</li>
+<li>net2：Bridge 選 L0 的 <code>vmbr4</code>，VLAN Tag 留白，承載 Ceph Storage Network。進入 Nested PVE 後通常會顯示為 <code>ens20</code>。</li>
+</ul>
+<p>Trunk 網卡本身不要固定成 VLAN 20、30、40 或 50，否則只能承載其中一個 VLAN。Ceph 的 <code>net2</code> 也不填 VLAN Tag，因為它已經透過獨立的 L0 <code>vmbr4</code> 與其他網路隔離。
+<img src="../../source/Day05/1786299645842-image.png" alt="Nested PVE 的網卡與磁碟配置"></p>
+<p><em>圖（二）Nested PVE 的網卡與磁碟配置。圖中的 6 GiB Memory 與 100 GiB System Disk 是早期畫面，正式設定以 Day 03 的 12 GiB 與 80 GiB 為準。</em>
+<img src="../../source/Day05/1786299645843-image.png" alt="使用 MAC Address 對照 VirtIO 介面"></p>
+<p><em>圖（三）用 MAC Address 對照 Nested PVE 內的 VirtIO 介面名稱。</em></p>
+<h2>3. 在 pve01 建立 L2 Trunk Bridge</h2>
+<ol>
+<li>登入 <code>pve01</code>。</li>
+<li>選 <code>pve01</code> → <code>System</code> → <code>Network</code>。</li>
+<li>先從介面清單辨認第二張 VirtIO NIC，也就是在 L0 VM Hardware 中接到 <code>vmbr2</code> 的 <code>net1</code>。不要只憑介面名稱猜測。一般會是 <code>nic1</code>，但應以 MAC Address 為準。</li>
+<li>按 <code>Create</code> → <code>Linux Bridge</code>。</li>
+<li>Name 填 <code>vmbr1</code>。</li>
+<li>Bridge ports 選第二張、連到 L0 <code>vmbr2</code> 的 NIC。</li>
+<li>IPv4、IPv6 都選不配置，Gateway 留白。</li>
+<li>勾選 <code>VLAN aware</code>，Comment 填 <code>L2 guest VLAN trunk</code>。</li>
+<li>按 <code>Create</code> → <code>Apply Configuration</code>。</li>
+</ol>
+<p><img src="../../source/Day05/1786299645844-image.png" alt="建立 VLAN-aware vmbr1"></p>
+<p><em>圖（四）建立 vmbr1。圖中尚未勾選 VLAN aware，送出前必須勾選。</em></p>
+<ol start="10">
+<li>Console 仍保持開啟，確認管理用 <code>vmbr0</code> 沒有被修改。</li>
+</ol>
+<p>在 <code>pve02</code>、<code>pve03</code> 重複同一流程。</p>
+<h3>3.1 預先建立 PVE Management VLAN 10 子介面</h3>
+<p><code>vmbr1</code> 建立完成後，在三台 L1 PVE 先建立 <code>vmbr1.10</code>，替後續把管理入口切換到 OPNsense 鋪路。這一天只設定 IP，不修改現有 Default Gateway。</p>
+<p>先在 <code>pve01</code> 操作：</p>
+<ol>
+<li>選 <code>pve01</code> → <code>System</code> → <code>Network</code>。</li>
+<li>按 <code>Create</code> → <code>Linux VLAN</code>。</li>
+<li>Name 填 <code>vmbr1.10</code>。VLAN raw device 選 <code>vmbr1</code>。若畫面依名稱自動辨識 VLAN Tag，確認結果為 <code>10</code>。</li>
+<li>IPv4/CIDR 填 <code>10.77.10.11/24</code>。</li>
+<li>IPv4 Gateway 留白，IPv6 不設定，勾選 <code>Autostart</code>。</li>
+<li>Comment 填 <code>PVE Management VLAN 10</code>。</li>
+<li>按 <code>Create</code> → <code>Apply Configuration</code>。</li>
+<li>確認 <code>vmbr0</code> 原有的 <code>192.168.0.x</code> 位址與 Default Gateway 都沒有被修改。</li>
+</ol>
+<p><img src="../../source/Day05/1786299645845-image.png" alt="設定 Management VLAN 10 子介面"></p>
+<p><em>圖（五）此畫面拍攝於後續 Gateway 已切換的狀態；Day 05 建立時 Gateway 必須留白。</em></p>
+<p>在另外兩台重複相同步驟，只更換 IPv4/CIDR：</p>
+<ul>
+<li>pve01：<code>10.77.10.11/24</code></li>
+<li>pve02：<code>10.77.10.12/24</code></li>
+<li>pve03：<code>10.77.10.13/24</code></li>
+</ul>
+<p>三台的 <code>vmbr1.10</code> 都不填 Gateway。此時 <code>10.77.10.1</code> 尚未由 OPNsense 提供完整管理路徑，因此不要移除 <code>vmbr0</code> 的現有 Gateway。</p>
+<h2>4. 建立 Corosync 專用網路</h2>
+<h3>4.1 在 L0 為三台 Nested PVE 加入第四張網卡</h3>
+<ol>
+<li><p>依序關閉 VM 101、102、103，確認狀態顯示 <code>stopped</code>。</p>
+</li>
+<li><p>在 L0 左側選 VM 101 <code>pve01</code> → <code>Hardware</code>。</p>
+</li>
+<li><p>按 <code>Add</code> → <code>Network Device</code>。</p>
+</li>
+<li><p>依照下列方式填寫：</p>
+<ul>
+<li><strong>Bridge</strong>：<code>vmbr5</code></li>
+<li><strong>Model</strong>：<code>VirtIO (paravirtualized)</code></li>
+<li><strong>VLAN Tag</strong>：留白</li>
+<li><strong>MAC address</strong>：使用自動產生值</li>
+<li><strong>Firewall</strong>：取消勾選</li>
+<li><strong>Disconnect</strong>：不勾選</li>
+</ul>
+</li>
+<li><p>按 <code>Add</code>。回到 Hardware 後應看到新增的 <code>Network Device (net3)</code>，內容包含 <code>bridge=vmbr5</code>。</p>
+</li>
+<li><p>選取 <code>net3</code> → <code>Edit</code>，把畫面中的 MAC Address 記錄下來。後面要靠這個位址辨認 Nested PVE 裡的新介面。</p>
+</li>
+</ol>
+<p><img src="../../source/Day05/1786299882421-image.png" alt="新增 Corosync 專用網卡"></p>
+<p><em>圖（六）新增連到 vmbr5 的 Corosync 網卡。</em></p>
+<ol start="7">
+<li>在 VM 102 <code>pve02</code>、VM 103 <code>pve03</code> 重複相同步驟。三台必須使用各自自動產生的 MAC Address，不可複製成相同值。</li>
+<li>三台都完成後再逐台啟動。</li>
+</ol>
+<h3>4.2 在 Nested PVE Web UI 找出第四張 NIC</h3>
+<p>以下先以 <code>pve01</code> 為例：</p>
+<ol>
+<li><p>使用原本路由器配發並固定的 <code>192.168.0.x</code> 管理位址登入 pve01 Web UI。</p>
+</li>
+<li><p>左側選節點 <code>pve01</code>。</p>
+</li>
+<li><p>進入 <code>System</code> → <code>Network</code>。</p>
+</li>
+<li><p>清單中會多出一張尚未加入任何 Linux Bridge、也沒有 IPv4/CIDR 的 Network Device。介面名稱可能是 <code>nic2</code>、<code>ens21</code> 或其他值，不可只靠名稱判斷。</p>
+</li>
+<li><p>開啟同一節點的 <code>Shell</code> 執行，確認 MAC 位置對應的網卡：</p>
+<pre><code class="language-bash">ip -br link
+</code></pre>
+</li>
+</ol>
+<p><img src="../../source/Day05/1786299645847-image.png" alt="找出 Corosync 網卡 ens21"></p>
+<p><em>圖（七）用 MAC Address 找出本次 pve01 的第四張網卡 ens21。</em></p>
+<ol start="6">
+<li>將輸出的 MAC Address 與 L0 VM 101 <code>Hardware</code> → <code>net3</code> 記錄的 MAC 對照，找出真正連到 <code>vmbr5</code> 的第四張 NIC。</li>
+</ol>
+<h3>4.3 使用 GUI 設定 Corosync IPv4</h3>
+<p>在 <code>pve01</code> 的 <code>System</code> → <code>Network</code>：</p>
+<ol>
+<li><p>選取剛才用 MAC Address 確認的第四張 Network Device。</p>
+</li>
+<li><p>按上方 <code>Edit</code>，開啟 <code>Edit: Linux Network Device</code>。</p>
+</li>
+<li><p>依照下列方式填寫：</p>
+<ul>
+<li><strong>IPv4/CIDR</strong>：<code>10.77.80.11/24</code></li>
+<li><strong>IPv4 Gateway</strong>：留白。若畫面沒有這個欄位，不另外建立 Gateway</li>
+<li><strong>IPv6/CIDR</strong>：留白</li>
+<li><strong>IPv6 Gateway</strong>：留白</li>
+<li><strong>Autostart</strong>：勾選</li>
+<li><strong>MTU</strong>：保持預設，不自行填入 Jumbo Frame</li>
+<li><strong>Comment</strong>：<code>Corosync Link 0</code>
+<img src="../../source/Day05/1786299645848-image.png" alt="設定 Corosync Link 0 位址"></li>
+</ul>
+</li>
+</ol>
+<p><em>圖（八）替 ens21 設定 Corosync Link 0 位址並啟用 Autostart。</em></p>
+<p><code>Autostart</code> 是必要設定。這張 Corosync NIC 沒有加入 Linux Bridge。如果未勾選 Autostart，PVE 可能只保存 IPv4 設定，開機時卻不會自動啟用介面，重新啟動後也不會出現 <code>10.77.80.x</code>。勾選後，PVE 會在 <code>/etc/network/interfaces</code> 為該介面建立對應的 <code>auto</code> 設定。</p>
+<ol start="4">
+<li><p>按 <code>OK</code> 儲存。</p>
+</li>
+<li><p>Network 畫面上方 <code>Apply Configuration</code>，按下並確認套用。</p>
+</li>
+<li><p>套用後回到 Network 清單，確認該 Network Device 顯示 <code>10.77.80.11/24</code>，而 <code>vmbr0</code> 的 <code>192.168.0.x</code> 管理位址仍然存在。</p>
+</li>
+<li><p>開啟 Shell 執行 <code>ip -4 -br address</code>。如果第四張 NIC 仍顯示 <code>DOWN</code> 或沒有 <code>10.77.80.11/24</code>，先再次確認 GUI 的 Autostart 已勾選並且 Pending Changes 已套用。</p>
+</li>
+<li><p>若設定已保存但介面仍未啟用，可針對剛才以 MAC Address 確認的實際介面執行。本次 pve01 的實際介面名稱是 <code>ens21</code>：</p>
+<pre><code class="language-bash">ifup ens21
+ip -4 -br address
+</code></pre>
+</li>
+</ol>
+<p>  pve02、pve03 仍要先以 MAC Address 確認名稱。</p>
+<p>接著在另外兩台重複完全相同的 GUI 流程，只更換 IPv4/CIDR：</p>
+<ul>
+<li><strong>節點：pve01</strong><ul>
+<li>IPv4/CIDR：<code>10.77.80.11/24</code></li>
+<li>Gateway：留白</li>
+<li>Comment：<code>Corosync Link 0</code></li>
+</ul>
+</li>
+<li><strong>節點：pve02</strong><ul>
+<li>IPv4/CIDR：<code>10.77.80.12/24</code></li>
+<li>Gateway：留白</li>
+<li>Comment：<code>Corosync Link 0</code></li>
+</ul>
+</li>
+<li><strong>節點：pve03</strong><ul>
+<li>IPv4/CIDR：<code>10.77.80.13/24</code></li>
+<li>Gateway：留白</li>
+<li>Comment：<code>Corosync Link 0</code></li>
+</ul>
+</li>
+</ul>
+<p>這三個位址直接設定在第四張 VirtIO NIC 上。</p>
+<p>三台都設定完成後，在建立 Cluster 前依序重新啟動 pve01、pve02、pve03，每次只重新啟動一台。重新登入後再次確認 <code>10.77.80.11～13/24</code> 仍存在。這一步用來證明 Autostart 已生效，而不是只靠手動 <code>ip link set ... up</code> 暫時啟用。</p>
+<h3>4.4 確認沒有設定錯 Gateway</h3>
+<p>在三台 Nested PVE 各自執行：</p>
+<pre><code class="language-bash">ip -4 -br address
+ip route
+</code></pre>
+<p>檢查重點：</p>
+<ul>
+<li>第四張 NIC 有正確的 <code>10.77.80.11～13/24</code>。</li>
+<li>第四張 NIC 在重新開機後仍為 <code>UP</code>，證明 Autostart 已生效。</li>
+<li><code>10.77.80.0/24</code> 是直接連線路由。</li>
+<li>Default Route 仍指向原本路由器管理網路。</li>
+<li>不可出現 <code>default via 10.77.80.x</code>。</li>
+</ul>
+<p>最後從每台交叉 Ping 另外兩台。不要只 Ping 自己。這個網路不經現有路由器、OPNsense 或 Default Gateway。</p>
+<pre><code class="language-bash">ping -c 3 10.77.80.11
+ping -c 3 10.77.80.12
+ping -c 3 10.77.80.13
+</code></pre>
+<p>如果都正常代表配置成功。</p>
+<h2>5. 建立 Ceph Storage Network</h2>
+<p>先用 L0 記錄的 <code>net2</code> MAC Address，找出三台巢狀 PVE 內真正連到 L0 <code>vmbr4</code> 的第三張 VirtIO NIC。通常會是 <code>ens20</code>，但仍以 MAC Address 為準。</p>
+<p>在 <code>pve01</code> 操作：</p>
+<ol>
+<li>選 <code>pve01</code> → <code>System</code> → <code>Network</code>。</li>
+<li>按 <code>Create</code> → <code>Linux Bridge</code>。</li>
+<li>Name 填 <code>vmbr2</code>。</li>
+<li>Bridge ports 選剛才用 MAC Address 確認、連到 L0 <code>vmbr4</code> 的第三張 NIC。</li>
+<li>IPv4/CIDR 填 <code>10.77.70.11/24</code>。</li>
+<li>Gateway 留白，IPv6 不設定。</li>
+<li>不勾 <code>VLAN aware</code>，勾選 <code>Autostart</code>。</li>
+<li>Comment 填 <code>Ceph Storage Network</code>。</li>
+</ol>
+<p><img src="../../source/Day05/1786299657281-image.png" alt="建立 Ceph Storage Network vmbr2"></p>
+<p><em>圖（九）建立使用 ens20 的 Ceph Storage Network vmbr2。</em></p>
+<ol start="9">
+<li>按 <code>Create</code> → <code>Apply Configuration</code>，並確認管理用 <code>vmbr0</code> 沒有被修改。</li>
+</ol>
+<p>在另外兩台重複相同流程，只更換 IPv4/CIDR：</p>
+<ul>
+<li><strong>節點：pve01</strong><ul>
+<li>vmbr2 IPv4/CIDR：<code>10.77.70.11/24</code></li>
+<li>Gateway：留白</li>
+</ul>
+</li>
+<li><strong>節點：pve02</strong><ul>
+<li>vmbr2 IPv4/CIDR：<code>10.77.70.12/24</code></li>
+<li>Gateway：留白</li>
+</ul>
+</li>
+<li><strong>節點：pve03</strong><ul>
+<li>vmbr2 IPv4/CIDR：<code>10.77.70.13/24</code></li>
+<li>Gateway：留白</li>
+</ul>
+</li>
+</ul>
+<p>三台都完成後，在各節點執行：</p>
+<pre><code class="language-bash">ip -4 -br address
+ip route
+</code></pre>
+<p>檢查 <code>10.77.70.0/24</code> 是直接連線路由，Default Route 仍指向原本的管理網路，不可出現 <code>default via 10.77.70.x</code>。最後從每台交叉 Ping 另外兩台：</p>
+<pre><code class="language-bash">ping -c 3 10.77.70.11
+ping -c 3 10.77.70.12
+ping -c 3 10.77.70.13
+</code></pre>
+<p>這個網段沒有 Gateway，也不經 OPNsense，專門承載 Ceph Client、MON、OSD 與 OSD 複寫的 Lab 儲存流量。今天只是把網路準備好，尚未初始化 Ceph。</p>
+<h2>6. 為每個 Ceph 節點增加空白 OSD 磁碟</h2>
+<p>回到 L0，對 VM 101、102、103 各操作一次：</p>
+<ol>
+<li>正常關閉該巢狀 PVE，確認狀態為 <code>stopped</code>。</li>
+<li>選 VM → <code>Hardware</code> → <code>Add</code> → <code>Hard Disk</code>。</li>
+<li>Bus/Device 選尚未使用的 <code>SCSI</code> 編號。</li>
+<li>Storage 選 <code>local-lvm</code>，Disk size 填 <code>40 GiB</code>。</li>
+<li>Cache 使用 <code>No cache</code>，勾選 <code>Discard</code> 與 <code>IO thread</code>。</li>
+<li>取消勾選 <code>Backup</code>。這顆磁碟之後會成為 Ceph OSD，不應被當成一般 VM 磁碟納入 vzdump 備份。</li>
+<li>只有 L0 實體底層確實是 SSD／NVMe 時才勾 <code>SSD emulation</code>（需要先勾選 <code>Advanced</code>）。</li>
+<li>按 <code>Add</code>，再啟動該節點。</li>
+</ol>
+<p><img src="../../source/Day05/1786299663720-image.png" alt="新增 40 GiB Ceph OSD 磁碟"></p>
+<p><em>圖（十）新增 40 GiB OSD 磁碟；圖中 Backup 仍為勾選狀態，送出前必須取消。</em></p>
+<p>三台開機後各自執行：</p>
+<pre><code class="language-bash">lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL
+</code></pre>
+<p>每台應看到一顆約 40 GiB、沒有 FSTYPE 與 Mountpoint 的額外磁碟。整顆空白磁碟留到 Day 07 建立 Ceph OSD。</p>
+<h2>7. 說明後續封包路徑（本步驟不操作）</h2>
+<p>Day 05 到這裡已完成 Bridge、Corosync、Ceph 網路與空白磁碟的前置準備，但不建立一般服務 VM。之後一般 VM 的 NIC 才會接在 L1 <code>vmbr1</code>，並在 VM Hardware 的 Network Device 填 VLAN Tag：</p>
+<ul>
+<li><strong>類型：Service</strong><ul>
+<li>VLAN Tag：20</li>
+<li>範例 VM：proxy01、proxy02、app01、app02</li>
+</ul>
+</li>
+<li><strong>類型：Database</strong><ul>
+<li>VLAN Tag：30</li>
+<li>範例 VM：pg01、pg02、pg03</li>
+</ul>
+</li>
+<li><strong>類型：Backup</strong><ul>
+<li>VLAN Tag：40</li>
+<li>範例 VM：backup01</li>
+</ul>
+</li>
+<li><strong>類型：Bastion DMZ</strong><ul>
+<li>VLAN Tag：50</li>
+<li>範例 VM：jump01</li>
+</ul>
+</li>
+</ul>
+<p>看不懂沒關係，後續防火牆章節會再次解釋。</p>
+</main></body>
+</html>

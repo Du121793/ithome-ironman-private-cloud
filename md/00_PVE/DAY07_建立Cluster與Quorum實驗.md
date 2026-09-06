@@ -1,6 +1,6 @@
 # Day 07｜三台 PVE 如何組成叢集：Corosync、法定票數與 Ceph 共享儲存
 
-對應文章：[Day 07｜三台 PVE 如何組成叢集：Corosync、法定票數與 Ceph 共享儲存](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 07｜三台 PVE 如何組成叢集：Corosync、法定票數與 Ceph 共享儲存](https://ithelp.ithome.com.tw/articles/10407987)
 
 ## 建立前檢查
 
@@ -87,6 +87,8 @@ ping -c 3 10.77.80.13
 
 ![在 pve01 建立 iron-lab Cluster](../../source/Day07/1786295170674-image.png)
 
+*圖（一）在 pve01 建立 iron-lab Cluster。*
+
 Shell 驗證：
 
 ```bash
@@ -118,6 +120,8 @@ pvecm status
 
 ![將 pve03 加入 Cluster，完成三節點配置](../../source/Day07/1786295388507-image.png)
 
+*圖（二）將 pve03 加入 Cluster，完成三節點配置。*
+
 ```bash
 pvecm nodes
 pvecm status
@@ -133,6 +137,8 @@ corosync-cfgtool -s
 
 ![關閉 pve03 後，Cluster 仍保有 Quorum](../../source/Day07/1786295618518-image.png)
 
+*圖（三）關閉 pve03 後，Cluster 仍保有 Quorum。*
+
 ## 7. 再關閉一個節點
 
 在 L0 將 VM 102 Shutdown：
@@ -140,6 +146,8 @@ corosync-cfgtool -s
 1. pve01 執行 `pvecm status`，確認 Total votes 1、Quorate No。
 
 ![再關閉 pve02 後，Cluster 失去 Quorum](../../source/Day07/1786295672217-image.png)
+
+*圖（四）再關閉 pve02 後，Cluster 失去 Quorum。*
 
 ```bash
 pvecm status
@@ -167,6 +175,8 @@ ceph --version
 
 ![安裝 Ceph 19.2 Squid 套件](../../source/Day07/1786296033998-image.png)
 
+*圖（五）安裝 Ceph 19.2 Squid 套件。*
+
 確認版本與 Repository：
 
 ```bash
@@ -191,6 +201,8 @@ pveceph init --network 10.77.70.0/24 --cluster-network 10.77.70.0/24
 
 ![初始化 Ceph Cluster](../../source/Day07/1786296049296-image.png)
 
+*圖（六）初始化 Ceph Cluster。*
+
 ## 11. 建立 MON 與 MGR
 
 三台節點各執行：
@@ -209,6 +221,8 @@ Web UI 確認狀態：
 
 ![確認 Ceph MON 與 MGR 狀態](../../source/Day07/1786296176508-image.png)
 
+*圖（七）確認 Ceph MON 與 MGR 狀態。*
+
 ```bash
 ceph -s
 ceph mon dump
@@ -224,6 +238,8 @@ ceph mgr dump
 3. 按 `Create`。
 
 ![建立 Ceph OSD](../../source/Day07/1786296256143-image.png)
+
+*圖（八）建立 Ceph OSD。*
 
 設定 Lab 記憶體限制：
 
@@ -241,6 +257,8 @@ ceph -s
 4. 按 `Create`。
 
 ![建立 ceph-vm Pool](../../source/Day07/1786296573630-image.png)
+
+*圖（九）建立 ceph-vm Pool。*
 
 確認 Application：
 
@@ -260,6 +278,15 @@ pvesm status
 ceph df
 ```
 
+建立 CephFS 前再確認三個 OSD、Ceph 與 PVE Storage 狀態：
+
+```bash
+ceph -s
+ceph osd tree
+ceph df
+pvesm status
+```
+
 ## 14. 建立 5GiB CephFS 共用 ISO
 
 ### 14.1 建立 MDS
@@ -270,6 +297,8 @@ pve01、pve02 執行：
 2. 確認 Node，按 `Create`。
 
 ![建立 CephFS Metadata Server](../../source/Day07/1786296808809-image.png)
+
+*圖（十）建立 CephFS Metadata Server。*
 
 ```bash
 pveceph mds create
@@ -284,6 +313,8 @@ ceph mds stat
 4. 勾選 `Add as Storage`，按 `Create`。
 
 ![建立 CephFS 並加入 PVE Storage](../../source/Day07/1786296932006-image.png)
+
+*圖（十一）建立 CephFS 並加入 PVE Storage。*
 
 ```bash
 ceph fs ls

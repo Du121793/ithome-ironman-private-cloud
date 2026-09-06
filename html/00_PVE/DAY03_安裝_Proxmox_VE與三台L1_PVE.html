@@ -43,7 +43,7 @@
 </li>
 </ul>
 <p><code>pve-l0</code>、<code>pve01</code>、<code>pve02</code>、<code>pve03</code> 的管理網路都先接現有路由器 LAN。安裝器顯示的 IP、Prefix、Gateway 與 DNS 以 DHCP 實際帶入的內容為準，安裝完成後再到路由器依 MAC Address 建立固定租約。</p>
-<p>這是 OPNsense 尚未建立時的 Bootstrap 設定，不是 30 天結束時的長期安全狀態。Day 15 會在不修改 Corosync 與 Ceph 的前提下，將 pve01～pve03 的 Default Gateway 與 DNS 切到 OPNsense Management VLAN 10；本節已錄製的安裝流程不需要重做。</p>
+<p>這是 OPNsense 尚未建立時的 Bootstrap 設定，不是 30 天結束時的長期安全狀態。Day 15 會在不修改 Corosync 與 Ceph 的前提下，將 pve01～pve03 的 Default Gateway 與 DNS 切到 OPNsense Management VLAN 10。</p>
 <h2>1. 下載安裝媒體</h2>
 <ol>
 <li>開啟 Proxmox VE ISO 頁面：<a href="https://www.proxmox.com/en/downloads/proxmox-virtual-environment/iso">https://www.proxmox.com/en/downloads/proxmox-virtual-environment/iso</a>。</li>
@@ -52,7 +52,7 @@
 <li>插入至少 8 GB USB，選擇 ISO 後按 <code>START</code>。</li>
 <li>Rufus 詢問寫入模式時先使用建議值；完成後安全退出 USB。</li>
 </ol>
-<p>錄影前可在 Windows PowerShell 驗證檔案：</p>
+<p>下載後可在 Windows PowerShell 驗證檔案：</p>
 <pre><code class="language-powershell">Get-FileHash .\proxmox-ve_9.2-1.iso -Algorithm SHA256
 </code></pre>
 <p>官方 9.2-1 ISO SHA256：</p>
@@ -157,7 +157,7 @@ apt policy pve-manager ceph-common
 grep -R --line-number --no-messages &#39;download.proxmox.com\|enterprise.proxmox.com&#39; /etc/apt/sources.list /etc/apt/sources.list.d/
 </code></pre>
 <p><code>apt update</code> 不應再出現 Enterprise Repository 的 <code>401 Unauthorized</code>，也不能同時混入其他 Debian 版本或不同 Ceph 大版本的來源。確認後再到 <code>Updates</code> 按 <code>Refresh</code>、<code>Upgrade</code>。</p>
-<p><code>pve-l0</code> 加入兩個來源是為了保留完整錄製環境；真正安裝 Ceph Daemon 的節點是後續 Cluster 內的 <code>pve01</code>～<code>pve03</code>。這是示範環境設定，正式環境應依支援與更新策略使用 Enterprise Repository。</p>
+<p><code>pve-l0</code> 加入兩個來源是為了讓整套 Lab 使用一致的套件來源；真正安裝 Ceph Daemon 的節點是後續 Cluster 內的 <code>pve01</code>～<code>pve03</code>。這是示範環境設定，正式環境應依支援與更新策略使用 Enterprise Repository。</p>
 <h2>4. 建立內部 Trunk Bridge</h2>
 <ol>
 <li>選 <code>pve-l0</code> → <code>System</code> → <code>Network</code>。</li>
@@ -202,7 +202,7 @@ grep -R --line-number --no-messages &#39;download.proxmox.com\|enterprise.proxmo
 <p><img src="../../source/Day03/1786288419034-image.png" alt="替 pve01 加入連到 vmbr2 的第二張 VirtIO 網卡"></p>
 <p><em>圖（七）替 pve01 加入連到 vmbr2 的第二張 VirtIO 網卡。</em></p>
 <h2>7. 複製 VM 硬體設定</h2>
-<p>為了錄影清楚，可以逐台建立；若使用 Clone，也要改正 VMID、名稱與 MAC Address。</p>
+<p>可以逐台建立；若使用 Clone，也要改正 VMID、名稱與 MAC Address。</p>
 <ul>
 <li><strong>VMID：101</strong><ul>
 <li>Name：pve01</li>
@@ -269,7 +269,7 @@ grep -R --line-number --no-messages &#39;download.proxmox.com\|enterprise.proxmo
 <li>確認 net0 可到現有路由器，net1 尚未設定 IP。</li>
 </ol>
 <h2>10. 部署紀錄</h2>
-<p>安裝完成後填入實際值，不要把錄影電腦的 IP 當成 PVE IP：</p>
+<p>安裝完成後填入實際值，不要把管理電腦的 IP 當成 PVE IP：</p>
 <ul>
 <li><strong>主機：pve-l0</strong><ul>
 <li>FQDN：pve-l0.lab.home</li>
@@ -299,14 +299,6 @@ grep -R --line-number --no-messages &#39;download.proxmox.com\|enterprise.proxmo
 <li>Web UI 已登入：[ ]</li>
 </ul>
 </li>
-</ul>
-<h2>錄影收尾畫面</h2>
-<ul>
-<li><input disabled="" type="checkbox"> L0 Datacenter 中看得到 VM 101、102、103。</li>
-<li><input disabled="" type="checkbox"> 四台 PVE 都能透過路由器配發並保留的管理 IP 開啟 Web UI。</li>
-<li><input disabled="" type="checkbox"> 三台 L1 PVE 的 VMID、Hostname 與 FQDN 正確。</li>
-<li><input disabled="" type="checkbox"> 在 L0 檢查每台 L1 PVE VM：<code>net0</code> 接到 L0 <code>vmbr0</code>，<code>net1</code> 接到 L0 <code>vmbr2</code>；這裡的 <code>vmbr2</code> 是 <code>pve-l0</code> 上的 Trunk Bridge，不是 L1 PVE 內部的 Ceph <code>vmbr2</code>。</li>
-<li><input disabled="" type="checkbox"> 已說明單一實體主機只能模擬三節點，不能當成正式硬體 HA 證明。</li>
 </ul>
 </main></body>
 </html>

@@ -140,7 +140,7 @@ Trunk 網卡本身不要固定成 VLAN 20、30、40 或 50，否則只能承載�
 ![設定 Management VLAN 10 子介面](../../source/Day05/1786299645845-image.png)
 
 
-*圖（五）此畫面拍攝於後續 Gateway 已切換的狀態；Day 05 建立時 Gateway 必須留白。*
+*圖（五）此圖來自後續 Gateway 已切換的狀態；Day 05 建立時 Gateway 必須留白。*
 
 
 在另外兩台重複相同步驟，只更換 IPv4/CIDR：

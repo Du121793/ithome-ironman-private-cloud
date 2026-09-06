@@ -55,7 +55,7 @@ df -h
 <p><img src="../../source/Day04/1786288979232-image.png" alt="從測試 VM 建立 Snapshot"></p>
 <p><em>圖（四）從測試 VM 建立 Snapshot。</em></p>
 <ol start="3">
-<li>Name 填 <code>before-storage-demo</code>，Description 填拍攝日期與目的。</li>
+<li>Name 填 <code>before-storage-demo</code>，Description 填測試日期與目的。</li>
 </ol>
 <p><img src="../../source/Day04/1786288996421-image.png" alt="設定 Snapshot 名稱與是否包含記憶體狀態"></p>
 <p><em>圖（五）設定 Snapshot 名稱與是否包含記憶體狀態。</em></p>
@@ -67,11 +67,11 @@ df -h
 <ol>
 <li>選 <code>Datacenter</code> → <code>Backup</code> → <code>Add</code>。</li>
 <li>Node 選目前測試節點，Storage 選 <code>local</code>。</li>
-<li>Schedule 先選錄影方便執行的時間，Selection mode 選 <code>Include selected VMs</code>。</li>
+<li>Schedule 先選方便立即測試的時間，Selection mode 選 <code>Include selected VMs</code>。</li>
 <li>只選測試 VM。Mode 選 <code>Snapshot</code>，Compression 選 <code>ZSTD</code>。</li>
 </ol>
-<p><img src="../../source/Day04/1786289084079-image.png" alt="建立測試用 vzdump Backup Job。圖中的每 30 分鐘排程只供錄影測試"></p>
-<p><em>圖（六）建立測試用 vzdump Backup Job。圖中的每 30 分鐘排程只供錄影測試。</em></p>
+<p><img src="../../source/Day04/1786289084079-image.png" alt="建立測試用 vzdump Backup Job。圖中的每 30 分鐘排程只供本次測試"></p>
+<p><em>圖（六）建立測試用 vzdump Backup Job。圖中的每 30 分鐘排程只供本次測試。</em></p>
 <ol start="5">
 <li>建立後選該 Job，按 <code>Run now</code>。</li>
 </ol>
@@ -84,7 +84,7 @@ df -h
 <p><em>圖（八）確認 local Storage 已產生 vzdump 備份檔。</em></p>
 <ol start="7">
 <li>可先在測試 VM 建立一個識別文件，再點選備份測試 <code>Restore</code>。還原時使用另一個未使用的 VMID，不要直接覆蓋原本的測試 VM。開機後確認識別文件存在。</li>
-<li>圖中的 <code>*/30</code> 是錄影用暫時排程，測試完成後停用或刪除這個 Backup Job，避免持續占用 <code>local</code> 空間。</li>
+<li>圖中的 <code>*/30</code> 是測試用暫時排程，測試完成後停用或刪除這個 Backup Job，避免持續占用 <code>local</code> 空間。</li>
 </ol>
 <p>CLI 可使用：</p>
 <pre><code class="language-bash">vzdump 100 --storage local --mode snapshot --compress zstd

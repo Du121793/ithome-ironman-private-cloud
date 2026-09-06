@@ -1,9 +1,19 @@
 <!doctype html>
-<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Day 07｜三台 PVE 如何組成叢集：Corosync、法定票數與 Ceph 共享儲存</title><style>
-:root{--orange:#f47b20;--ink:#30343b;--line:#e6e8eb}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:#fff;font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}main{width:min(940px,calc(100% - 40px));margin:auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35}h2{margin-top:42px;padding-bottom:10px;border-bottom:1px solid var(--line)}h3{margin-top:30px}a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2}code{padding:.15em .35em;border-radius:4px;background:#f4f5f6;color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}table{width:100%;border-collapse:collapse;margin:22px 0}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
-</style></head><body><main><h1>Day 07｜三台 PVE 如何組成叢集：Corosync、法定票數與 Ceph 共享儲存</h1>
-<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 07｜三台 PVE 如何組成叢集：Corosync、法定票數與 Ceph 共享儲存</a></p>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 07｜三台 PVE 如何組成叢集：Corosync、法定票數與 Ceph 共享儲存</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 07｜三台 PVE 如何組成叢集：Corosync、法定票數與 Ceph 共享儲存</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/articles/10407987">Day 07｜三台 PVE 如何組成叢集：Corosync、法定票數與 Ceph 共享儲存</a></p>
 <h2>建立前檢查</h2>
 <ul>
 <li>Hostname 分別是 <code>pve01</code>、<code>pve02</code>、<code>pve03</code>，FQDN 位於 <code>lab.home</code>。</li>
@@ -65,6 +75,7 @@ ping -c 3 10.77.80.13
 <li>選 <code>Join Information</code>，複製資訊。</li>
 </ol>
 <p><img src="../../source/Day07/1786295170674-image.png" alt="在 pve01 建立 iron-lab Cluster"></p>
+<p><em>圖（一）在 pve01 建立 iron-lab Cluster。</em></p>
 <p>Shell 驗證：</p>
 <pre><code class="language-bash">pvecm status
 pvecm nodes
@@ -90,6 +101,7 @@ pvecm status
 <li>回 pve01 確認三個 Node 皆出現。</li>
 </ol>
 <p><img src="../../source/Day07/1786295388507-image.png" alt="將 pve03 加入 Cluster，完成三節點配置"></p>
+<p><em>圖（二）將 pve03 加入 Cluster，完成三節點配置。</em></p>
 <pre><code class="language-bash">pvecm nodes
 pvecm status
 corosync-cfgtool -s
@@ -101,12 +113,14 @@ corosync-cfgtool -s
 <li>pve01 執行 <code>pvecm status</code>，確認 Total votes 2、Quorate Yes。</li>
 </ol>
 <p><img src="../../source/Day07/1786295618518-image.png" alt="關閉 pve03 後，Cluster 仍保有 Quorum"></p>
+<p><em>圖（三）關閉 pve03 後，Cluster 仍保有 Quorum。</em></p>
 <h2>7. 再關閉一個節點</h2>
 <p>在 L0 將 VM 102 Shutdown：</p>
 <ol>
 <li>pve01 執行 <code>pvecm status</code>，確認 Total votes 1、Quorate No。</li>
 </ol>
 <p><img src="../../source/Day07/1786295672217-image.png" alt="再關閉 pve02 後，Cluster 失去 Quorum"></p>
+<p><em>圖（四）再關閉 pve02 後，Cluster 失去 Quorum。</em></p>
 <pre><code class="language-bash">pvecm status
 pvecm nodes
 journalctl -u corosync -n 80 --no-pager
@@ -125,6 +139,7 @@ ceph --version
 </code></pre>
 <p>確認為 <code>Ceph 19.2 Squid</code> 後輸入 <code>y</code>。</p>
 <p><img src="../../source/Day07/1786296033998-image.png" alt="安裝 Ceph 19.2 Squid 套件"></p>
+<p><em>圖（五）安裝 Ceph 19.2 Squid 套件。</em></p>
 <p>確認版本與 Repository：</p>
 <pre><code class="language-bash">apt policy ceph-common ceph-osd ceph-mon
 </code></pre>
@@ -138,6 +153,7 @@ apt-cache policy ceph-common ceph-base ceph-mon ceph-osd
 <pre><code class="language-bash">pveceph init --network 10.77.70.0/24 --cluster-network 10.77.70.0/24
 </code></pre>
 <p><img src="../../source/Day07/1786296049296-image.png" alt="初始化 Ceph Cluster"></p>
+<p><em>圖（六）初始化 Ceph Cluster。</em></p>
 <h2>11. 建立 MON 與 MGR</h2>
 <p>三台節點各執行：</p>
 <pre><code class="language-bash">pveceph mon create
@@ -147,6 +163,7 @@ apt-cache policy ceph-common ceph-base ceph-mon ceph-osd
 </code></pre>
 <p>Web UI 確認狀態：</p>
 <p><img src="../../source/Day07/1786296176508-image.png" alt="確認 Ceph MON 與 MGR 狀態"></p>
+<p><em>圖（七）確認 Ceph MON 與 MGR 狀態。</em></p>
 <pre><code class="language-bash">ceph -s
 ceph mon dump
 ceph mgr dump
@@ -159,6 +176,7 @@ ceph mgr dump
 <li>按 <code>Create</code>。</li>
 </ol>
 <p><img src="../../source/Day07/1786296256143-image.png" alt="建立 Ceph OSD"></p>
+<p><em>圖（八）建立 Ceph OSD。</em></p>
 <p>設定 Lab 記憶體限制：</p>
 <pre><code class="language-bash">ceph config set osd osd_memory_target 2147483648
 ceph config get osd osd_memory_target
@@ -172,6 +190,7 @@ ceph -s
 <li>按 <code>Create</code>。</li>
 </ol>
 <p><img src="../../source/Day07/1786296573630-image.png" alt="建立 ceph-vm Pool"></p>
+<p><em>圖（九）建立 ceph-vm Pool。</em></p>
 <p>確認 Application：</p>
 <pre><code class="language-bash">ceph osd pool application get ceph-vm
 </code></pre>
@@ -182,6 +201,12 @@ ceph -s
 pvesm status
 ceph df
 </code></pre>
+<p>建立 CephFS 前再確認三個 OSD、Ceph 與 PVE Storage 狀態：</p>
+<pre><code class="language-bash">ceph -s
+ceph osd tree
+ceph df
+pvesm status
+</code></pre>
 <h2>14. 建立 5GiB CephFS 共用 ISO</h2>
 <h3>14.1 建立 MDS</h3>
 <p>pve01、pve02 執行：</p>
@@ -190,6 +215,7 @@ ceph df
 <li>確認 Node，按 <code>Create</code>。</li>
 </ol>
 <p><img src="../../source/Day07/1786296808809-image.png" alt="建立 CephFS Metadata Server"></p>
+<p><em>圖（十）建立 CephFS Metadata Server。</em></p>
 <pre><code class="language-bash">pveceph mds create
 ceph mds stat
 </code></pre>
@@ -201,6 +227,7 @@ ceph mds stat
 <li>勾選 <code>Add as Storage</code>，按 <code>Create</code>。</li>
 </ol>
 <p><img src="../../source/Day07/1786296932006-image.png" alt="建立 CephFS 並加入 PVE Storage"></p>
+<p><em>圖（十一）建立 CephFS 並加入 PVE Storage。</em></p>
 <pre><code class="language-bash">ceph fs ls
 ceph fs status cephfs
 ceph mds stat
@@ -252,4 +279,5 @@ ceph df
 df -h /mnt/pve/cephfs
 find /mnt/pve/cephfs/template/iso -maxdepth 1 -type f -printf &#39;%f %s bytes\n&#39;
 </code></pre>
-</main></body></html>
+</main></body>
+</html>

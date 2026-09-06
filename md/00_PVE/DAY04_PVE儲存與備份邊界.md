@@ -48,7 +48,7 @@ df -h
 
 *圖（四）從測試 VM 建立 Snapshot。*
 
-3. Name 填 `before-storage-demo`，Description 填拍攝日期與目的。
+3. Name 填 `before-storage-demo`，Description 填測試日期與目的。
 
 ![設定 Snapshot 名稱與是否包含記憶體狀態](../../source/Day04/1786288996421-image.png)
 
@@ -61,12 +61,12 @@ df -h
 
 1. 選 `Datacenter` → `Backup` → `Add`。
 2. Node 選目前測試節點，Storage 選 `local`。
-3. Schedule 先選錄影方便執行的時間，Selection mode 選 `Include selected VMs`。
+3. Schedule 先選方便立即測試的時間，Selection mode 選 `Include selected VMs`。
 4. 只選測試 VM。Mode 選 `Snapshot`，Compression 選 `ZSTD`。
 
-![建立測試用 vzdump Backup Job。圖中的每 30 分鐘排程只供錄影測試](../../source/Day04/1786289084079-image.png)
+![建立測試用 vzdump Backup Job。圖中的每 30 分鐘排程只供本次測試](../../source/Day04/1786289084079-image.png)
 
-*圖（六）建立測試用 vzdump Backup Job。圖中的每 30 分鐘排程只供錄影測試。*
+*圖（六）建立測試用 vzdump Backup Job。圖中的每 30 分鐘排程只供本次測試。*
 
 5. 建立後選該 Job，按 `Run now`。
 
@@ -81,7 +81,7 @@ df -h
 *圖（八）確認 local Storage 已產生 vzdump 備份檔。*
 
 7. 可先在測試 VM 建立一個識別文件，再點選備份測試 `Restore`。還原時使用另一個未使用的 VMID，不要直接覆蓋原本的測試 VM。開機後確認識別文件存在。
-8. 圖中的 `*/30` 是錄影用暫時排程，測試完成後停用或刪除這個 Backup Job，避免持續占用 `local` 空間。
+8. 圖中的 `*/30` 是測試用暫時排程，測試完成後停用或刪除這個 Backup Job，避免持續占用 `local` 空間。
 
 CLI 可使用：
 

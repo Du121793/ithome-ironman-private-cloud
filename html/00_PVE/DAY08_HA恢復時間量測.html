@@ -1,0 +1,632 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 08 額外實作｜PVE Migration、HA Recovery 與 Ceph Recovery 時間量測</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 08 額外實作｜PVE Migration、HA Recovery 與 Ceph Recovery 時間量測</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 08｜節點故障後 VM 如何接手：Proxmox VE 遷移、HA 隔離與恢復時間量測</a></p>
+<h2>0. 測試前的停止條件</h2>
+<p>出現以下任一情況時不要注入故障：</p>
+<ul>
+<li><code>pvecm status</code> 不是三票且沒有 Quorum。</li>
+<li><code>ceph -s</code> 不是 <code>HEALTH_OK</code>。</li>
+<li>三個 OSD 沒有全部顯示 <code>up</code>、<code>in</code>。</li>
+<li>測試 VM 的任何必要磁碟仍位於 <code>local-lvm</code>。</li>
+<li>HA Resource 已經進入 Error，或 Request State 不是 <code>started</code>。</li>
+<li>另一台 Nested PVE、MON 或 OSD 已經離線。</li>
+<li>無法確定測試 VM 目前位於哪個節點。</li>
+<li>測試 VM 內含不能丟失的重要資料。</li>
+</ul>
+<p>測試過程一次只停止一台 Nested PVE，不使用 <code>pvecm expected 1</code> 改寫投票門檻，也不在 HA Recovery 期間手動啟動同一台測試 VM。</p>
+<h2>1. 準備四個操作畫面</h2>
+<p>在瀏覽器開啟四個分頁或四個獨立視窗：</p>
+<ol>
+<li><strong>L0 管理畫面</strong>：登入 <code>pve-l0</code>，稍後用來停止與恢復 Nested PVE。</li>
+<li><strong>Cluster 管理畫面</strong>：登入不會在本次測試中停止的 pve01、pve02 或 pve03。</li>
+<li><strong>L0 Probe Shell</strong>：在 <code>pve-l0</code> 開啟 <code>Shell</code>，持續 Ping 測試 VM。</li>
+<li><strong>Cluster 觀察 Shell</strong>：在存活的 Nested PVE 開啟 <code>Shell</code>，記錄 HA 與 Ceph 狀態。</li>
+</ol>
+<p>Cluster 管理畫面不能登入即將停止的節點，否則故障發生後 Web UI 會一起中斷。每次進行節點故障測試前，都要先重新確認測試 VM 的所在節點，再選另一台存活節點作為 Cluster 管理入口。</p>
+<h2>2. 確認測試 VM 與基準狀態</h2>
+<h3>2.1 從 Web UI 找出測試 VM 所在節點</h3>
+<p>在 Cluster 管理畫面依序操作：</p>
+<ol>
+<li>點選左側 <code>Datacenter</code>。</li>
+<li>點選 <code>HA</code>。</li>
+<li>開啟 <code>Status</code>。</li>
+<li>找到 <code>vm:903</code>。</li>
+<li>記錄目前節點與狀態；狀態必須是 <code>started</code>。</li>
+</ol>
+<p>如果實際使用的測試 VM 不是 VMID 903，從這一步開始將所有 <code>903</code> 改成自己的 VMID。</p>
+<h3>2.2 從 Nested PVE Shell 交叉確認</h3>
+<p>在任一正常的 Nested PVE 開啟 <code>Shell</code>，執行：</p>
+<pre><code class="language-bash">TEST_VMID=903
+
+pvecm status
+ha-manager config
+ha-manager status
+qm config &quot;$TEST_VMID&quot; |
+  grep -E &#39;^(cpu|net[0-9]+|scsi[0-9]+|virtio[0-9]+|sata[0-9]+|ide[0-9]+|efidisk[0-9]+|tpmstate[0-9]+):&#39;
+ceph -s
+ceph pg stat
+</code></pre>
+<p>預期結果：</p>
+<ul>
+<li><code>pvecm status</code> 顯示 <code>Quorate: Yes</code>，三個節點都有一票。</li>
+<li><code>ha-manager status</code> 顯示 <code>vm:903</code> 為 <code>started</code>，並列出目前節點。</li>
+<li>測試 VM 的系統磁碟、Cloud-Init Drive，以及存在時的 EFI／TPM Disk 都位於 <code>ceph-vm</code>。</li>
+<li><code>ceph -s</code> 顯示 <code>HEALTH_OK</code>，三個 OSD 都是 <code>up</code>、<code>in</code>。</li>
+<li><code>ceph pg stat</code> 顯示全部 PG 為 <code>active+clean</code>。</li>
+</ul>
+<p>若 <code>ha-manager config</code> 沒有 <code>vm:903</code>，先回到原本的 Day 08 實作文件完成 HA Resource 與 Affinity Rule，不要在量測途中臨時補建。</p>
+<h3>2.3 找出測試 VM 的 IPv4 位址</h3>
+<p>在 Cluster Web UI：</p>
+<ol>
+<li>從左側選取 VM 903。</li>
+<li>點選 <code>Summary</code>。</li>
+<li>在 <code>IP Addresses</code> 確認測試 VM 接在 <code>vmbr0</code> 的 IPv4 位址是 <code>192.168.0.169</code>。</li>
+<li>不要使用 <code>127.0.0.1</code>、IPv6 Link-local 位址或 Nested PVE 本身的管理位址。</li>
+</ol>
+<p>如果 Summary 沒有顯示位址，從 VM Console 登入後執行：</p>
+<pre><code class="language-bash">ip -4 -br address
+</code></pre>
+<p>本文後續命令固定使用 <code>192.168.0.169</code>。如果 VM 內看到其他位址，先修正 DHCP Reservation 或 VM 網路設定，不要在量測過程中混用不同位址。</p>
+<h3>2.4 從 L0 確認 Probe 路徑</h3>
+<p>在 <code>pve-l0</code> 的 Probe Shell 執行：</p>
+<pre><code class="language-bash">ping -n -c 5 192.168.0.169
+</code></pre>
+<p>五次都能收到回覆才繼續。測試 VM 由 DHCP 取得位址時，Migration 不會改變它的虛擬網卡 MAC Address，通常會繼續使用同一筆租約；仍應以這一步實際看到的位址為準。</p>
+<h3>2.5 確認各主機時間可以互相比對</h3>
+<p>在 L0 與任一正常 Nested PVE 分別執行：</p>
+<pre><code class="language-bash">date --iso-8601=ns
+timedatectl show \
+  -p NTPSynchronized \
+  -p Timezone \
+  -p LocalRTC
+</code></pre>
+<p>兩邊時間應一致，<code>NTPSynchronized=yes</code>，<code>LocalRTC=no</code>。若時間不同步，先回到 Day 07 的 Chrony 檢查流程；不要用彼此不一致的時間戳計算恢復時間。</p>
+<h2>3. 將測試 VM 放到固定起點</h2>
+<p>後續使用固定路徑：Live Migration 從 pve01 到 pve02，Relocate 從 pve02 到 pve03，最後停止承載測試 VM 的 pve03。這樣每個節點、VMID 與目標位置都是確定值。</p>
+<p>在 pve01 Shell 完整執行：</p>
+<pre><code class="language-bash">mkdir -p /root/day08-ha-measurement
+rm -f \
+  /root/day08-ha-measurement/live-migrate-status.log \
+  /root/day08-ha-measurement/live-migrate-requested.txt \
+  /root/day08-ha-measurement/live-migrate-completed.txt
+
+pvecm status
+ceph -s
+ha-manager status
+
+ha-manager relocate vm:903 pve01
+
+while true; do
+  CURRENT_STATUS=&quot;$(ha-manager status | grep &#39;service vm:903&#39;)&quot;
+  date --iso-8601=ns
+  printf &#39;%s\n&#39; &quot;$CURRENT_STATUS&quot;
+
+  if printf &#39;%s\n&#39; &quot;$CURRENT_STATUS&quot; |
+    grep -qE &#39;service vm:903 \(pve01, started\)&#39;; then
+    break
+  fi
+
+  sleep 1
+done
+
+ping -n -c 5 192.168.0.169
+</code></pre>
+<p>如果 VM 原本就在 pve01，<code>ha-manager relocate</code> 可能回覆不需要移動；只要後面顯示 <code>service vm:903 (pve01, started)</code> 且五次 Ping 全部成功，即可繼續。</p>
+<h2>4. 測量 Live Migration 中斷時間</h2>
+<h3>4.1 在 L0 啟動獨立 Probe</h3>
+<p>在 <code>pve-l0</code> Shell 完整執行：</p>
+<pre><code class="language-bash">mkdir -p /root/day08-ha-measurement
+rm -f /root/day08-ha-measurement/live-migrate-ping.log
+
+stdbuf -oL ping \
+  -n \
+  -D \
+  -O \
+  -i 0.2 \
+  192.168.0.169 2&gt;&amp;1 |
+  tee /root/day08-ha-measurement/live-migrate-ping.log
+</code></pre>
+<p>畫面持續出現 <code>bytes from 192.168.0.169</code> 後，保持這個 Probe 運作。</p>
+<h3>4.2 在 pve01 觸發移動並計時</h3>
+<p>在 pve01 的另一個 Shell 完整執行：</p>
+<pre><code class="language-bash">mkdir -p /root/day08-ha-measurement
+rm -f \
+  /root/day08-ha-measurement/live-migrate-status.log \
+  /root/day08-ha-measurement/live-migrate-requested.txt \
+  /root/day08-ha-measurement/live-migrate-completed.txt
+
+date --iso-8601=ns |
+  tee /root/day08-ha-measurement/live-migrate-requested.txt
+
+ha-manager migrate vm:903 pve02
+
+while true; do
+  CURRENT_TIME=&quot;$(date --iso-8601=ns)&quot;
+  CURRENT_STATUS=&quot;$(ha-manager status | grep &#39;service vm:903&#39;)&quot;
+  printf &#39;%s %s\n&#39; &quot;$CURRENT_TIME&quot; &quot;$CURRENT_STATUS&quot; |
+    tee -a /root/day08-ha-measurement/live-migrate-status.log
+
+  if printf &#39;%s\n&#39; &quot;$CURRENT_STATUS&quot; |
+    grep -qE &#39;service vm:903 \(pve02, started\)&#39;; then
+    date --iso-8601=ns |
+      tee /root/day08-ha-measurement/live-migrate-completed.txt
+    break
+  fi
+
+  sleep 1
+done
+</code></pre>
+<p>回到 L0 Probe Shell，確認 Ping 已連續正常至少 10 秒，按 <code>Ctrl+C</code> 停止。</p>
+<h3>4.3 直接計算 Live Migration 的 Ping 中斷</h3>
+<p>在 <code>pve-l0</code> Shell 完整執行：</p>
+<pre><code class="language-bash">awk &#39;
+  function timestamp(raw) {
+    gsub(/^\[/, &quot;&quot;, raw)
+    gsub(/\]$/, &quot;&quot;, raw)
+    return raw + 0
+  }
+
+  /no answer yet/ &amp;&amp; !in_gap {
+    in_gap=1
+    gap_start=timestamp($1)
+    next
+  }
+
+  /bytes from/ &amp;&amp; in_gap {
+    gap_end=timestamp($1)
+    gap=gap_end-gap_start
+    gap_count++
+    printf &quot;gap_%d start=%.6f end=%.6f duration=%.3f_seconds\n&quot;, \
+      gap_count, gap_start, gap_end, gap
+
+    if (gap &gt; max_gap) {
+      max_gap=gap
+    }
+
+    in_gap=0
+  }
+
+  END {
+    if (gap_count == 0) {
+      print &quot;result=no_observed_ping_gap&quot;
+    } else {
+      printf &quot;result=max_observed_gap duration=%.3f_seconds\n&quot;, max_gap
+    }
+  }
+&#39; /root/day08-ha-measurement/live-migrate-ping.log
+</code></pre>
+<p><code>result=no_observed_ping_gap</code> 表示在 0.2 秒 Probe 間隔內沒有觀察到中斷，不代表絕對零停機。出現一個以上的 Gap 時，最後一行就是本次實驗觀察到的最長中斷。</p>
+<p>本次實測得到 <code>result=max_observed_gap duration=0.228_seconds</code>。</p>
+<p><img src="../../source/Day08/day08-fig21.jpg" alt="Live Migration Ping 中斷量測結果"></p>
+<p><em>圖（一）Live Migration Ping 中斷量測結果。</em></p>
+<h2>5. 測量 Relocate 中斷時間</h2>
+<h3>5.1 在 L0 啟動新的 Probe</h3>
+<p>在 <code>pve-l0</code> Shell 完整執行：</p>
+<pre><code class="language-bash">rm -f /root/day08-ha-measurement/relocate-ping.log
+
+stdbuf -oL ping \
+  -n \
+  -D \
+  -O \
+  -i 0.2 \
+  192.168.0.169 2&gt;&amp;1 |
+  tee /root/day08-ha-measurement/relocate-ping.log
+</code></pre>
+<p>畫面持續出現 <code>bytes from 192.168.0.169</code> 後，保持 Probe 運作。</p>
+<h3>5.2 在 pve01 觸發 Relocate</h3>
+<p>第 4 節完成後，VM 903 應位於 pve02。在 pve01 Shell 完整執行：</p>
+<pre><code class="language-bash">rm -f \
+  /root/day08-ha-measurement/relocate-status.log \
+  /root/day08-ha-measurement/relocate-requested.txt \
+  /root/day08-ha-measurement/relocate-completed.txt
+
+ha-manager status |
+  grep &#39;service vm:903&#39;
+
+date --iso-8601=ns |
+  tee /root/day08-ha-measurement/relocate-requested.txt
+
+ha-manager relocate vm:903 pve03
+
+while true; do
+  CURRENT_TIME=&quot;$(date --iso-8601=ns)&quot;
+  CURRENT_STATUS=&quot;$(ha-manager status | grep &#39;service vm:903&#39;)&quot;
+  printf &#39;%s %s\n&#39; &quot;$CURRENT_TIME&quot; &quot;$CURRENT_STATUS&quot; |
+    tee -a /root/day08-ha-measurement/relocate-status.log
+
+  if printf &#39;%s\n&#39; &quot;$CURRENT_STATUS&quot; |
+    grep -qE &#39;service vm:903 \(pve03, started\)&#39;; then
+    date --iso-8601=ns |
+      tee /root/day08-ha-measurement/relocate-completed.txt
+    break
+  fi
+
+  sleep 1
+done
+</code></pre>
+<p>回到 L0 Probe Shell，確認 Ping 已連續正常至少 10 秒，按 <code>Ctrl+C</code>。</p>
+<h3>5.3 直接計算 Relocate 的 Ping 中斷</h3>
+<p>在 <code>pve-l0</code> Shell 完整執行：</p>
+<pre><code class="language-bash">awk &#39;
+  function timestamp(raw) {
+    gsub(/^\[/, &quot;&quot;, raw)
+    gsub(/\]$/, &quot;&quot;, raw)
+    return raw + 0
+  }
+
+  /no answer yet/ &amp;&amp; !in_gap {
+    in_gap=1
+    gap_start=timestamp($1)
+    next
+  }
+
+  /bytes from/ &amp;&amp; in_gap {
+    gap_end=timestamp($1)
+    gap=gap_end-gap_start
+    gap_count++
+    printf &quot;gap_%d start=%.6f end=%.6f duration=%.3f_seconds\n&quot;, \
+      gap_count, gap_start, gap_end, gap
+
+    if (gap &gt; max_gap) {
+      max_gap=gap
+    }
+
+    in_gap=0
+  }
+
+  END {
+    if (gap_count == 0) {
+      print &quot;result=no_observed_ping_gap&quot;
+    } else {
+      printf &quot;result=max_observed_gap duration=%.3f_seconds\n&quot;, max_gap
+    }
+  }
+&#39; /root/day08-ha-measurement/relocate-ping.log
+</code></pre>
+<p>這個結果包含 VM 停止、在 pve03 重新啟動與 Guest 網路恢復的時間，不是 Live Migration。</p>
+<p>本次實測得到 <code>result=max_observed_gap duration=33.041_seconds</code>。</p>
+<p><img src="../../source/Day08/day08-fig22.jpg" alt="Relocate Ping 中斷量測結果"></p>
+<p><em>圖（二）Relocate Ping 中斷量測結果。</em></p>
+<h2>6. 測量 pve03 故障後的 HA Recovery</h2>
+<p>第 5 節完成後，VM 903 固定位於 pve03，因此本節要在 L0 停止的是 VMID 103。</p>
+<h3>6.1 在 pve01 確認可以安全測試</h3>
+<p>在 pve01 Shell 完整執行：</p>
+<pre><code class="language-bash">pvecm status
+ceph -s
+ceph pg stat
+ha-manager status |
+  grep &#39;service vm:903&#39;
+</code></pre>
+<p>只有同時看到 <code>Quorate: Yes</code>、<code>HEALTH_OK</code>、全部 PG 為 <code>active+clean</code> 與 <code>service vm:903 (pve03, started)</code> 時才繼續。</p>
+<h3>6.2 在 L0 啟動 HA Recovery Probe</h3>
+<p>在 <code>pve-l0</code> Shell 完整執行：</p>
+<pre><code class="language-bash">rm -f /root/day08-ha-measurement/ha-recovery-ping.log
+
+stdbuf -oL ping \
+  -n \
+  -D \
+  -O \
+  -i 0.2 \
+  192.168.0.169 2&gt;&amp;1 |
+  tee /root/day08-ha-measurement/ha-recovery-ping.log
+</code></pre>
+<p>看到連續回覆後，保持 Probe 運作。</p>
+<h3>6.3 在 pve01 記錄 HA 與 Ceph 狀態</h3>
+<p>在 pve01 的另一個 Shell 完整執行：</p>
+<pre><code class="language-bash">mkdir -p /root/day08-ha-measurement
+rm -f \
+  /root/day08-ha-measurement/ha-recovery-status.log \
+  /root/day08-ha-measurement/ceph-recovery-status.log
+
+while true; do
+  CURRENT_EPOCH=&quot;$(date +%s.%N)&quot;
+  CURRENT_TIME=&quot;$(date --iso-8601=ns)&quot;
+  HA_STATUS=&quot;$(ha-manager status | grep &#39;service vm:903&#39;)&quot;
+  CEPH_HEALTH=&quot;$(ceph health)&quot;
+  CEPH_PG=&quot;$(ceph pg stat)&quot;
+
+  printf &#39;%s|%s|%s\n&#39; &quot;$CURRENT_EPOCH&quot; &quot;$CURRENT_TIME&quot; &quot;$HA_STATUS&quot; |
+    tee -a /root/day08-ha-measurement/ha-recovery-status.log
+  printf &#39;%s|%s|%s|%s\n&#39; \
+    &quot;$CURRENT_EPOCH&quot; &quot;$CURRENT_TIME&quot; &quot;$CEPH_HEALTH&quot; &quot;$CEPH_PG&quot; |
+    tee -a /root/day08-ha-measurement/ceph-recovery-status.log
+
+  sleep 1
+done
+</code></pre>
+<p>先看到 VM 位於 pve03、Ceph 為 <code>HEALTH_OK</code> 後，保持這個紀錄命令運作。</p>
+<h3>6.4 在 L0 停止 pve03</h3>
+<p>在 <code>pve-l0</code> 的另一個 Shell 完整執行：</p>
+<pre><code class="language-bash">mkdir -p /root/day08-ha-measurement
+
+qm config 103 |
+  grep &#39;^name:&#39;
+qm status 103
+
+date +%s.%N |
+  tee /root/day08-ha-measurement/ha-fault-injected.epoch
+date --iso-8601=ns |
+  tee /root/day08-ha-measurement/ha-fault-injected.iso
+
+qm stop 103
+qm status 103
+</code></pre>
+<p>執行前，<code>qm config 103</code> 必須顯示 <code>name: pve03</code>，<code>qm status 103</code> 必須先顯示 <code>running</code>；停止後必須顯示 <code>stopped</code>。</p>
+<h3>6.5 等待 VM 自動恢復</h3>
+<p>不要手動啟動 VM 903。在 pve01 的另一個 Shell 完整執行：</p>
+<pre><code class="language-bash">while true; do
+  CURRENT_TIME=&quot;$(date --iso-8601=ns)&quot;
+  CURRENT_STATUS=&quot;$(ha-manager status | grep &#39;service vm:903&#39;)&quot;
+  printf &#39;%s %s\n&#39; &quot;$CURRENT_TIME&quot; &quot;$CURRENT_STATUS&quot;
+
+  if printf &#39;%s\n&#39; &quot;$CURRENT_STATUS&quot; |
+    grep -qE &#39;service vm:903 \(pve0[12], started\)&#39;; then
+    break
+  fi
+
+  sleep 1
+done
+</code></pre>
+<p>同時觀察 L0 Probe。Ping 恢復後繼續等待 10 秒，再按 <code>Ctrl+C</code>。pve01 上第 6.3 節的 HA／Ceph 紀錄仍要繼續運作。</p>
+<h3>6.6 直接計算 HA Recovery 的網路中斷</h3>
+<p>在 <code>pve-l0</code> Shell 完整執行：</p>
+<pre><code class="language-bash">awk &#39;
+  function timestamp(raw) {
+    gsub(/^\[/, &quot;&quot;, raw)
+    gsub(/\]$/, &quot;&quot;, raw)
+    return raw + 0
+  }
+
+  /no answer yet/ &amp;&amp; !in_gap {
+    in_gap=1
+    gap_start=timestamp($1)
+    next
+  }
+
+  /bytes from/ &amp;&amp; in_gap {
+    gap_end=timestamp($1)
+    gap=gap_end-gap_start
+    gap_count++
+    printf &quot;gap_%d start=%.6f end=%.6f duration=%.3f_seconds\n&quot;, \
+      gap_count, gap_start, gap_end, gap
+
+    if (gap &gt; max_gap) {
+      max_gap=gap
+    }
+
+    in_gap=0
+  }
+
+  END {
+    if (gap_count == 0) {
+      print &quot;result=no_observed_ping_gap&quot;
+    } else {
+      printf &quot;result=max_observed_gap duration=%.3f_seconds\n&quot;, max_gap
+    }
+  }
+&#39; /root/day08-ha-measurement/ha-recovery-ping.log
+</code></pre>
+<p>這個結果是從第一次確定沒收到 Ping 回覆，到 VM 在存活節點重新回覆的可觀察中斷。</p>
+<h3>6.7 計算從故障注入到第一次 Ping 恢復</h3>
+<p>同樣在 <code>pve-l0</code> Shell 完整執行：</p>
+<pre><code class="language-bash">FAULT_EPOCH=&quot;$(cat /root/day08-ha-measurement/ha-fault-injected.epoch)&quot;
+
+RECOVERY_EPOCH=&quot;$(awk -v fault=&quot;$FAULT_EPOCH&quot; &#39;
+  function timestamp(raw) {
+    gsub(/^\[/, &quot;&quot;, raw)
+    gsub(/\]$/, &quot;&quot;, raw)
+    return raw + 0
+  }
+
+  /no answer yet/ {
+    current=timestamp($1)
+    if (current &gt;= fault) {
+      saw_failure=1
+    }
+    next
+  }
+
+  /bytes from/ &amp;&amp; saw_failure {
+    current=timestamp($1)
+    if (current &gt;= fault) {
+      printf &quot;%.9f\n&quot;, current
+      exit
+    }
+  }
+&#39; /root/day08-ha-measurement/ha-recovery-ping.log)&quot;
+
+printf &#39;fault_epoch=%s\n&#39; &quot;$FAULT_EPOCH&quot;
+printf &#39;first_recovered_reply_epoch=%s\n&#39; &quot;$RECOVERY_EPOCH&quot;
+
+if [ -z &quot;$RECOVERY_EPOCH&quot; ]; then
+  echo &#39;ERROR: no recovered Ping reply found after fault injection&#39;
+else
+  awk \
+    -v start=&quot;$FAULT_EPOCH&quot; \
+    -v finish=&quot;$RECOVERY_EPOCH&quot; \
+    &#39;BEGIN {
+      printf &quot;fault_to_first_recovered_reply=%.3f_seconds\n&quot;, finish-start
+    }&#39;
+fi
+</code></pre>
+<p>這個數字包含 HA 偵測節點故障、Fencing／重新指派、VM 啟動與 Guest 網路恢復。</p>
+<p>本次從關閉 pve03 到 VM 首次恢復 Ping 共 223.006 秒；從第一筆未回覆到首次恢復回覆的可觀察中斷為 222.170 秒。正文採用前者，因為它以明確的故障注入時間為起點。</p>
+<p><img src="../../source/Day08/day08-fig23.jpg" alt="HA Recovery 從故障注入到 Ping 恢復的量測結果"></p>
+<p><em>圖（三）HA Recovery 從故障注入到 Ping 恢復的量測結果。</em></p>
+<h2>7. 恢復 pve03 並測量 Ceph 恢復時間</h2>
+<h3>7.1 在 L0 啟動 pve03 並記錄時間</h3>
+<p>在 <code>pve-l0</code> Shell 完整執行：</p>
+<pre><code class="language-bash">date +%s.%N |
+  tee /root/day08-ha-measurement/pve03-started.epoch
+date --iso-8601=ns |
+  tee /root/day08-ha-measurement/pve03-started.iso
+
+qm start 103
+qm status 103
+
+cat /root/day08-ha-measurement/pve03-started.epoch
+cat /root/day08-ha-measurement/pve03-started.iso
+</code></pre>
+<p>保留畫面中的 <code>pve03-started.epoch</code> 數值，第 7.3 節會直接用它計算。</p>
+<h3>7.2 在 pve01 等到 Ceph 完整恢復</h3>
+<p>第 6.3 節的記錄 Shell 繼續運作。在 pve01 另開一個 Shell，每秒自動檢查是否已完整恢復：</p>
+<pre><code class="language-bash">while true; do
+  CURRENT_TIME=&quot;$(date --iso-8601=ns)&quot;
+  CEPH_HEALTH=&quot;$(ceph health)&quot;
+  CEPH_PG=&quot;$(ceph pg stat)&quot;
+
+  printf &#39;%s %s %s\n&#39; \
+    &quot;$CURRENT_TIME&quot; &quot;$CEPH_HEALTH&quot; &quot;$CEPH_PG&quot;
+
+  if [ &quot;$CEPH_HEALTH&quot; = &#39;HEALTH_OK&#39; ] &amp;&amp;
+    printf &#39;%s\n&#39; &quot;$CEPH_PG&quot; |
+      grep -q &#39;active+clean&#39;; then
+    break
+  fi
+
+  sleep 1
+done
+</code></pre>
+<p>命令自動結束後，在第 6.3 節的紀錄 Shell 按 <code>Ctrl+C</code>。然後在 pve01 執行完整驗證：</p>
+<pre><code class="language-bash">pvecm status
+ceph -s
+ceph pg stat
+ceph mon stat
+ceph osd tree
+ha-manager status |
+  grep &#39;service vm:903&#39;
+</code></pre>
+<p>必須看到三個 PVE 節點恢復 Quorum、三個 MON 在 Quorum、三個 OSD 全部 <code>up/in</code>、<code>HEALTH_OK</code>、全部 PG 為 <code>active+clean</code>，且 VM 903 維持 <code>started</code>。</p>
+<h3>7.3 計算 pve03 啟動到 Ceph 恢復的時間</h3>
+<p><code>pve03-started.epoch</code> 在 L0，Ceph 的每筆觀察時間已寫入 pve01 的 <code>ceph-recovery-status.log</code>。在 pve01 執行下列完整命令，只將第一行右側的數字替換為 L0 剛才顯示的 <code>pve03-started.epoch</code>：</p>
+<pre><code class="language-bash">PVE03_START_EPOCH=&#39;1788600000.000000000&#39;
+
+CEPH_OK_RECORD=&quot;$(awk \
+  -F &#39;|&#39; \
+  -v start=&quot;$PVE03_START_EPOCH&quot; \
+  &#39;$1 &gt;= start &amp;&amp; $3 == &quot;HEALTH_OK&quot; &amp;&amp; $4 ~ /active\+clean/ {
+    print
+    exit
+  }&#39; /root/day08-ha-measurement/ceph-recovery-status.log)&quot;
+
+CEPH_OK_EPOCH=&quot;$(printf &#39;%s\n&#39; &quot;$CEPH_OK_RECORD&quot; | cut -d &#39;|&#39; -f 1)&quot;
+CEPH_OK_TIME=&quot;$(printf &#39;%s\n&#39; &quot;$CEPH_OK_RECORD&quot; | cut -d &#39;|&#39; -f 2)&quot;
+
+printf &#39;pve03_start_epoch=%s\n&#39; &quot;$PVE03_START_EPOCH&quot;
+printf &#39;first_healthy_observation=%s\n&#39; &quot;$CEPH_OK_TIME&quot;
+printf &#39;ceph_active_clean_epoch=%s\n&#39; &quot;$CEPH_OK_EPOCH&quot;
+
+if [ -z &quot;$CEPH_OK_EPOCH&quot; ]; then
+  echo &#39;ERROR: no HEALTH_OK and active+clean record found after pve03 start&#39;
+else
+  awk \
+    -v start=&quot;$PVE03_START_EPOCH&quot; \
+    -v finish=&quot;$CEPH_OK_EPOCH&quot; \
+    &#39;BEGIN {
+      printf &quot;pve03_start_to_ceph_active_clean=%.3f_seconds\n&quot;, finish-start
+    }&#39;
+fi
+</code></pre>
+<p>兩台主機必須已通過 NTP 同步，這個跨主機時間差才可以使用。</p>
+<p>本次從啟動 pve03 到 Ceph 同時符合 <code>HEALTH_OK</code> 與全部 PG 為 <code>active+clean</code>，共 53.756 秒。PG 在 43.790 秒時已全部回到 <code>active+clean</code>，其後仍短暫存在 pve03 的時鐘偏差告警，因此完整健康時間採用 53.756 秒。</p>
+<p><img src="../../source/Day08/day08-fig24.jpg" alt="Ceph 從 pve03 啟動到恢復健康的量測結果"></p>
+<p><em>圖（四）Ceph 從 pve03 啟動到恢復健康的量測結果。</em></p>
+<h2>8. 最後完整驗證</h2>
+<p>在 pve01 完整執行：</p>
+<pre><code class="language-bash">pvecm status
+
+ceph -s
+ceph pg stat
+ceph osd tree
+
+ha-manager config
+ha-manager status
+
+ping -n -c 5 192.168.0.169
+</code></pre>
+<p>在 <code>pve-l0</code> 完整執行：</p>
+<pre><code class="language-bash">qm status 101
+qm status 102
+qm status 103
+
+grep -H -E \
+  &#39;packets transmitted|packet loss&#39; \
+  /root/day08-ha-measurement/*-ping.log
+</code></pre>
+<p>最後整理四個實測數字：</p>
+<table>
+<thead>
+<tr>
+<th>欄位</th>
+<th>實測值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Live Migration 最長可觀察 Ping 中斷</td>
+<td>0.228 秒</td>
+</tr>
+<tr>
+<td>Relocate 最長可觀察 Ping 中斷</td>
+<td>33.041 秒</td>
+</tr>
+<tr>
+<td>停止 pve03 到 VM 第一次恢復回覆</td>
+<td>223.006 秒</td>
+</tr>
+<tr>
+<td>啟動 pve03 到 Ceph 回到完整健康</td>
+<td>53.756 秒</td>
+</tr>
+</tbody></table>
+<p>Live Migration／Relocate 的 Ping 中斷、故障注入到 VM 回覆，以及 Ceph 完整恢復是不同指標，不要相加成單一數字。</p>
+<h2>9. 測試失敗時如何安全收尾</h2>
+<p>如果 VM 長時間沒有在其他節點恢復：</p>
+<ol>
+<li>不要停止第二台 Nested PVE。</li>
+<li>不要執行 <code>pvecm expected 1</code>。</li>
+<li>不要手動複製或移動 <code>/etc/pve/nodes/.../qemu-server/903.conf</code>。</li>
+<li>先在 L0 恢復 VMID 103，也就是 pve03。</li>
+<li>等待 Cluster 回到三票 Quorum。</li>
+<li>等待 Ceph 回到 <code>HEALTH_OK</code> 與 <code>active+clean</code>。</li>
+<li>再保存以下診斷資料：</li>
+</ol>
+<p>在 <code>pve-l0</code> Shell 完整執行：</p>
+<pre><code class="language-bash">qm config 103 |
+  grep &#39;^name:&#39;
+qm status 103
+
+qm start 103
+qm status 103
+</code></pre>
+<p><code>qm config 103</code> 必須顯示 <code>name: pve03</code>。如果 pve03 本來就已經是 <code>running</code>，不要再執行第二次 Start。</p>
+<p>在 pve01 Shell 等待節點重新加入，然後完整執行：</p>
+<pre><code class="language-bash">pvecm status
+ha-manager status
+ceph -s
+ceph pg stat
+
+journalctl \
+  -u pve-ha-crm \
+  -u pve-ha-lrm \
+  --since &#39;-30 min&#39; \
+  -o short-iso-precise \
+  --no-pager
+</code></pre>
+<p>完成診斷前不要再次注入故障。</p>
+<h2>小結</h2>
+<p>本額外實作詳細測量了在 Nested PVE 環境下 HA Migration 與 Recovery 的真實中斷時間。數據顯示 Live Migration 的中斷極短，而節點非預期失效後的 HA Recovery 則需要數分鐘才能完全恢復虛擬機與 Ceph 儲存的健康狀態。此基準可作為後續調優或架構設計的參考。</p>
+</main></body>
+</html>

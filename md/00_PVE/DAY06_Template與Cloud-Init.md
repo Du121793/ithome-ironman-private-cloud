@@ -17,6 +17,8 @@
 
 ![下載 Debian Cloud Image](../../source/Day06/1786293441877-image.png)
 
+*圖（一）下載 Debian Cloud Image。*
+
 Cloud Image 不是安裝 ISO，所以不從 `ISO Images` 上傳。檔案只暫存在節點目錄，匯入完成並驗證後即可移除。
 
 ## 2. 建立 Template VM 9001
@@ -33,6 +35,8 @@ Cloud Image 不是安裝 ISO，所以不從 `ISO Images` 上傳。檔案只暫�
 
 ![建立 Template VM 9001](../../source/Day06/1786293604736-image.png)
 
+*圖（二）建立 Template VM 9001。*
+
 建立完成後先到 VM 9001 → `Hardware` 檢查。如果仍有精靈建立的空白 `Hard Disk (scsi0)`（通常是 32 GiB），先選取它按 `Detach`，再選取出現的 `Unused Disk` 按 `Remove` 並確認刪除。這一步只刪除剛建立、尚未寫入資料的空白磁碟；若不是全新的 VM 9001，不可照做。必須先移除預設空白磁碟，才能避免稍後把它誤認成 Debian Cloud Image。
 
 ## 3. 匯入 Cloud Image
@@ -46,6 +50,8 @@ qm disk import 9001 /var/lib/vz/template/debian-cloud.qcow2 local-lvm
 
 ![匯入 Debian Cloud Image](../../source/Day06/1786293917309-image.png)
 
+*圖（三）匯入 Debian Cloud Image。*
+
 指令完成時必須看到成功匯入為 `unused0` 的訊息。若 Web UI 沒有出現新的 `Unused Disk`，不要開機，先執行 `qm config 9001` 與 `pvesm list local-lvm --vmid 9001` 確認；一顆沒有分割區的 32 GiB 預設空白磁碟不是 Debian Cloud Image。
 
 接著回到 Web UI：
@@ -55,22 +61,32 @@ qm disk import 9001 /var/lib/vz/template/debian-cloud.qcow2 local-lvm
 
 ![加入 Unused Disk 為 SCSI 0](../../source/Day06/1786293962134-image.png)
 
+*圖（四）加入 Unused Disk 為 SCSI 0。*
+
 3. 如果 `Hardware` 仍有建立 VM 時自動產生的空白 `CD/DVD Drive (ide2)`，選取它並按 `Remove`。即使建立 VM 時選了 `Do not use any media`，PVE 仍可能保留一個空白光碟裝置並占用 `ide2`。
 4. `Add` → `CloudInit Drive`，Storage 選 `local-lvm`，Bus/Device 選 `IDE 2`。不要選 `SCSI 0`；`scsi0` 必須保留給上一步掛載的 Debian 系統磁碟。
 
 ![新增 CloudInit Drive](../../source/Day06/1786294021765-image.png)
 
+*圖（五）新增 CloudInit Drive。*
+
 5. 若要保留後續測試 Serial Console 的能力，可用 `Add` → `Serial Port`，Port 填 `0`。GUI 會建立 `serial0`；底層設定顯示為 `serial0: socket`。本步驟可以保留裝置，但首次開機不強制使用它。
 
 ![新增 Serial Port 0](../../source/Day06/1786294174829-image.png)
+
+*圖（六）新增 Serial Port 0。*
 
 6. 到 `Options` → `Boot Order`，只啟用 `scsi0`，並放在第一順位。
 
 ![調整 Boot Order](../../source/Day06/1786294174831-image.png)
 
+*圖（七）調整 Boot Order。*
+
 7. `Hardware` → `Display` 保持 `Default`，首次開機使用一般 Console。不要先改成 `Serial terminal 0`；如果畫面只停在 `Starting serial terminal on interface serial0`，代表 PVE 已連上序列埠，但 Guest 沒有輸出到該介面，改回 `Default` 即可看到正常開機畫面。
 
 ![Console 選單](../../source/Day06/1786294174830-image.png)
+
+*圖（八）Console 選單。*
 
 開機前再次確認 `Hardware`：Debian Cloud Image 應顯示為 `Hard Disk (scsi0)`，CloudInit Drive 應顯示為 `CloudInit Drive (ide2)`。如果看到 `Boot failed: not a bootable disk`，通常是 CloudInit Drive 誤占 `scsi0`，或匯入的 Debian 磁碟仍停在 `Unused Disk`；先關機並修正磁碟位置，不要反覆重啟。
 
@@ -86,6 +102,8 @@ qm disk import 9001 /var/lib/vz/template/debian-cloud.qcow2 local-lvm
 6. 按 `Regenerate Image`。
 
 ![設定 Cloud-Init 基線參數](../../source/Day06/1786294529970-image.png)
+
+*圖（九）設定 Cloud-Init 基線參數。*
 
 首次開機前到 `pve01` Shell 驗證：
 
@@ -121,7 +139,9 @@ sudo cloud-init status --wait
 
 ![驗證 Cloud-Init 狀態](../../source/Day06/1786294627614-image.png)
 
-3. 確認 Guest Agent 與 Cloud-Init 正常後，先保留錄影素材。
+*圖（十）驗證 Cloud-Init 狀態。*
+
+3. 確認 Guest Agent 與 Cloud-Init 正常後。
 4. 確認 VM 9001 沒有使用者資料，再清除 Cloud-Init 狀態與 Machine ID：
 
 ```bash
@@ -131,6 +151,8 @@ sudo shutdown -h now
 
 ![清除 Cloud-Init 與 Machine ID](../../source/Day06/1786294656976-image.png)
 
+*圖（十一）清除 Cloud-Init 與 Machine ID。*
+
 ## 6. 轉成 Template 並建立測試 VM
 
 1. 確認 VM 9001 已完全關機。
@@ -139,6 +161,8 @@ sudo shutdown -h now
 4. Mode 選 `Full Clone`，VM ID 填 `902`，Name 填 `cloudinit-test01`。
 
 ![從 Template 建立 Full Clone VM](../../source/Day06/1786294713909-image.png)
+
+*圖（十二）從 Template 建立 Full Clone VM。*
 
 5. 測試 Clone 暫時保留 `vmbr0`，再到 `Cloud-Init` 設定 User、SSH Key、Hostname 與 DHCP，使用現有路由器驗證首次開機。
 6. 按 `Regenerate Image` 後啟動。
@@ -152,6 +176,8 @@ systemctl status qemu-guest-agent --no-pager
 ```
 
 ![驗證 Clone VM 初始化結果](../../source/Day06/1786294770705-image.png)
+
+*圖（十三）驗證 Clone VM 初始化結果。*
 
 ## 7. 後續服務 VM 的 VMID
 

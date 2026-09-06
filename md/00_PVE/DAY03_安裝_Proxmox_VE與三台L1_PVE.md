@@ -25,7 +25,7 @@
 
 `pve-l0`、`pve01`、`pve02`、`pve03` 的管理網路都先接現有路由器 LAN。安裝器顯示的 IP、Prefix、Gateway 與 DNS 以 DHCP 實際帶入的內容為準，安裝完成後再到路由器依 MAC Address 建立固定租約。
 
-這是 OPNsense 尚未建立時的 Bootstrap 設定，不是 30 天結束時的長期安全狀態。Day 15 會在不修改 Corosync 與 Ceph 的前提下，將 pve01～pve03 的 Default Gateway 與 DNS 切到 OPNsense Management VLAN 10；本節已錄製的安裝流程不需要重做。
+這是 OPNsense 尚未建立時的 Bootstrap 設定，不是 30 天結束時的長期安全狀態。Day 15 會在不修改 Corosync 與 Ceph 的前提下，將 pve01～pve03 的 Default Gateway 與 DNS 切到 OPNsense Management VLAN 10。
 
 ## 1. 下載安裝媒體
 
@@ -35,7 +35,7 @@
 4. 插入至少 8 GB USB，選擇 ISO 後按 `START`。
 5. Rufus 詢問寫入模式時先使用建議值；完成後安全退出 USB。
 
-錄影前可在 Windows PowerShell 驗證檔案：
+下載後可在 Windows PowerShell 驗證檔案：
 
 ```powershell
 Get-FileHash .\proxmox-ve_9.2-1.iso -Algorithm SHA256
@@ -185,7 +185,7 @@ grep -R --line-number --no-messages 'download.proxmox.com\|enterprise.proxmox.co
 
 `apt update` 不應再出現 Enterprise Repository 的 `401 Unauthorized`，也不能同時混入其他 Debian 版本或不同 Ceph 大版本的來源。確認後再到 `Updates` 按 `Refresh`、`Upgrade`。
 
-`pve-l0` 加入兩個來源是為了保留完整錄製環境；真正安裝 Ceph Daemon 的節點是後續 Cluster 內的 `pve01`～`pve03`。這是示範環境設定，正式環境應依支援與更新策略使用 Enterprise Repository。
+`pve-l0` 加入兩個來源是為了讓整套 Lab 使用一致的套件來源；真正安裝 Ceph Daemon 的節點是後續 Cluster 內的 `pve01`～`pve03`。這是示範環境設定，正式環境應依支援與更新策略使用 Enterprise Repository。
 
 ## 4. 建立內部 Trunk Bridge
 
@@ -242,7 +242,7 @@ grep -R --line-number --no-messages 'download.proxmox.com\|enterprise.proxmox.co
 
 ## 7. 複製 VM 硬體設定
 
-為了錄影清楚，可以逐台建立；若使用 Clone，也要改正 VMID、名稱與 MAC Address。
+可以逐台建立；若使用 Clone，也要改正 VMID、名稱與 MAC Address。
 
 - **VMID：101**
   - Name：pve01
@@ -312,7 +312,7 @@ grep -R --line-number --no-messages 'download.proxmox.com\|enterprise.proxmox.co
 
 ## 10. 部署紀錄
 
-安裝完成後填入實際值，不要把錄影電腦的 IP 當成 PVE IP：
+安裝完成後填入實際值，不要把管理電腦的 IP 當成 PVE IP：
 
 - **主機：pve-l0**
   - FQDN：pve-l0.lab.home
@@ -334,11 +334,3 @@ grep -R --line-number --no-messages 'download.proxmox.com\|enterprise.proxmox.co
   - 路由器固定租約：安裝完成後記錄
   - net0 MAC：安裝完成後記錄
   - Web UI 已登入：[ ]
-
-## 錄影收尾畫面
-
-- [ ] L0 Datacenter 中看得到 VM 101、102、103。
-- [ ] 四台 PVE 都能透過路由器配發並保留的管理 IP 開啟 Web UI。
-- [ ] 三台 L1 PVE 的 VMID、Hostname 與 FQDN 正確。
-- [ ] 在 L0 檢查每台 L1 PVE VM：`net0` 接到 L0 `vmbr0`，`net1` 接到 L0 `vmbr2`；這裡的 `vmbr2` 是 `pve-l0` 上的 Trunk Bridge，不是 L1 PVE 內部的 Ceph `vmbr2`。
-- [ ] 已說明單一實體主機只能模擬三節點，不能當成正式硬體 HA 證明。

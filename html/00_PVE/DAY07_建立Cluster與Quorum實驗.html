@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 07｜三台 PVE 如何組成叢集：Corosync、法定票數與 Ceph 共享儲存</title><style>
+:root{--orange:#f47b20;--ink:#30343b;--line:#e6e8eb}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:#fff;font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}main{width:min(940px,calc(100% - 40px));margin:auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35}h2{margin-top:42px;padding-bottom:10px;border-bottom:1px solid var(--line)}h3{margin-top:30px}a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2}code{padding:.15em .35em;border-radius:4px;background:#f4f5f6;color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}table{width:100%;border-collapse:collapse;margin:22px 0}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+</style></head><body><main><h1>Day 07｜三台 PVE 如何組成叢集：Corosync、法定票數與 Ceph 共享儲存</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 07｜三台 PVE 如何組成叢集：Corosync、法定票數與 Ceph 共享儲存</a></p>
+<h2>建立前檢查</h2>
+<ul>
+<li>Hostname 分別是 <code>pve01</code>、<code>pve02</code>、<code>pve03</code>，FQDN 位於 <code>lab.home</code>。</li>
+<li>Corosync IP 分別為 <code>10.77.80.11/24</code>、<code>10.77.80.12/24</code>、<code>10.77.80.13/24</code>，不設定 Gateway。</li>
+<li>節點間能經 <code>10.77.80.0/24</code> 直接互通。</li>
+</ul>
+<p>各節點執行檢查：</p>
+<pre><code class="language-bash">hostname --fqdn
+ip -4 -br address
+ip route
+timedatectl
+pvecm status
+</code></pre>
+<h2>1. 建立 Cluster 前確認 Chrony</h2>
+<h3>1.1 檢查外層 pve-l0</h3>
+<pre><code class="language-bash">systemctl is-active chrony
+chronyc tracking
+chronyc sources -v
+timedatectl
+date -Is
+</code></pre>
+<h3>1.2 分別檢查 pve01、pve02、pve03</h3>
+<pre><code class="language-bash">systemctl is-active chrony
+chronyc tracking
+chronyc sources -v
+timedatectl
+date -Is
+</code></pre>
+<h3>1.3 Chrony 未啟動處理</h3>
+<p>若未安裝或未啟動，執行：</p>
+<pre><code class="language-bash">apt update
+apt install -y chrony
+systemctl enable --now chrony
+</code></pre>
+<p>確認並停用其他 NTP Client：</p>
+<pre><code class="language-bash">systemctl is-active systemd-timesyncd
+systemctl is-active chrony
+systemctl disable --now systemd-timesyncd
+systemctl restart chrony
+</code></pre>
+<h3>1.4 時間強制校正</h3>
+<pre><code class="language-bash">chronyc makestep
+chronyc tracking
+chronyc sources -v
+date -Is
+</code></pre>
+<h2>2. 複查 Corosync 網路</h2>
+<pre><code class="language-bash">ping -c 3 10.77.80.11
+ping -c 3 10.77.80.12
+ping -c 3 10.77.80.13
+</code></pre>
+<h2>3. 在 pve01 建立 Cluster</h2>
+<ol>
+<li>登入 pve01。</li>
+<li>選 <code>Datacenter</code> → <code>Cluster</code> → <code>Create Cluster</code>。</li>
+<li>Cluster Name 填 <code>iron-lab</code>。</li>
+<li>Link 0 選 <code>10.77.80.11</code>。</li>
+<li>按 <code>Create</code>。</li>
+<li>選 <code>Join Information</code>，複製資訊。</li>
+</ol>
+<p><img src="../../source/Day07/1786295170674-image.png" alt="在 pve01 建立 iron-lab Cluster"></p>
+<p>Shell 驗證：</p>
+<pre><code class="language-bash">pvecm status
+pvecm nodes
+systemctl status corosync --no-pager
+</code></pre>
+<h2>4. 加入 pve02</h2>
+<ol>
+<li>登入 pve02 Web UI。</li>
+<li>選 <code>Datacenter</code> → <code>Cluster</code> → <code>Join Cluster</code>。</li>
+<li>貼上 Join Information，輸入密碼。</li>
+<li>Link 0 選 <code>10.77.80.12</code>。</li>
+<li>按 <code>Join</code>。</li>
+<li>回到 pve01 確認出現 pve02。</li>
+</ol>
+<pre><code class="language-bash">pvecm nodes
+pvecm status
+</code></pre>
+<h2>5. 加入 pve03</h2>
+<ol>
+<li>登入 pve03 Web UI。</li>
+<li>重複加入步驟，Link 0 選 <code>10.77.80.13</code>。</li>
+<li>按 <code>Join</code>。</li>
+<li>回 pve01 確認三個 Node 皆出現。</li>
+</ol>
+<p><img src="../../source/Day07/1786295388507-image.png" alt="將 pve03 加入 Cluster，完成三節點配置"></p>
+<pre><code class="language-bash">pvecm nodes
+pvecm status
+corosync-cfgtool -s
+</code></pre>
+<h2>6. 關閉一個節點</h2>
+<p>在 L0 將 VM 103 Shutdown：</p>
+<ol>
+<li>pve03 變成離線。</li>
+<li>pve01 執行 <code>pvecm status</code>，確認 Total votes 2、Quorate Yes。</li>
+</ol>
+<p><img src="../../source/Day07/1786295618518-image.png" alt="關閉 pve03 後，Cluster 仍保有 Quorum"></p>
+<h2>7. 再關閉一個節點</h2>
+<p>在 L0 將 VM 102 Shutdown：</p>
+<ol>
+<li>pve01 執行 <code>pvecm status</code>，確認 Total votes 1、Quorate No。</li>
+</ol>
+<p><img src="../../source/Day07/1786295672217-image.png" alt="再關閉 pve02 後，Cluster 失去 Quorum"></p>
+<pre><code class="language-bash">pvecm status
+pvecm nodes
+journalctl -u corosync -n 80 --no-pager
+</code></pre>
+<h2>8. 恢復節點</h2>
+<ol>
+<li>在 L0 啟動 VM 102，等待開機。</li>
+<li>確認恢復兩票。</li>
+<li>啟動 VM 103。</li>
+<li>確認三節點皆 Online、Total votes 回到 3。</li>
+</ol>
+<h2>9. 安裝 Ceph Squid 套件</h2>
+<p>三台節點執行：</p>
+<pre><code class="language-bash">pveceph install --repository no-subscription --version squid
+ceph --version
+</code></pre>
+<p>確認為 <code>Ceph 19.2 Squid</code> 後輸入 <code>y</code>。</p>
+<p><img src="../../source/Day07/1786296033998-image.png" alt="安裝 Ceph 19.2 Squid 套件"></p>
+<p>確認版本與 Repository：</p>
+<pre><code class="language-bash">apt policy ceph-common ceph-osd ceph-mon
+</code></pre>
+<p>排查衝突用（若有需要）：</p>
+<pre><code class="language-bash">grep -RhsnE &#39;enterprise\.proxmox|download\.proxmox|ceph-&#39; \
+  /etc/apt/sources.list /etc/apt/sources.list.d 2&gt;/dev/null
+apt-cache policy ceph-common ceph-base ceph-mon ceph-osd
+</code></pre>
+<h2>10. 初始化 Ceph Cluster</h2>
+<p>只在 pve01 執行：</p>
+<pre><code class="language-bash">pveceph init --network 10.77.70.0/24 --cluster-network 10.77.70.0/24
+</code></pre>
+<p><img src="../../source/Day07/1786296049296-image.png" alt="初始化 Ceph Cluster"></p>
+<h2>11. 建立 MON 與 MGR</h2>
+<p>三台節點各執行：</p>
+<pre><code class="language-bash">pveceph mon create
+</code></pre>
+<p>pve01、pve02 執行：</p>
+<pre><code class="language-bash">pveceph mgr create
+</code></pre>
+<p>Web UI 確認狀態：</p>
+<p><img src="../../source/Day07/1786296176508-image.png" alt="確認 Ceph MON 與 MGR 狀態"></p>
+<pre><code class="language-bash">ceph -s
+ceph mon dump
+ceph mgr dump
+</code></pre>
+<h2>12. 建立三個 OSD</h2>
+<p>各節點執行：</p>
+<ol>
+<li>選節點 → <code>Ceph</code> → <code>OSD</code> → <code>Create: OSD</code>。</li>
+<li>選 40 GiB 空白磁碟。</li>
+<li>按 <code>Create</code>。</li>
+</ol>
+<p><img src="../../source/Day07/1786296256143-image.png" alt="建立 Ceph OSD"></p>
+<p>設定 Lab 記憶體限制：</p>
+<pre><code class="language-bash">ceph config set osd osd_memory_target 2147483648
+ceph config get osd osd_memory_target
+ceph -s
+</code></pre>
+<h2>13. 建立 ceph-vm Pool</h2>
+<ol>
+<li>選 <code>Ceph</code> → <code>Pools</code> → <code>Create</code>。</li>
+<li>Name <code>ceph-vm</code>，Size <code>3</code>，Min. Size <code>2</code>。</li>
+<li><code>PG Autoscale Mode</code> 選 <code>on</code>。</li>
+<li>按 <code>Create</code>。</li>
+</ol>
+<p><img src="../../source/Day07/1786296573630-image.png" alt="建立 ceph-vm Pool"></p>
+<p>確認 Application：</p>
+<pre><code class="language-bash">ceph osd pool application get ceph-vm
+</code></pre>
+<p>若無 <code>rbd</code> 則執行：</p>
+<pre><code class="language-bash">ceph osd pool application enable ceph-vm rbd
+</code></pre>
+<pre><code class="language-bash">ceph osd pool ls detail
+pvesm status
+ceph df
+</code></pre>
+<h2>14. 建立 5GiB CephFS 共用 ISO</h2>
+<h3>14.1 建立 MDS</h3>
+<p>pve01、pve02 執行：</p>
+<ol>
+<li>選 <code>Ceph</code> → <code>CephFS</code> → <code>Metadata Servers</code>。</li>
+<li>確認 Node，按 <code>Create</code>。</li>
+</ol>
+<p><img src="../../source/Day07/1786296808809-image.png" alt="建立 CephFS Metadata Server"></p>
+<pre><code class="language-bash">pveceph mds create
+ceph mds stat
+</code></pre>
+<h3>14.2 建立 CephFS 與加入 Storage</h3>
+<ol>
+<li>選 <code>Ceph</code> → <code>CephFS</code> → <code>Create CephFS</code>。</li>
+<li>Name <code>cephfs</code>，<code>PG Num</code> <code>32</code>。</li>
+<li><code>PG Autoscale Mode</code> <code>on</code>。</li>
+<li>勾選 <code>Add as Storage</code>，按 <code>Create</code>。</li>
+</ol>
+<p><img src="../../source/Day07/1786296932006-image.png" alt="建立 CephFS 並加入 PVE Storage"></p>
+<pre><code class="language-bash">ceph fs ls
+ceph fs status cephfs
+ceph mds stat
+ceph osd pool ls detail
+pvesm status
+</code></pre>
+<p>若未自動加入 Storage，手動從 <code>Datacenter</code> → <code>Storage</code> 新增 <code>CephFS</code>。</p>
+<h3>14.3 確認 PG 與 Autoscaler</h3>
+<pre><code class="language-bash">ceph osd pool get cephfs_data pg_num
+ceph osd pool get cephfs_metadata pg_num
+ceph osd pool get cephfs_metadata pg_num_min
+ceph osd pool get cephfs_metadata pg_autoscale_bias
+ceph osd pool get cephfs_data pg_autoscale_mode
+ceph osd pool get cephfs_metadata pg_autoscale_mode
+ceph osd pool autoscale-status
+</code></pre>
+<p>必要時開啟 Autoscale：</p>
+<pre><code class="language-bash">ceph osd pool set cephfs_data pg_autoscale_mode on
+ceph osd pool set cephfs_metadata pg_autoscale_mode on
+</code></pre>
+<p>確認 Size：</p>
+<pre><code class="language-bash">ceph osd pool get cephfs_data size
+ceph osd pool get cephfs_data min_size
+ceph osd pool get cephfs_metadata size
+ceph osd pool get cephfs_metadata min_size
+</code></pre>
+<p>必要時修正 Size：</p>
+<pre><code class="language-bash">ceph osd pool set cephfs_data size 3
+ceph osd pool set cephfs_data min_size 2
+ceph osd pool set cephfs_metadata size 3
+ceph osd pool set cephfs_metadata min_size 2
+</code></pre>
+<h3>14.4 限制根目錄為 5GiB (選用)</h3>
+<pre><code class="language-bash">findmnt /mnt/pve/cephfs
+df -h /mnt/pve/cephfs
+apt update
+apt install -y attr
+setfattr -n ceph.quota.max_bytes -v 5368709120 /mnt/pve/cephfs
+getfattr -n ceph.quota.max_bytes /mnt/pve/cephfs
+df -h /mnt/pve/cephfs
+</code></pre>
+<h3>14.5 上傳 ISO</h3>
+<ol>
+<li>選 <code>cephfs</code> → <code>ISO Images</code>。</li>
+<li>上傳 ISO，確認三台節點均可讀取。</li>
+</ol>
+<pre><code class="language-bash">ceph fs status cephfs
+ceph df
+df -h /mnt/pve/cephfs
+find /mnt/pve/cephfs/template/iso -maxdepth 1 -type f -printf &#39;%f %s bytes\n&#39;
+</code></pre>
+</main></body></html>

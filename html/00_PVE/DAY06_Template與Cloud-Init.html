@@ -3,7 +3,7 @@
 <title>Day 06｜讓虛擬機可以重複部署：範本、Cloud-Init 與 Debian 雲端映像</title><style>
 :root{--orange:#f47b20;--ink:#30343b;--line:#e6e8eb}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:#fff;font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}main{width:min(940px,calc(100% - 40px));margin:auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35}h2{margin-top:42px;padding-bottom:10px;border-bottom:1px solid var(--line)}h3{margin-top:30px}a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2}code{padding:.15em .35em;border-radius:4px;background:#f4f5f6;color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}table{width:100%;border-collapse:collapse;margin:22px 0}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
 </style></head><body><main><h1>Day 06｜讓虛擬機可以重複部署：範本、Cloud-Init 與 Debian 雲端映像</h1>
-<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 06｜讓虛擬機可以重複部署：範本、Cloud-Init 與 Debian 雲端映像</a></p>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/articles/10407778">Day 06｜讓虛擬機可以重複部署：範本、Cloud-Init 與 Debian 雲端映像</a></p>
 <p>本日建立可重複使用的 Linux Template，並用 Cloud-Init 產生第一台測試 VM。正式服務 VM 的 VMID 與網路配置仍依全環境規劃，不在 Template 內寫死主機身分。</p>
 <h2>1. 下載 Cloud Image</h2>
 <p>使用 Debian 官方 Cloud Image：<a href="https://cloud.debian.org/images/cloud/">https://cloud.debian.org/images/cloud/</a>。</p>
@@ -15,6 +15,7 @@
 <li>輸入 <code>wget -O debian-cloud.qcow2</code>，空一格後貼上剛複製的完整官方連結，再按 Enter。</li>
 <li>執行 <code>ls -lh debian-cloud.qcow2</code>，確認檔案不是 0 Byte。</li>
 </ol>
+<p><img src="../../source/Day06/1786293441877-image.png" alt="下載 Debian Cloud Image"></p>
 <p>Cloud Image 不是安裝 ISO，所以不從 <code>ISO Images</code> 上傳。檔案只暫存在節點目錄，匯入完成並驗證後即可移除。</p>
 <h2>2. 建立 Template VM 9001</h2>
 <ol>
@@ -28,23 +29,38 @@
 <li><code>Network</code>：第一次準備 Template 時暫時選 <code>vmbr0</code>、Model 選 <code>VirtIO</code>，VLAN Tag 留白。此時 OPNsense 與內部 VLAN DHCP 尚未部署，若先接 <code>vmbr1</code>，Cloud-Init 會等待不存在的 DHCP，後續也無法下載套件。<code>vmbr0</code> 只用於取得現有路由器的 DHCP 與完成 Template 更新。</li>
 <li>取消 <code>Start after created</code>，按 <code>Finish</code>。</li>
 </ol>
+<p><img src="../../source/Day06/1786293604736-image.png" alt="建立 Template VM 9001"></p>
 <p>建立完成後先到 VM 9001 → <code>Hardware</code> 檢查。如果仍有精靈建立的空白 <code>Hard Disk (scsi0)</code>（通常是 32 GiB），先選取它按 <code>Detach</code>，再選取出現的 <code>Unused Disk</code> 按 <code>Remove</code> 並確認刪除。這一步只刪除剛建立、尚未寫入資料的空白磁碟；若不是全新的 VM 9001，不可照做。必須先移除預設空白磁碟，才能避免稍後把它誤認成 Debian Cloud Image。</p>
 <h2>3. 匯入 Cloud Image</h2>
 <p>在 <code>pve01</code> Shell 執行：</p>
 <pre><code class="language-bash">ls -lh /var/lib/vz/template/debian-cloud.qcow2
 qm disk import 9001 /var/lib/vz/template/debian-cloud.qcow2 local-lvm
 </code></pre>
+<p><img src="../../source/Day06/1786293917309-image.png" alt="匯入 Debian Cloud Image"></p>
 <p>指令完成時必須看到成功匯入為 <code>unused0</code> 的訊息。若 Web UI 沒有出現新的 <code>Unused Disk</code>，不要開機，先執行 <code>qm config 9001</code> 與 <code>pvesm list local-lvm --vmid 9001</code> 確認；一顆沒有分割區的 32 GiB 預設空白磁碟不是 Debian Cloud Image。</p>
 <p>接著回到 Web UI：</p>
 <ol>
 <li>VM 9001 → <code>Hardware</code>，選 <code>Unused Disk 0</code> → <code>Edit</code>／<code>Add</code>。</li>
 <li>Bus/Device 選 <code>SCSI 0</code>，Discard 勾選，SSD Emulation 可依底層儲存設定。</li>
+</ol>
+<p><img src="../../source/Day06/1786293962134-image.png" alt="加入 Unused Disk 為 SCSI 0"></p>
+<ol start="3">
 <li>如果 <code>Hardware</code> 仍有建立 VM 時自動產生的空白 <code>CD/DVD Drive (ide2)</code>，選取它並按 <code>Remove</code>。即使建立 VM 時選了 <code>Do not use any media</code>，PVE 仍可能保留一個空白光碟裝置並占用 <code>ide2</code>。</li>
 <li><code>Add</code> → <code>CloudInit Drive</code>，Storage 選 <code>local-lvm</code>，Bus/Device 選 <code>IDE 2</code>。不要選 <code>SCSI 0</code>；<code>scsi0</code> 必須保留給上一步掛載的 Debian 系統磁碟。</li>
+</ol>
+<p><img src="../../source/Day06/1786294021765-image.png" alt="新增 CloudInit Drive"></p>
+<ol start="5">
 <li>若要保留後續測試 Serial Console 的能力，可用 <code>Add</code> → <code>Serial Port</code>，Port 填 <code>0</code>。GUI 會建立 <code>serial0</code>；底層設定顯示為 <code>serial0: socket</code>。本步驟可以保留裝置，但首次開機不強制使用它。</li>
+</ol>
+<p><img src="../../source/Day06/1786294174829-image.png" alt="新增 Serial Port 0"></p>
+<ol start="6">
 <li>到 <code>Options</code> → <code>Boot Order</code>，只啟用 <code>scsi0</code>，並放在第一順位。</li>
+</ol>
+<p><img src="../../source/Day06/1786294174831-image.png" alt="調整 Boot Order"></p>
+<ol start="7">
 <li><code>Hardware</code> → <code>Display</code> 保持 <code>Default</code>，首次開機使用一般 Console。不要先改成 <code>Serial terminal 0</code>；如果畫面只停在 <code>Starting serial terminal on interface serial0</code>，代表 PVE 已連上序列埠，但 Guest 沒有輸出到該介面，改回 <code>Default</code> 即可看到正常開機畫面。</li>
 </ol>
+<p><img src="../../source/Day06/1786294174830-image.png" alt="Console 選單"></p>
 <p>開機前再次確認 <code>Hardware</code>：Debian Cloud Image 應顯示為 <code>Hard Disk (scsi0)</code>，CloudInit Drive 應顯示為 <code>CloudInit Drive (ide2)</code>。如果看到 <code>Boot failed: not a bootable disk</code>，通常是 CloudInit Drive 誤占 <code>scsi0</code>，或匯入的 Debian 磁碟仍停在 <code>Unused Disk</code>；先關機並修正磁碟位置，不要反覆重啟。</p>
 <h2>4. 設定 Cloud-Init 基線</h2>
 <p>選 VM 9001 → <code>Cloud-Init</code>：</p>
@@ -56,6 +72,7 @@ qm disk import 9001 /var/lib/vz/template/debian-cloud.qcow2 local-lvm
 <li>DNS Domain 可填 <code>lab.home</code>；DNS Server 留給部署時或 DHCP 決定。</li>
 <li>按 <code>Regenerate Image</code>。</li>
 </ol>
+<p><img src="../../source/Day06/1786294529970-image.png" alt="設定 Cloud-Init 基線參數"></p>
 <p>首次開機前到 <code>pve01</code> Shell 驗證：</p>
 <pre><code class="language-bash">qm config 9001 | grep ipconfig0
 qm cloudinit dump 9001 network
@@ -77,6 +94,7 @@ sudo apt install -y qemu-guest-agent cloud-init
 sudo systemctl enable --now qemu-guest-agent
 sudo cloud-init status --wait
 </code></pre>
+<p><img src="../../source/Day06/1786294627614-image.png" alt="驗證 Cloud-Init 狀態"></p>
 <ol start="3">
 <li>確認 Guest Agent 與 Cloud-Init 正常後，先保留錄影素材。</li>
 <li>確認 VM 9001 沒有使用者資料，再清除 Cloud-Init 狀態與 Machine ID：</li>
@@ -84,12 +102,16 @@ sudo cloud-init status --wait
 <pre><code class="language-bash">sudo cloud-init clean --logs --machine-id
 sudo shutdown -h now
 </code></pre>
+<p><img src="../../source/Day06/1786294656976-image.png" alt="清除 Cloud-Init 與 Machine ID"></p>
 <h2>6. 轉成 Template 並建立測試 VM</h2>
 <ol>
 <li>確認 VM 9001 已完全關機。</li>
 <li>右鍵 VM 9001 → <code>Convert to template</code>，確認轉換。</li>
 <li>右鍵 Template 9001 → <code>Clone</code>。</li>
 <li>Mode 選 <code>Full Clone</code>，VM ID 填 <code>902</code>，Name 填 <code>cloudinit-test01</code>。</li>
+</ol>
+<p><img src="../../source/Day06/1786294713909-image.png" alt="從 Template 建立 Full Clone VM"></p>
+<ol start="5">
 <li>測試 Clone 暫時保留 <code>vmbr0</code>，再到 <code>Cloud-Init</code> 設定 User、SSH Key、Hostname 與 DHCP，使用現有路由器驗證首次開機。</li>
 <li>按 <code>Regenerate Image</code> 後啟動。</li>
 <li>確認 PVE Summary 顯示 Guest Agent 回報的 IP。</li>
@@ -99,6 +121,7 @@ hostnamectl
 ip -4 -br address
 systemctl status qemu-guest-agent --no-pager
 </code></pre>
+<p><img src="../../source/Day06/1786294770705-image.png" alt="驗證 Clone VM 初始化結果"></p>
 <h2>7. 後續服務 VM 的 VMID</h2>
 <table>
 <thead>

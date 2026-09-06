@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 08｜節點故障後 VM 如何接手：Proxmox VE 遷移、HA 隔離與恢復時間量測</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 08｜節點故障後 VM 如何接手：Proxmox VE 遷移、HA 隔離與恢復時間量測</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 08｜節點故障後 VM 如何接手：Proxmox VE 遷移、HA 隔離與恢復時間量測</a></p>
+<p>本日只處理 Proxmox VE 的高可用，不提前討論尚未部署的 PostgreSQL 或 Patroni。Day 07 已建立 <code>ceph-vm</code> RBD Storage，因此可以用可丟棄測試 VM 實際展示 Migration 與 PVE HA Recovery；但三台 Nested PVE、三個虛擬 OSD 與所有 VM 最終仍位於同一台 L0，不能宣稱已完成實體主機層的正式 HA。</p>
+<h2>1. 先盤點 PVE HA 前置條件</h2>
+<ol>
+<li>登入 Cluster → <code>Datacenter</code> → <code>Storage</code>。</li>
+<li>檢查 <code>ceph-vm</code> 的 Nodes、Shared 與 Content，並執行 <code>ceph -s</code> 確認健康。</li>
+<li>選一台測試 VM → <code>Hardware</code>，確認每顆磁碟是否都位於 <code>ceph-vm</code>。</li>
+<li>到 <code>Datacenter</code> → <code>HA</code>，展示 Affinity Rules、Resources、Status。PVE 9 已使用 HA Affinity Rules 取代舊版 Groups，所以畫面沒有 Groups 是正常的。</li>
+<li>Shell 執行：</li>
+</ol>
+<pre><code class="language-bash">pvecm status
+pvesm status
+ceph -s
+ha-manager status
+</code></pre>
+<p>如果 VM 磁碟仍只存在某一節點的 <code>local-lvm</code>，節點消失後其他節點讀不到該磁碟。只有已移至 <code>ceph-vm</code> 的可丟棄測試 VM 才進行本日 HA 實驗；僅把 local-lvm VM 加進 HA Resources 不會憑空複製磁碟。</p>
+<h2>2. 使用可丟棄 VM 建立 HA Resource</h2>
+<p>使用 Day 06 的 <code>cloudinit-test01</code>，或重新建立一台 VMID 902 測試 VM：</p>
+<ol>
+<li>關閉測試 VM。</li>
+<li>選 VM → <code>Hardware</code> → 選系統磁碟 → <code>Disk Action</code> → <code>Move Storage</code>。</li>
+<li>Target Storage 選 <code>ceph-vm</code>，勾選成功後刪除來源磁碟，按 <code>Move disk</code>。</li>
+<li>等待 Task 顯示 <code>OK</code>，再確認 Hardware 中該磁碟位於 <code>ceph-vm</code>。</li>
+<li>啟動 VM，確認 Guest 正常後再關機。</li>
+<li>選 <code>Datacenter</code> → <code>HA</code> → <code>Resources</code> → <code>Add</code>。</li>
+<li>Resource 選測試 VM。PVE 9 的視窗不再提供 Group 欄位，因為舊版 HA Groups 已被 HA Rules 取代。</li>
+<li><code>Max Restart</code>、<code>Max Relocate</code> 與 Comment 先使用預設值，再按 <code>Add</code>。目前的 PVE 9 新增視窗沒有 <code>Requested State</code> 欄位；新增既有 VM 為 HA Resource 時，預設 Request State 是 <code>started</code>，HA Manager 可能會立即把剛才關閉的測試 VM 啟動。</li>
+<li>加入後查看 <code>HA</code> → <code>Status</code>，並執行：</li>
+</ol>
+<pre><code class="language-bash">ha-manager config
+ha-manager status
+</code></pre>
+<p><code>ha-manager config</code> 中的 <code>vm:902</code> 應顯示 <code>state started</code>。如果實際不是 <code>started</code>，才使用：</p>
+<pre><code class="language-bash">ha-manager set vm:902 --state started
+</code></pre>
+<p>只有測試 VM 的全部磁碟都能被目標節點取得時，才進一步測試 Migration／Recovery。Cloud-Init Disk 也必須位於 <code>ceph-vm</code>，不能只搬系統磁碟。</p>
+<h2>3. 建立 HA Node Affinity Rule</h2>
+<p>PVE 9 將舊版 HA Group 的節點偏好功能改成 Node Affinity Rule。Rule 會引用已存在的 HA Resource，因此先完成上一節，再建立 Rule。</p>
+<ol>
+<li>選 <code>Datacenter</code> → <code>HA</code> → <code>Affinity Rules</code>。</li>
+<li>在 <code>HA Node Affinity Rules</code> 按 <code>Add</code>。</li>
+<li><code>Resources</code> 選剛加入的測試 VM，例如 <code>vm:902</code>。</li>
+<li><code>Nodes</code> 加入 <code>pve01</code>、<code>pve02</code>、<code>pve03</code>。</li>
+<li><code>Strict</code> 不勾選。非 Strict Rule 表示優先使用列出的節點，但這些節點都不可用時仍可選擇其他可用節點；Strict Rule 會把資源限制在指定節點，全部不可用時資源會停止。</li>
+<li><code>Comment</code> 填 <code>Day08 lab node affinity</code>，其他欄位使用預設值後按 <code>Create</code>。</li>
+</ol>
+<p>本 Lab 只有三個節點，將三台全部列入 Rule 主要是展示 PVE 9 的設定位置與資料結構。正式環境才依硬體能力、Storage 可達性與故障域設定節點清單及 Priority。</p>
+<p>同一頁另有 <code>HA Resource Affinity Rules</code>，用來要求多個 HA Resource 盡量一起運作或彼此分散。本日只有一台測試 VM，因此不在該區塊新增 Rule。</p>
+<h2>4. 先確認 CPU Type 是否適合 Migration</h2>
+<p>在測試 VM 的 <code>Hardware</code> → <code>Processors</code> 查看 CPU Type，也可以執行：</p>
+<pre><code class="language-bash">qm config 902 | grep &#39;^cpu:&#39;
+</code></pre>
+<p><code>CPU type=host</code> 不是完全不能 Migration。它會把來源 PVE Host 較完整的 CPU 指令集提供給 Guest，因此判斷重點是目標節點能不能提供相同的 CPU 能力：</p>
+<ul>
+<li>來源與目標是相同或高度相容的 CPU，<code>host</code> 通常仍能 Live Migration。</li>
+<li>目標節點缺少來源 VM 已使用的 CPU Flag，Live Migration 可能被拒絕或失敗。</li>
+<li>Offline Migration 與 HA Recovery 不需要搬移正在執行的 CPU State，限制較少；但 Guest 或以來源專用指令集編譯的程式仍可能無法在較舊 CPU 上正常執行。</li>
+<li>Intel／AMD 混用，或不同世代 CPU 混用時，不應把 <code>host</code> 當成整個 Cluster 的通用 CPU Model。</li>
+</ul>
+<p>本 Lab 的 <code>pve01</code>～<code>pve03</code> 都在同一台 L0 上，看到的是同一顆實體 CPU，因此先保留 <code>host</code> 做 Live Migration 實驗即可。成功只證明這三台同源 Nested 節點相容，不代表不同實體硬體一定相容。</p>
+<p>正式環境若節點硬體不同，應先盤點所有節點共同支援的 CPU 能力，再選擇共同可用的 CPU Model，例如經測試的 <code>x86-64-v2-AES</code> 或自訂 Cluster CPU Model。若需要修改，先關閉 VM，再到 <code>VM</code> → <code>Hardware</code> → <code>Processors</code> → <code>Edit</code> → <code>Type</code>；不要在本 Lab 還能正常 Migration 時為了教學強制更換。</p>
+<h2>5. 手動 Migration 與 HA Recovery 的差異</h2>
+<p>手動 Migration 是管理者主動選擇目標節點並等待搬移完成，適合維護前操作。HA Recovery 是節點被判定不可用後，由 HA Manager 依 Quorum、Watchdog／Fencing、Affinity Rules 與資源狀態決定是否在其他節點重新啟動 VM。</p>
+<p>錄影時依序展示：</p>
+<ol>
+<li>右鍵測試 VM → <code>Migrate</code>。</li>
+<li>查看 Target Node 與 Storage 選項。</li>
+<li>確認磁碟位於 <code>ceph-vm</code> 後執行 Live Migration，記錄完成時間與 Guest 中斷時間。</li>
+<li>回 <code>HA Status</code> 確認 Resource 所在節點已更新。</li>
+<li>再關閉測試 VM，執行一次 Offline Migration，對照兩種操作的畫面與時間。</li>
+<li>要做 Recovery 實驗時，從 L0 關閉承載測試 VM 的 Nested PVE；觀察 HA 是否在另一節點啟動 VM，再恢復原節點。</li>
+<li>同時記錄 <code>ceph -s</code>，因為停止一個 Nested PVE 也會讓一個 OSD 與 MON 離線。</li>
+</ol>
+<h2>6. 本 Lab 可以與不能證明的內容</h2>
+<p>可以實作：</p>
+<ul>
+<li>HA Node Affinity Rule、HA Resource 與 HA Manager 狀態查看。</li>
+<li>Quorum 對 HA 決策的影響。</li>
+<li>使用 Ceph RBD 的 Live／Offline Migration 與測試 VM Recovery。</li>
+<li><code>CPU type=host</code> 在三台同源 Nested 節點間的相容性結果。</li>
+</ul>
+<p>不能直接宣稱：</p>
+<ul>
+<li>單一實體主機斷電後 VM 仍會服務。</li>
+<li>三個虛擬 Ceph OSD 等於三個獨立實體故障域。</li>
+<li>沒有可靠 Watchdog／Fencing 也能安全自動接管。</li>
+<li>這次 <code>host</code> Migration 成功，代表任意 Intel、AMD 或不同世代 CPU 都能遷移。</li>
+<li>VM 在另一節點重新開機等於服務完全沒有中斷。</li>
+</ul>
+<h2>7. 正式環境補充</h2>
+<p>正式 PVE HA 至少要重新評估：三台獨立實體主機、獨立故障域、可靠 Corosync 網路、Watchdog／Fencing、共享或分散式儲存、相容的 Cluster CPU Model、UPS、備份與實際關機演練。</p>
+</main></body>
+</html>

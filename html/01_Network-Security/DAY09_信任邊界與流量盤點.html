@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 09｜狀態式防火牆如何運作：封包路徑、連線狀態與信任邊界</title><style>
+:root{--orange:#f47b20;--ink:#30343b;--line:#e6e8eb}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:#fff;font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}main{width:min(940px,calc(100% - 40px));margin:auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35}h2{margin-top:42px;padding-bottom:10px;border-bottom:1px solid var(--line)}h3{margin-top:30px}a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2}code{padding:.15em .35em;border-radius:4px;background:#f4f5f6;color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}table{width:100%;border-collapse:collapse;margin:22px 0}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+</style></head><body><main><h1>Day 09｜狀態式防火牆如何運作：封包路徑、連線狀態與信任邊界</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 09｜狀態式防火牆如何運作：封包路徑、連線狀態與信任邊界</a></p>
+<p>本日不部署防火牆規則，先把誰要連到誰寫成可以在 Day 14 實作的清單。若沒有先做這一步，後面很容易因為服務暫時連不到就建立過寬的 <code>any to any</code>。</p>
+<h2>1. 確認固定區域</h2>
+<p>以<a href="../config/README.md">實作環境設定索引</a>內的網路、VM 與 Port 表為唯一參數來源：</p>
+<table>
+<thead>
+<tr>
+<th>區域</th>
+<th>網段</th>
+<th>主要主機</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Management</td>
+<td><code>10.77.10.0/24</code></td>
+<td>OPNsense 與 Day 15 起的 pve01～pve03 管理位址</td>
+</tr>
+<tr>
+<td>Service</td>
+<td><code>10.77.20.0/24</code></td>
+<td>proxy、app、client、monitor</td>
+</tr>
+<tr>
+<td>Database</td>
+<td><code>10.77.30.0/24</code></td>
+<td>pg01～pg03、Patroni、etcd</td>
+</tr>
+<tr>
+<td>Backup</td>
+<td><code>10.77.40.0/24</code></td>
+<td>backup01</td>
+</tr>
+<tr>
+<td>Bastion DMZ</td>
+<td><code>10.77.50.0/24</code></td>
+<td>jump01</td>
+</tr>
+<tr>
+<td>OpenVPN</td>
+<td><code>10.77.60.0/24</code></td>
+<td>遠端使用者</td>
+</tr>
+<tr>
+<td>Ceph</td>
+<td><code>10.77.70.0/24</code></td>
+<td>PVE MON／OSD，不經 OPNsense</td>
+</tr>
+<tr>
+<td>Corosync</td>
+<td><code>10.77.80.0/24</code></td>
+<td>PVE 叢集通訊，不經 OPNsense</td>
+</tr>
+</tbody></table>
+<h2>2. 建立流量需求表</h2>
+<p>逐列記錄來源、目的、Port 與理由：</p>
+<table>
+<thead>
+<tr>
+<th>來源</th>
+<th>目的</th>
+<th align="right">Port</th>
+<th>是否允許</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Cloudflare <code>CLOUDFLARE_IPV4</code></td>
+<td>公開 WAN 入口，DNAT 至 Web VIP <code>10.77.20.10</code></td>
+<td align="right">443</td>
+<td>是</td>
+<td>公開 Web 入口</td>
+</tr>
+<tr>
+<td>Internet</td>
+<td>jump01 <code>10.77.50.11</code></td>
+<td align="right">WAN TCP 45222，DNAT 至 TCP 22</td>
+<td>是</td>
+<td>受控管理入口</td>
+</tr>
+<tr>
+<td>Internet</td>
+<td>DB VIP／pg01～03</td>
+<td align="right">5432</td>
+<td>否</td>
+<td>DB 不公開 WAN</td>
+</tr>
+<tr>
+<td>jump01</td>
+<td>授權內部主機</td>
+<td align="right">22</td>
+<td>是</td>
+<td>ProxyJump</td>
+</tr>
+<tr>
+<td>proxy01／02</td>
+<td>pg01～03</td>
+<td align="right">5432、8008</td>
+<td>是</td>
+<td>DB 流量與 Patroni Health Check</td>
+</tr>
+<tr>
+<td>pg01～03</td>
+<td>pg01～03</td>
+<td align="right">5432、2379、2380</td>
+<td>是</td>
+<td>WAL、etcd Client／Peer</td>
+</tr>
+<tr>
+<td>pg01～03</td>
+<td>backup01</td>
+<td align="right">Repository 所需 SSH</td>
+<td>是</td>
+<td>pgBackRest Repository</td>
+</tr>
+<tr>
+<td>monitor01</td>
+<td>受監控主機</td>
+<td align="right">Exporter Port</td>
+<td>是</td>
+<td>Metrics Scrape</td>
+</tr>
+<tr>
+<td>VPN Admin</td>
+<td>pve01～03</td>
+<td align="right">8006</td>
+<td>是</td>
+<td>PVE Web UI</td>
+</tr>
+<tr>
+<td>VPN Client</td>
+<td>DB VIP</td>
+<td align="right">5432</td>
+<td>依群組</td>
+<td>私有 DB 入口</td>
+</tr>
+<tr>
+<td>VPN Client</td>
+<td>pg01～03</td>
+<td align="right">5432、8008、2379</td>
+<td>否</td>
+<td>不繞過 VIP 與管理邊界</td>
+</tr>
+</tbody></table>
+<h2>3. 盤點現有暴露面</h2>
+<p>在已存在的 Debian VM 執行：</p>
+<pre><code class="language-bash">ip -br address
+ip route
+sudo ss -lntup
+systemctl --type=service --state=running
+</code></pre>
+<p>在 PVE 節點執行：</p>
+<pre><code class="language-bash">ip -br address
+ip route
+ss -lntup
+systemctl --type=service --state=running
+pvesh get /cluster/firewall/options
+</code></pre>
+<p><img src="../../source/Day09/day09-fig07.png" alt="PVE 節點的介面、路由與監聽 Socket"></p>
+<p>圖（一）PVE 節點的介面與路由表指出一般對外流量、Ceph 與 Corosync 使用不同路徑，<code>ss</code> 則列出本機正在監聽的 Socket。</p>
+<p><img src="../../source/Day09/day09-fig08.png" alt="PVE 節點的執行中服務"></p>
+<p>圖（二）PVE 節點的執行中服務可與監聽連接埠交叉比對。</p>
+<p><img src="../../source/Day09/day09-fig09.png" alt="Debian 測試 VM 的介面、路由、監聽 Socket 與服務"></p>
+<p>圖（三）Debian 測試 VM 的介面、路由、監聽 Socket 與執行中服務。</p>
+<p><img src="../../source/Day09/day09-fig10.png" alt="以 sudo 顯示監聽 Socket 所屬程序"></p>
+<p>圖（四）以足夠權限執行 <code>ss</code> 後，可以確認監聽 Socket 所屬程序。</p>
+<p>測試 VM 使用 DHCP，因此兩次補拍的位址不同；這不影響本圖確認監聽程序的用途。</p>
+<p>保存盤點結果，但不要讓 Public IP、MAC、Token 與憑證內容出現在文件中。</p>
+<h2>4. 記錄後續驗收方法</h2>
+<p>Day 09 先定義測試來源、操作方法與預期結果。防火牆規則及對應服務完成後，再從指定來源執行測試並保存結果：</p>
+<table>
+<thead>
+<tr>
+<th>測試來源</th>
+<th>操作方法</th>
+<th>預期結果</th>
+<th>可執行階段</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>proxy01</code></td>
+<td><code>nc -vz -w 3 10.77.30.11 5432</code></td>
+<td>允許連到 PostgreSQL</td>
+<td>proxy 與 PostgreSQL 服務完成後</td>
+</tr>
+<tr>
+<td><code>jump01</code></td>
+<td><code>nc -vz -w 3 10.77.30.11 5432</code></td>
+<td>拒絕直接連到 PostgreSQL</td>
+<td>PostgreSQL 服務完成後</td>
+</tr>
+<tr>
+<td>VPN Admin</td>
+<td><code>curl -kI --connect-timeout 5 https://10.77.10.11:8006/</code></td>
+<td>允許連到 PVE Web UI</td>
+<td>Day 17 完成 VPN 與規則後</td>
+</tr>
+<tr>
+<td>VPN 一般使用者</td>
+<td><code>nc -vz -w 3 10.77.30.11 8008</code></td>
+<td>拒絕直接連到 Patroni API</td>
+<td>Patroni 服務完成後</td>
+</tr>
+</tbody></table>
+<p>本日只記錄方法與預期結果，不把尚未執行的測試寫成驗證成功。後續測試時，允許項目要看到連線成功，拒絕項目則要搭配 OPNsense Live View 或規則計數器確認封包確實被規則阻擋，避免把服務尚未啟動誤判成防火牆拒絕。</p>
+<p>此時 pve01～pve03 還在路由器 Bootstrap 網段，不提前改線。清單先記錄 Day 15 的最終位址 <code>10.77.10.11</code>～<code>.13</code>，以及 PVE 只需要 DNS、NTP、HTTP／HTTPS 更新等必要出口；完成 OPNsense 規則後才逐台切換 Default Gateway。</p>
+</main></body></html>

@@ -1,9 +1,19 @@
 <!doctype html>
-<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Day 09｜狀態式防火牆如何運作：封包路徑、連線狀態與信任邊界</title><style>
-:root{--orange:#f47b20;--ink:#30343b;--line:#e6e8eb}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:#fff;font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}main{width:min(940px,calc(100% - 40px));margin:auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35}h2{margin-top:42px;padding-bottom:10px;border-bottom:1px solid var(--line)}h3{margin-top:30px}a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2}code{padding:.15em .35em;border-radius:4px;background:#f4f5f6;color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}table{width:100%;border-collapse:collapse;margin:22px 0}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
-</style></head><body><main><h1>Day 09｜狀態式防火牆如何運作：封包路徑、連線狀態與信任邊界</h1>
-<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 09｜狀態式防火牆如何運作：封包路徑、連線狀態與信任邊界</a></p>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 09｜狀態式防火牆如何運作：封包路徑、連線狀態與信任邊界</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 09｜狀態式防火牆如何運作：封包路徑、連線狀態與信任邊界</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/articles/10408763">Day 09｜狀態式防火牆如何運作：封包路徑、連線狀態與信任邊界</a></p>
 <p>本日不部署防火牆規則，先把誰要連到誰寫成可以在 Day 14 實作的清單。若沒有先做這一步，後面很容易因為服務暫時連不到就建立過寬的 <code>any to any</code>。</p>
 <h2>1. 確認固定區域</h2>
 <p>以<a href="../config/README.md">實作環境設定索引</a>內的網路、VM 與 Port 表為唯一參數來源：</p>
@@ -208,4 +218,5 @@ pvesh get /cluster/firewall/options
 </tbody></table>
 <p>本日只記錄方法與預期結果，不把尚未執行的測試寫成驗證成功。後續測試時，允許項目要看到連線成功，拒絕項目則要搭配 OPNsense Live View 或規則計數器確認封包確實被規則阻擋，避免把服務尚未啟動誤判成防火牆拒絕。</p>
 <p>此時 pve01～pve03 還在路由器 Bootstrap 網段，不提前改線。清單先記錄 Day 15 的最終位址 <code>10.77.10.11</code>～<code>.13</code>，以及 PVE 只需要 DNS、NTP、HTTP／HTTPS 更新等必要出口；完成 OPNsense 規則後才逐台切換 Default Gateway。</p>
-</main></body></html>
+</main></body>
+</html>

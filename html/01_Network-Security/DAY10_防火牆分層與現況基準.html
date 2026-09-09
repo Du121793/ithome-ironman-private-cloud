@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 10｜防火牆種類與部署位置：封包過濾、代理防火牆、WAF、IDS／IPS 與 NGFW</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 10｜防火牆種類與部署位置：封包過濾、代理防火牆、WAF、IDS／IPS 與 NGFW</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 10｜防火牆種類與部署位置：封包過濾、代理防火牆、WAF、IDS／IPS 與 NGFW</a></p>
+<p>本日不急著部署 OPNsense，先確認每一層負責的工作，避免同一條規則在 PVE、OPNsense 與 Debian Host 同時修改後無法排錯。</p>
+<h2>1. 固定責任邊界</h2>
+<table>
+<thead>
+<tr>
+<th>層級</th>
+<th>本系列用途</th>
+<th>不負責</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>上游路由器</td>
+<td>提供 L0 管理、OPNsense WAN 與 Day 03～15 PVE Bootstrap</td>
+<td>Day 15 後的 PVE／服務 VLAN 存取政策</td>
+</tr>
+<tr>
+<td>OPNsense</td>
+<td>VLAN Routing、NAT、VPN、跨區 Default Deny</td>
+<td>PostgreSQL Role 權限</td>
+</tr>
+<tr>
+<td>PVE Firewall</td>
+<td>保護 Hypervisor／特定 VM 的管理面</td>
+<td>取代 OPNsense Routing</td>
+</tr>
+<tr>
+<td>Debian nftables</td>
+<td>主機最後一道入口限制</td>
+<td>跨 VLAN Gateway</td>
+</tr>
+<tr>
+<td>Nginx／HAProxy</td>
+<td>L7 Web 與角色感知 DB Proxy</td>
+<td>WAN 邊界防火牆</td>
+</tr>
+<tr>
+<td>PostgreSQL</td>
+<td><code>pg_hba.conf</code>、TLS、Role／GRANT</td>
+<td>阻止所有網路掃描</td>
+</tr>
+</tbody></table>
+<h2>2. 記錄 PVE Firewall 現況</h2>
+<p>在 pve01～pve03 各執行：</p>
+<pre><code class="language-bash">pve-firewall status
+pvesh get /cluster/firewall/options
+iptables-save 2&gt;/dev/null | head -n 40
+nft list ruleset 2&gt;/dev/null | head -n 80
+</code></pre>
+<p><img src="../../source/Day10/day10-fig09.png" alt="pve01 的 PVE Firewall 狀態與現有規則"></p>
+<p>圖（一）pve01 的 PVE Firewall 狀態與現有規則。</p>
+<p>只記錄現況，不在三台節點同時啟用新規則。若之後要啟用 PVE Firewall，先建立允許目前管理來源連 TCP 8006／22 的規則，再由單一節點測試。</p>
+<h2>3. 記錄 Debian Host Firewall 現況</h2>
+<p>在一台測試 VM 執行：</p>
+<pre><code class="language-bash">sudo nft list ruleset
+sudo ss -lntup
+sudo systemctl status nftables --no-pager
+</code></pre>
+<p><img src="../../source/Day10/day10-fig10.png" alt="Debian 測試 VM 的 nftables 與 Socket 現況"></p>
+<p>圖（二）Debian 測試 VM 的 nftables 與 Socket 現況。</p>
+<p>空白規則集表示目前沒有 nftables 規則；<code>command not found</code> 則表示 nftables 尚未安裝。兩種結果都可作為後續比較基準。</p>
+</main></body>
+</html>

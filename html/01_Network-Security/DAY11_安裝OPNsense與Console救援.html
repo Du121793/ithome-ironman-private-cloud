@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 11｜在 Proxmox VE 安裝 OPNsense：vNIC、WAN／LAN 介面指派與主控台（Console）救援</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 11｜在 Proxmox VE 安裝 OPNsense：vNIC、WAN／LAN 介面指派與主控台（Console）救援</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 11｜在 Proxmox VE 安裝 OPNsense：vNIC、WAN／LAN 介面指派與主控台（Console）救援</a></p>
+<p><code>fw01</code> 放在 L0 <code>pve-l0</code>，VMID <code>110</code>。本日完成安裝、三張網卡、管理介面與設定備份；VLAN 在 Day 13 建立。</p>
+<p>Day 11 先讓 OPNsense 本身上線。pve01～pve03 此時仍使用 Day 03 建立的路由器 Bootstrap Gateway，避免在 VLAN 與規則尚未完成前失去管理路徑。等 Day 14 完成基本規則後，Day 15 才逐台把 PVE Management 與一般對外出口切到 OPNsense。</p>
+<h2>1. 下載 OPNsense DVD ISO</h2>
+<ol>
+<li>開啟 <a href="https://opnsense.org/download/">https://opnsense.org/download/</a>。</li>
+<li>Architecture 選 <code>amd64</code>、Image type 選 <code>dvd</code>、Mirror 選距離較近且可正常下載者。</li>
+<li>下載 <code>OPNsense-版本-dvd-amd64.iso.bz2</code>、SHA256 與 Signature。以本次 2026 年 8 月使用的版本為例，檔名應為 <code>OPNsense-26.7-dvd-amd64.iso.bz2</code>。</li>
+<li>使用 7-Zip 解開 <code>.bz2</code>，得到 <code>.iso</code>。</li>
+<li>在 <code>pve-l0</code> → <code>local</code> → <code>ISO Images</code> → <code>Upload</code> 上傳 ISO。</li>
+<li>將下載版本、SHA256 與日期寫進部署紀錄；不要只記「最新版」。</li>
+</ol>
+<p>SHA-256 與數位簽章可用來檢查下載檔案的完整性及來源真實性，本 Lab 不強制執行。若要核對 SHA-256，可在解壓前執行：</p>
+<pre><code class="language-powershell">Get-FileHash .\OPNsense-26.7-dvd-amd64.iso.bz2 -Algorithm SHA256
+</code></pre>
+<p>將輸出值與 OPNsense 官方 26.7 發行頁面提供的 SHA-256 比對。</p>
+<p>下載後必須先核對副檔名：</p>
+<pre><code class="language-text">dvd    → .iso.bz2，解壓後是 .iso，適合本文件的 PVE CD/DVD 安裝流程
+vga    → .img.bz2，USB／磁碟映像
+serial → .img.bz2，只輸出到 Serial Console
+nano   → .img.bz2，預先安裝的 Embedded 映像
+</code></pre>
+<p>若拿到 <code>.img</code>，代表下載時沒有選到 <code>dvd</code>。不要把 <code>.img</code> 上傳成 ISO 或掛在 CD/DVD Drive；這可能只會停在黑畫面、找不到開機媒體，或因下載到 <code>serial</code> 映像而在一般 VGA Console 看不到輸出。<code>.img</code> 雖可用匯入磁碟的方式啟動，但需要額外安排安裝來源碟、目標系統碟與 Console 類型，不採用於本系列。</p>
+<h2>2. 建立 fw01 VM 110</h2>
+<p>在 <code>pve-l0</code> 按 <code>Create VM</code>：</p>
+<ol>
+<li><code>General</code>：VM ID 填 <code>110</code>、Name 填 <code>fw01</code>，勾選 <code>Start at boot</code>。</li>
+<li><code>OS</code>：選剛上傳的 OPNsense DVD ISO，Guest OS 選 <code>Other</code>。</li>
+<li><code>System</code>：Machine 選 <code>q35</code>、BIOS 選 <code>SeaBIOS</code>，不要新增 EFI Disk；SCSI Controller 選 <code>VirtIO SCSI single</code>。</li>
+<li><code>Disks</code>：Bus／Device 選 SCSI、Storage 選 <code>local-lvm</code>、Disk size 填 <code>16GB</code>，勾選 <code>Discard</code> 與 <code>IO thread</code>。</li>
+<li><code>CPU</code>：1 Socket、2 Cores、Type 選 <code>host</code>。</li>
+<li><code>Memory</code>：填 <code>3072 MiB</code>，不啟用 Ballooning。</li>
+<li><code>Network</code>：Model 選 <code>VirtIO</code>、Bridge 選 <code>vmbr0</code>、VLAN Tag 留白。這張網卡是 net0／WAN。</li>
+<li>完成精靈建立 VM。</li>
+</ol>
+<p>這次實測曾使用 <code>OVMF (UEFI)</code> 並在 EFI Disk 啟用 <code>Pre-Enroll keys</code>，開機時出現：</p>
+<pre><code class="language-text">UEFI QEMU DVD-ROM ... Access Denied
+Start PXE over IPv4
+</code></pre>
+<p>這代表 Secure Boot 拒絕載入 OPNsense DVD，接著才改用 PXE。為了讓讀者直接完成安裝，本教學採用已實測成功的 <code>SeaBIOS</code>，不建立 EFI Disk。</p>
+<p>建立後到 <code>Hardware</code> 再加入：</p>
+<ol>
+<li>net0 保持 Bridge <code>vmbr0</code>、VLAN Tag 留白，作為 WAN，先由上游路由器 DHCP 取址。</li>
+<li>按 <code>Add</code> → <code>Network Device</code> 建立 net1。Model 選 <code>VirtIO</code>、Bridge 選 <code>vmbr2</code>、VLAN Tag 填 <code>10</code>，作為 Internal Management／LAN。PVE 會處理 VLAN Tag，因此 OPNsense 內看到的 <code>vtnet1</code> 是未標記介面。</li>
+<li>再按 <code>Add</code> → <code>Network Device</code> 建立 net2。Model 選 <code>VirtIO</code>、Bridge 選 <code>vmbr2</code>、VLAN Tag 留白，作為 VLAN 20～50 Trunk。</li>
+</ol>
+<p>保存三張 NIC 的 MAC Address，後面以 MAC 對照 <code>vtnet0～2</code>，不要只靠介面順序猜測。</p>
+<p>建立後在 L0 Shell 確認第三張網卡：</p>
+<pre><code class="language-bash">qm config 110 | grep &#39;^net2&#39;
+</code></pre>
+<p><img src="../../source/Day11/1786864312125-image.png" alt="確認 fw01 三張 VirtIO NIC 的 Bridge 與 VLAN Tag"></p>
+<p><em>圖（一）確認 fw01 三張 VirtIO NIC 的 Bridge 與 VLAN Tag。</em></p>
+<p><code>net2</code> 必須顯示 <code>bridge=vmbr2</code>，而且不填 VLAN Tag。若顯示 <code>bridge=vmbr0</code>，請先關閉 fw01，把 net2 的 Bridge 改回 <code>vmbr2</code> 再繼續。</p>
+<p>到 <code>Options</code> → <code>Boot Order</code>，安裝階段將 CD/DVD Drive <code>ide2</code> 放在系統碟 <code>scsi0</code> 前面。CLI 對應指令是：</p>
+<pre><code class="language-bash">qm set 110 --boot &#39;order=ide2;scsi0&#39;
+</code></pre>
+<h2>3. 安裝到虛擬磁碟</h2>
+<ol>
+<li><p>啟動 VM，開啟 PVE Console。</p>
+</li>
+<li><p>Live Environment 登入使用者輸入 <code>installer</code>，密碼輸入 <code>opnsense</code>。</p>
+</li>
+<li><p>Keymap 選預設。</p>
+</li>
+<li><p>本 Lab 單顆 16GB 虛擬磁碟選 <code>Install (UFS)</code>；它沒有磁碟冗餘，正式設備再依磁碟規劃評估 ZFS。</p>
+</li>
+<li><p>確認選到 16GB 系統碟，接受 Partition 與 Swap 建議。</p>
+</li>
+<li><p>設定新的 root 密碼，不要錄到畫面中。</p>
+</li>
+<li><p>選 <code>Complete Install</code>，安裝完成後關機。</p>
+</li>
+<li><p>到 <code>Hardware</code> 的 CD/DVD Drive 退出 OPNsense ISO，或到 <code>Options</code> → <code>Boot Order</code> 將 <code>scsi0</code> 改成第一順位。</p>
+</li>
+<li><p>若使用 CLI，執行：</p>
+<pre><code class="language-bash">qm set 110 --boot &#39;order=scsi0&#39;
+qm start 110
+</code></pre>
+</li>
+<li><p>再次開機時確認系統從 16GB <code>scsi0</code> 啟動，而不是重新進入安裝程式。</p>
+</li>
+</ol>
+<h2>4. 指派介面</h2>
+<p>從 Console 選 <code>1) Assign interfaces</code>：</p>
+<ol>
+<li><code>Do you want to configure LAGGs now?</code> 輸入 <code>N</code>。本 Lab 沒有使用 LACP／LAGG。</li>
+<li><code>Do you want to configure VLANs now?</code> 輸入 <code>N</code>。本日只完成實體／虛擬介面指派，VLAN 20～50 留到 Day 13 從 Web UI 建立。</li>
+<li>接著依 MAC Address 指派：</li>
+</ol>
+<pre><code class="language-text">WAN：vtnet0
+LAN：vtnet1
+OPT1：vtnet2
+</code></pre>
+<p><img src="../../source/Day11/1786864725904-image.png" alt="依 MAC Address 將 WAN、LAN 與 OPT1 指派給 vtnet0～2"></p>
+<p><em>圖（二）依 MAC Address 將 WAN、LAN 與 OPT1 指派給 vtnet0～2。</em></p>
+<p>先用 MAC Address 確認。此時不要在 Console 建 VLAN，Day 13 再從 Web UI 建立。</p>
+<p>選 <code>2) Set interface(s) IP address</code>，將 LAN 設為：</p>
+<pre><code class="language-text">IPv4：10.77.10.1/24
+Gateway：不設定
+IPv6：先不設定
+DHCP Server：關閉
+Web GUI：HTTPS
+</code></pre>
+<h2>5. 從管理電腦開啟 Web UI</h2>
+<p>L0 不需要建立 <code>vmbr3</code>。Day 05 已在 <code>pve-l0</code> → <code>System</code> → <code>Network</code> 建立 <code>vmbr2.10</code>，這裡先選取它並按 <code>Edit</code>，確認：</p>
+<ol>
+<li>VLAN raw device 是 <code>vmbr2</code>，VLAN Tag 是 <code>10</code>。</li>
+<li>IPv4/CIDR 是 <code>10.77.10.10/24</code>。</li>
+<li>IPv4 Gateway、IPv6/CIDR 與 IPv6 Gateway 全部留空。</li>
+<li><code>Autostart</code> 已勾選。</li>
+</ol>
+<p>若先前略過 Day 05，才依照以上數值按 <code>Create</code> → <code>Linux VLAN</code> 補建，完成後按 <code>Apply Configuration</code>。</p>
+<p><code>vmbr2.10</code> 是掛在既有 <code>vmbr2</code> 上的 VLAN 介面，不是另一座 Bridge。先從 L0 Shell 確認：</p>
+<pre><code class="language-bash">ip -4 -br address show vmbr2.10
+ping -c 3 10.77.10.1
+</code></pre>
+<p>確認可達後，管理電腦用 SSH Tunnel 經目前登入 PVE 使用的管理 IP 進入：</p>
+<pre><code class="language-powershell">ssh -L 8443:10.77.10.1:443 root@192.168.0.146
+</code></pre>
+<p>不要將 IP 寫在 <code>Read-Host</code> 的提示文字中。若使用 <code>$L0ManagementIP = Read-Host &#39;192.168.0.146&#39;</code> 後直接按 Enter，變數會是空值，SSH 會顯示連線到空白 Host。若未來 L0 IP 改變，才使用以下寫法並在提示後實際輸入 IP：</p>
+<pre><code class="language-powershell">$L0ManagementIP = Read-Host &#39;請輸入 L0 管理 IP&#39;
+ssh -L 8443:10.77.10.1:443 &quot;root@$L0ManagementIP&quot;
+</code></pre>
+<p>保持 SSH 視窗開啟，在瀏覽器開啟：</p>
+<pre><code class="language-text">https://127.0.0.1:8443
+</code></pre>
+<p>首次使用自簽憑證會出現警告。確認連線目的確實是本機 Tunnel 後再繼續，不要把忽略憑證警告當成正式環境作法。</p>
+<h2>6. 初始設定與備份</h2>
+<ol>
+<li>登入 Web UI，執行 Wizard。</li>
+<li>Hostname 設 <code>fw01</code>，Domain 設 <code>lab.home</code>。</li>
+<li>DNS 暫時使用上游路由器提供值；不要在此時修改 WAN 為 PPPoE。</li>
+<li>Timezone 選 <code>Asia/Taipei</code>，NTP 保留可用來源。</li>
+<li>WAN 維持 DHCP，取消會阻擋實驗上游 Private Address 的選項，因為目前是 Double NAT Lab。</li>
+<li>確認 LAN <code>10.77.10.1/24</code>。</li>
+<li>到 <code>System → Configuration → Backups</code> 下載 <code>config.xml</code>。</li>
+</ol>
+<p><img src="../../source/Day11/1786866179026-image.png" alt="OPNsense 初始設定的 Hostname、Domain 與 Timezone"></p>
+<p><em>圖（三）OPNsense 初始設定的 Hostname、Domain 與 Timezone。</em></p>
+<p><img src="../../source/Day11/1786865185462-image.png" alt="下載 OPNsense config.xml 設定備份"></p>
+<p><em>圖（四）下載 OPNsense config.xml 設定備份。</em></p>
+<p><code>config.xml</code> 可能含 Password Hash、Certificate 與 Private Key，不可提交到 Git。</p>
+<h2>7. 更新 OPNsense</h2>
+<p>先完成前一節的 <code>config.xml</code> 備份，再執行更新。更新過程保持 PVE Console 開啟，不要同時修改 Interface Assignment、VLAN、PPPoE 或 Firewall Rule。</p>
+<ol>
+<li><p>先到 <code>Interfaces</code> → <code>Overview</code>，確認 WAN 已從上游路由器取得 DHCP 位址。</p>
+</li>
+<li><p>到 <code>System</code> → <code>Firmware</code> → <code>Settings</code>，確認 Release Type 是 <code>Community</code>，不要切換成 <code>Development</code>。</p>
+</li>
+<li><p>Firmware Mirror 先保留預設；若下載速度過慢或連線失敗，再改選可正常連線的 East Asia Mirror。</p>
+</li>
+<li><p>回到 <code>System</code> → <code>Firmware</code> → <code>Status</code>。</p>
+</li>
+<li><p>按 <code>Check for updates</code>。</p>
+</li>
+<li><p>有更新時先閱讀 Changelog，再按下安裝更新的按鈕。</p>
+</li>
+<li><p>等待套件下載與安裝完成。若畫面提示需要 Reboot，允許重新啟動；更新期間 SSH Tunnel 與 Web UI 暫時中斷是正常現象。</p>
+</li>
+<li><p>OPNsense 重新開機完成後，再次建立 SSH Tunnel：</p>
+<pre><code class="language-powershell">ssh -L 8443:10.77.10.1:443 root@192.168.0.146
+</code></pre>
+</li>
+<li><p>重新開啟 <code>https://127.0.0.1:8443</code>，到 <code>Lobby</code> → <code>Dashboard</code> 記錄更新後版本。</p>
+</li>
+<li><p>再到 <code>System</code> → <code>Firmware</code> → <code>Status</code> 執行一次 <code>Check for updates</code>，確認沒有尚未完成的更新。</p>
+</li>
+<li><p>更新成功後重新下載一份 <code>config.xml</code>，檔名標註更新後版本與日期，仍不可提交到 Git。</p>
+</li>
+</ol>
+<p><img src="../../source/Day11/1786865168193-image.png" alt="確認 OPNsense Firmware 版本與更新狀態"></p>
+<p><em>圖（五）確認 OPNsense Firmware 版本與更新狀態。</em></p>
+<p>本次使用 <code>26.7</code> 安裝 ISO，更新後的小版本以實際結果為準，不預設固定版號。若 <code>Check for updates</code> 失敗，先確認 WAN、DNS、Default Gateway 與 Firmware Mirror，不要直接改用 Development Repository。</p>
+<p>官方更新說明：<a href="https://docs.opnsense.org/manual/updates.html">https://docs.opnsense.org/manual/updates.html</a></p>
+<h2>8. Console 救援演練</h2>
+<p>保持 PVE Console 開啟，記錄以下選項：</p>
+<pre><code class="language-text">1) Assign interfaces
+2) Set interface(s) IP address
+3) Reset the root password
+4) Reset to factory defaults
+11) Reload all services
+13) Restore a backup
+</code></pre>
+<p><img src="../../source/Day11/day11-fig14.png" alt="OPNsense 主控台的介面指派、服務重新載入與 Shell 救援選單"></p>
+<p><em>圖（六）OPNsense 主控台的介面指派、服務重新載入與 Shell 救援選單。</em></p>
+<p>本日保留現有設定，選擇 <code>11) Reload all services</code> 重新載入服務。完成後回到 L0 再次確認 HTTPS：</p>
+<pre><code class="language-bash">curl -kI --connect-timeout 3 https://10.77.10.1/
+</code></pre>
+<p><img src="../../source/Day11/day11-fig15.png" alt="重新載入服務後從 pve-l0 驗證 OPNsense HTTPS"></p>
+<p><em>圖（七）重新載入服務後，從 pve-l0 再次取得 OPNsense HTTPS 回應。</em></p>
+</main></body>
+</html>

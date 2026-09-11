@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 12｜WAN 如何連上網際網路：OPNsense 的 DHCP、PPPoE、NAT 與 DDNS</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 12｜WAN 如何連上網際網路：OPNsense 的 DHCP、PPPoE、NAT 與 DDNS</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 12｜WAN 如何連上網際網路：OPNsense 的 DHCP、PPPoE、NAT 與 DDNS</a></p>
+<p>本 Lab 先使用上游路由器 DHCP，等所有服務完成後再決定是否把實體 WAN 直接交給 OPNsense。沒有實體 Console 或獨立救援路徑時，不要直接切換 PPPoE。</p>
+<h2>1. 確認目前 Double NAT</h2>
+<p>到 <code>Interfaces → Overview</code> 記錄 WAN：</p>
+<pre><code class="language-text">介面：vtnet0
+IPv4 Configuration Type：DHCP
+位址：由上游路由器配發的 Private IP
+Gateway：上游路由器
+</code></pre>
+<p>因 WAN 收到 Private IP，到 <code>Interfaces → WAN</code> 取消 <code>Block private networks</code>，保留 <code>Block bogon networks</code>，按 Save／Apply。</p>
+<p><img src="../../source/Day12/1786893776308-image.png" alt="確認 OPNsense WAN、LAN 與 OPT1 介面狀態"></p>
+<p><em>圖（一）確認 OPNsense WAN、LAN 與 OPT1 介面狀態。</em></p>
+<p><img src="../../source/Day12/1786893786171-image.png" alt="Double NAT Lab 的 WAN 需取消 Block private networks"></p>
+<p><em>圖（二）Double NAT Lab 的 WAN 需取消 Block private networks。</em></p>
+<p>到 <code>System → Gateways → Configuration</code> 確認 DHCP Gateway Online，再從 <code>Interfaces → Diagnostics → Ping</code>：</p>
+<ol>
+<li>Source 選 WAN。</li>
+<li>Ping 上游 Gateway。</li>
+<li>Ping <code>1.1.1.1</code>。</li>
+<li>到 <code>Interfaces → Diagnostics → DNS Lookup</code> 查詢 <code>www.opnsense.org</code>。</li>
+</ol>
+<p><img src="../../source/Day12/day12-fig15.png" alt="確認 DHCP Gateway 目前為 Online"></p>
+<p><em>圖（三）確認 DHCP Gateway 目前為 Online。</em></p>
+<p><img src="../../source/Day12/day12-fig16.png" alt="從 fw01 Ping 1.1.1.1 並收到全部回覆"></p>
+<p><em>圖（四）從 fw01 驗證公網 IPv4 可達性。</em></p>
+<p><img src="../../source/Day12/day12-fig17.png" alt="從 fw01 查詢 www.opnsense.org 並取得 DNS 紀錄"></p>
+<p><em>圖（五）從 fw01 驗證 DNS 名稱解析。</em></p>
+<h2>2. Source NAT</h2>
+<p>OPNsense 26.7 已將舊版的 <code>Outbound NAT</code> 選單改名為 <code>Source NAT</code>。到 <code>Firewall → NAT → Source NAT</code>：</p>
+<ol>
+<li>先確認目前使用自動產生 Source NAT 規則的模式；這就是舊文件所稱的 <code>Automatic outbound NAT rule generation</code>。</li>
+<li>本日維持自動模式，不新增手動 Source NAT 規則。</li>
+<li>若畫面出現需要套用的變更，再按 Save／Apply；沒有變更時不必為了截圖重存設定。</li>
+<li>Day 13 建好 VLAN 後，回來確認自動產生的 Source NAT 規則是否包含 <code>10.77.20.0/24</code>～<code>10.77.50.0/24</code>。</li>
+</ol>
+<p><img src="../../source/Day12/1786893837862-image.png" alt="確認 OPNsense 自動產生的 Source NAT 規則"></p>
+<p><em>圖（六）確認 OPNsense 自動產生的 Source NAT 規則。</em></p>
+<p>不要在 VLAN 尚未建立前手工新增四條重複 NAT。</p>
+<p>在舊版文章或搜尋結果中，以下名稱指的是同一類功能：</p>
+<pre><code class="language-text">Outbound NAT
+Source NAT
+SNAT
+</code></pre>
+<p>本系列依 OPNsense 26.7 畫面統一使用 <code>Source NAT</code>。</p>
+<h2>3. 記錄上游路由器限制</h2>
+<p>Double NAT 下公開服務需要兩層轉送：</p>
+<pre><code class="language-text">Internet
+  → 上游路由器 Port Forward
+  → fw01 WAN
+  → OPNsense Port Forward
+  → Web VIP 或 jump01
+</code></pre>
+<p>本系列已知上游路由器具有可接受入站連線的公網 IPv4。到上游路由器確認 WAN Address 與外部查到的 Public IP 相符；後續公開服務時，再分別建立上游路由器與 OPNsense 兩層 Port Forward。</p>
+<h2>4. PPPoE 切換 Runbook（本日只確認設定位置）</h2>
+<p>OPNsense 26.7 不再直接於 <code>Interfaces → WAN</code> 的 IPv4 Configuration Type 下拉選單建立 PPPoE。該選單只看到 <code>None</code>、<code>Static IPv4</code> 與 <code>DHCP</code> 是正常現象。PPPoE 必須先建立 Point-to-Point Device，再進行 Interface Assignment。</p>
+<p>本日只確認下列選單位置，不輸入帳密、不按 Save／Apply，也不將目前 WAN 從 DHCP 改成 None。真正切換時，必須具備實體 Console／獨立救援網路，並已確認 ISP 帳密。</p>
+<ol>
+<li>到 <code>Interfaces</code> → <code>Devices</code> → <code>Point-to-Point</code>，按 <code>Add</code>。</li>
+<li>Link Type 選 <code>PPPoE</code>。</li>
+<li>Link interface 選 WAN Parent <code>vtnet0</code>。</li>
+<li>填入 ISP Username／Password；Service Name 與 Host-Uniq 只有 ISP 明確要求時才填。帳密不得出現在截圖、文件或 Git。</li>
+<li>儲存後到 <code>Interfaces</code> → <code>Assignments</code>，選擇新建立的 <code>pppoe0</code> Device 並加入。</li>
+<li>進入新指派的 PPPoE Interface，勾選 Enable，IPv4 Configuration Type 選 <code>PPPoE</code>，再 Save／Apply。</li>
+<li>真正切換時，原本承載 DHCP 的 Parent WAN 必須停止取得 IPv4，避免同一條 WAN 同時保留 DHCP 與 PPPoE；這一步只在維護窗口執行。</li>
+<li>從 PVE Console 確認 PPPoE Interface、WAN Address 與 Gateway，並到 <code>System</code> → <code>Log Files</code> → <code>General</code> 檢查 PPP／LCP／Authentication 訊息。</li>
+</ol>
+<p><img src="../../source/Day12/1786893912025-image.png" alt="OPNsense Point-to-Point Device 的 PPPoE 設定位置"></p>
+<p><em>圖（七）OPNsense Point-to-Point Device 的 PPPoE 設定位置。</em></p>
+</main></body>
+</html>

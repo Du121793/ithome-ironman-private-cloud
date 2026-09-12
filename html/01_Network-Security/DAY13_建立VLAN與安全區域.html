@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 13｜從 VLAN 到安全區域：802.1Q、跨網段路由與 OPNsense 介面</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 13｜從 VLAN 到安全區域：802.1Q、跨網段路由與 OPNsense 介面</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 13｜從 VLAN 到安全區域：802.1Q、跨網段路由與 OPNsense 介面</a></p>
+<p>本日讓 OPNsense 的 <code>vtnet2</code> 承載 VLAN 20～50。Management 使用獨立 <code>vtnet1</code>，不在 Trunk 上重複建立 VLAN 10。</p>
+<h2>本日實際變更範圍</h2>
+<p>Day 13 實際只修改 OPNsense：</p>
+<ol>
+<li>在父介面 <code>vtnet2</code> 建立 VLAN 20、30、40、50 裝置。</li>
+<li>將四個 VLAN 裝置指派並啟用為 SERVICE、DATABASE、BACKUP、BASTION 介面。</li>
+<li>設定四個介面的靜態 IPv4 位址，讓 <code>IPv4 gateway rules</code> 維持 <code>Disabled</code>，並且不啟用 DHCP 服務。</li>
+<li>驗證四條直接連線路由並下載 <code>config.xml</code> 備份。</li>
+</ol>
+<p>今天不建立或修改服務 VM，不建立介面群組（Interface Group），也不新增暫時或正式防火牆規則。下方的 VM VLAN 清單只記錄後續部署日要套用的設定。</p>
+<h2>1. 建立 VLAN 裝置</h2>
+<p>到 <code>Interfaces</code> → <code>Devices</code> → <code>VLAN</code>，按 <code>Add</code>。OPNsense 26.7 的裝置名稱（Device）欄位不能留白，也不能只填 VLAN ID。名稱最多 15 個字元，必須以 <code>vlan0</code> 開頭，後面只能使用數字與句點，例如 <code>vlan0.1.104</code>。不符合時會顯示：</p>
+<pre><code class="language-text">The device name prefix &quot;vlan&quot; is required.
+Only a maximum of 15 characters is allowed starting with &quot;vlan0&quot; combined with numeric characters and dots.
+</code></pre>
+<p>依序建立四個 VLAN 裝置：</p>
+<ol>
+<li>Service VLAN：Device 填 <code>vlan0.2.20</code>、Parent 選 <code>vtnet2</code>、VLAN tag 填 <code>20</code>、Description 填 <code>VLAN20_SERVICE</code>。</li>
+<li>Database VLAN：Device 填 <code>vlan0.2.30</code>、Parent 選 <code>vtnet2</code>、VLAN tag 填 <code>30</code>、Description 填 <code>VLAN30_DATABASE</code>。</li>
+<li>Backup VLAN：Device 填 <code>vlan0.2.40</code>、Parent 選 <code>vtnet2</code>、VLAN tag 填 <code>40</code>、Description 填 <code>VLAN40_BACKUP</code>。</li>
+<li>Bastion VLAN：Device 填 <code>vlan0.2.50</code>、Parent 選 <code>vtnet2</code>、VLAN tag 填 <code>50</code>、Description 填 <code>VLAN50_BASTION</code>。</li>
+</ol>
+<p>每建立一項就核對 Device、Parent 與 Tag，再按 Save。不要在 Parent <code>vtnet2</code> 本身配置 IP，也不要建立 <code>vlan10</code>；Management 已由獨立的 <code>vtnet1</code> 負責。</p>
+<p><img src="../../source/Day13/1786976590321-image.png" alt="確認 VLAN 20～50 的裝置名稱、父介面與 VLAN Tag"></p>
+<p><em>圖（一）確認 VLAN 20～50 的裝置名稱、父介面與 VLAN Tag。</em></p>
+<h2>2. 指派介面</h2>
+<p>到 <code>Interfaces</code> → <code>Assignments</code>，將四個 VLAN 裝置加入並改名：</p>
+<ol>
+<li>將 <code>vlan0.2.20</code> 加入，Description／Interface Name 使用 <code>SERVICE</code>，IPv4 Static Address 設為 <code>10.77.20.1/24</code>。</li>
+<li>將 <code>vlan0.2.30</code> 加入，Description／Interface Name 使用 <code>DATABASE</code>，IPv4 Static Address 設為 <code>10.77.30.1/24</code>。</li>
+<li>將 <code>vlan0.2.40</code> 加入，Description／Interface Name 使用 <code>BACKUP</code>，IPv4 Static Address 設為 <code>10.77.40.1/24</code>。</li>
+<li>將 <code>vlan0.2.50</code> 加入，Description／Interface Name 使用 <code>BASTION</code>，IPv4 Static Address 設為 <code>10.77.50.1/24</code>。</li>
+</ol>
+<p>四個介面均不啟用 DHCP 服務。</p>
+<p><img src="../../source/Day13/1786976620729-image.png" alt="將四個 VLAN 裝置指派為 OPNsense 介面"></p>
+<p><em>圖（二）將四個 VLAN 裝置指派為 OPNsense 介面。</em></p>
+<p>每個介面：</p>
+<ol>
+<li>勾選 Enable Interface。</li>
+<li>IPv4 Configuration Type 選 Static IPv4。</li>
+<li>填入前面指定的 <code>10.77.20.1/24</code>、<code>10.77.30.1/24</code>、<code>10.77.40.1/24</code> 或 <code>10.77.50.1/24</code>。</li>
+<li><code>IPv4 gateway rules</code> 維持 <code>Disabled</code>，上游閘道由 WAN 負責。</li>
+<li>取消內部介面的 Block private networks／Block bogon networks。</li>
+<li>Save；四個都完成後 Apply Changes。</li>
+</ol>
+<p><img src="../../source/Day13/1786976697988-image.png" alt="啟用 VLAN 介面"></p>
+<p><em>圖（三）啟用 VLAN 介面。</em></p>
+<p><img src="../../source/Day13/1786976703533-image.png" alt="設定 VLAN 介面的靜態 IPv4 位址"></p>
+<p><em>圖（四）設定 VLAN 介面的靜態 IPv4 位址，並讓 IPv4 gateway rules 維持 Disabled。</em></p>
+<h2>3. 記錄未來 VM 的 VLAN 配置</h2>
+<p>Day 13 尚未建立服務 VM，本節只記錄後續配置，不進入 PVE 建立或修改任何 VM，也不執行 <code>qm set</code>。</p>
+<p>等各服務進入自己的部署日後，VM 的主要網卡（NIC）才接到 L1 <code>vmbr1</code>，並依用途設定 VLAN Tag：</p>
+<ul>
+<li>proxy01／proxy02，VMID 201／202：VLAN Tag <code>20</code>。</li>
+<li>app01／app02，VMID 211／212：VLAN Tag <code>20</code>。</li>
+<li>pg01～pg03，VMID 221～223：VLAN Tag <code>30</code>。</li>
+<li>ca01，VMID 224：VLAN Tag <code>30</code>。</li>
+<li>jump01，VMID 231：VLAN Tag <code>50</code>。</li>
+<li>client01，VMID 241：VLAN Tag <code>20</code>。</li>
+<li>monitor01，VMID 251：VLAN Tag <code>20</code>。</li>
+<li>backup01，VMID 261：VLAN Tag <code>40</code>。</li>
+<li>pg-restore01，VMID 904：VLAN Tag <code>30</code>；只在 PITR 演練期間建立，不加入 Patroni／etcd。</li>
+</ul>
+<p>服務 VM 預設只接一張網卡。不要為了讓 Database 與 Backup 互通而替 VM 加第二張跨區網卡。</p>
+<p>實際執行時間：</p>
+<ul>
+<li>Day 15 建立 jump01 時設定 VLAN 50。</li>
+<li>Day 19 建立 ca01、Day 20 建立 PostgreSQL 節點時都使用 VLAN 30。ca01 使用 <code>10.77.30.10</code>，pg01～03 使用 <code>10.77.30.11</code>～<code>.13</code>。</li>
+</ul>
+<p>ca01 與 PostgreSQL 節點同在 VLAN 30，兩者的封包不一定經過 OPNsense。Day 19 會在 ca01 建立 nftables 主機防火牆（Host Firewall）；正式環境建議將線上中繼 CA（Online Intermediate CA）放到獨立的 PKI／Security VLAN。</p>
+<ul>
+<li>Day 25 建立 Proxy、Web Backend 與 client01 時設定 VLAN 20。</li>
+<li>Day 28 建立 backup01 時設定 VLAN 40，建立臨時 pg-restore01 時設定 VLAN 30。</li>
+<li>Day 16 提前建立 monitor01 SSH 基線時設定 VLAN 20；Day 29 沿用同一台 VM 安裝監控服務。</li>
+</ul>
+<h2>4. 確認 OPNsense VLAN 介面</h2>
+<p>今天只確認 OPNsense 本身的介面與直接連線路由（Connected Route），不測試尚未存在的 VM。</p>
+<ol>
+<li>到 <code>Interfaces</code> → <code>Overview</code>。</li>
+<li>確認 SERVICE 已啟用，位址為 <code>10.77.20.1/24</code>。</li>
+<li>確認 DATABASE 已啟用，位址為 <code>10.77.30.1/24</code>。</li>
+<li>確認 BACKUP 已啟用，位址為 <code>10.77.40.1/24</code>。</li>
+<li>確認 BASTION 已啟用，位址為 <code>10.77.50.1/24</code>。</li>
+<li>確認四個介面的 Parent 都來自 <code>vtnet2</code>，WAN 仍是 <code>vtnet0</code>，LAN 仍是 <code>vtnet1</code>。</li>
+<li>從 OPNsense Console 選 <code>8) Shell</code>，執行：</li>
+</ol>
+<pre><code class="language-bash">ifconfig vlan0.2.20
+ifconfig vlan0.2.30
+ifconfig vlan0.2.40
+ifconfig vlan0.2.50
+netstat -rn4
+</code></pre>
+<p><code>ifconfig</code> 應顯示介面已啟用，並列出 IPv4 位址、VLAN Tag 與父介面。以下畫面以 SERVICE 為例：</p>
+<p><img src="../../source/Day13/1786976874700-image.png" alt="使用 ifconfig 確認 OPNsense VLAN 介面的實際狀態"></p>
+<p><em>圖（五）使用 ifconfig 確認 OPNsense VLAN 介面的實際狀態。</em></p>
+<p><code>netstat -rn4</code> 應出現四個直接連線網段：</p>
+<pre><code class="language-text">10.77.20.0/24
+10.77.30.0/24
+10.77.40.0/24
+10.77.50.0/24
+</code></pre>
+<p><img src="../../source/Day13/1786976809171-image.png" alt="使用 netstat 確認 VLAN 20～50 的直接連線路由"></p>
+<p><em>圖（六）使用 netstat 確認 VLAN 20～50 的直接連線路由。</em></p>
+<p>本日驗證範圍是 OPNsense 介面與直接連線路由；L1 橋接器（Bridge）、VM VLAN Tag 與跨 VLAN 防火牆政策會在 VM 建立後驗證。</p>
+<h2>5. 備份 Day 13 設定</h2>
+<ol>
+<li>到 <code>System</code> → <code>Configuration</code> → <code>Backups</code>。</li>
+<li>下載加入 VLAN 20～50 後的 <code>config.xml</code>。</li>
+<li>檔名記錄日期與 OPNsense 版本。</li>
+</ol>
+<h2>6. 未來 VM 無法連線時的排錯順序</h2>
+<p>等後續 VM 建立後，若無法連到自己的預設閘道，再依序檢查：</p>
+<ol>
+<li>VM 網卡的 VLAN Tag。</li>
+<li>L1 <code>vmbr1</code> 是否啟用 VLAN-aware。</li>
+<li>L1 net1 是否連到 L0 <code>vmbr2</code>。</li>
+<li>L0 <code>vmbr2</code> 是否 VLAN-aware。</li>
+<li>fw01 net2 是否連到 L0 <code>vmbr2</code>。</li>
+<li>OPNsense VLAN 的父介面、VLAN Tag 與介面啟用狀態。</li>
+<li>OPNsense Live View 是否出現預設拒絕（Default Deny）。</li>
+</ol>
+</main></body>
+</html>

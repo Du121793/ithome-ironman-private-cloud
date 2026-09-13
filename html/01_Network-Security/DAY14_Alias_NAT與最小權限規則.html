@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 14｜從預設拒絕到最小權限：OPNsense 防火牆的別名與規則順序</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 14｜從預設拒絕到最小權限：OPNsense 防火牆的別名與規則順序</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 14｜從預設拒絕到最小權限：OPNsense 防火牆的別名與規則順序</a></p>
+<p>Day 14 會實際建立 Alias 與 VLAN 的基礎規則。由於 proxy、PostgreSQL、jump01 等 VM 還沒有建立，服務專屬的跨區規則、WAN NAT 與連線測試只記錄規格，不在今天啟用。</p>
+<p>今天也不在尚未完成規則前修改 PVE Default Gateway。Day 15 會先新增 <code>PVE_NODES</code> Alias 與 LAN 出口規則，再逐台將 pve01～pve03 切到 Management VLAN 10。</p>
+<h2>1. 建立 INTERNAL_NETWORKS</h2>
+<ol>
+<li>進入 <code>Firewall</code> → <code>Aliases</code>。</li>
+<li>按右下角 <code>Add</code>。</li>
+<li><code>Enabled</code> 保持勾選。</li>
+<li><code>Name</code> 填入 <code>INTERNAL_NETWORKS</code>。</li>
+<li>先將 <code>Type</code> 選成 <code>Network(s)</code>，不要選 <code>Host(s)</code>。</li>
+<li>在 <code>Content</code> 中分別新增下列五個項目：</li>
+</ol>
+<pre><code class="language-text">10.77.10.0/24
+10.77.20.0/24
+10.77.30.0/24
+10.77.40.0/24
+10.77.50.0/24
+</code></pre>
+<ol start="7">
+<li>每個 CIDR 都是一個獨立項目，不要輸入 <code>10.77.10.0/24～10.77.50.0/24</code>。</li>
+<li><code>Description</code> 填入 <code>All internal lab networks</code>。</li>
+<li>按 <code>Save</code>，回到 Alias 清單後按 <code>Apply</code>。</li>
+</ol>
+<p>如果出現下列錯誤，通常是 <code>Type</code> 還在 <code>Host(s)</code>，或把多個網段當成同一個項目輸入：</p>
+<pre><code class="language-text">Entry &quot;10.77.10.0/24&quot; is not a valid hostname, IP address or range.
+</code></pre>
+<p>OPNsense 的 Network Alias 可使用 CIDR，<code>10.77.10.0/24</code> 本身是有效的網段寫法。</p>
+<p><img src="../../source/Day14/day14-fig01.png" alt="建立 INTERNAL_NETWORKS Network Alias"></p>
+<p><em>圖（一）建立 INTERNAL_NETWORKS Network Alias。</em></p>
+<h2>2. 建立主機 Alias</h2>
+<p>下列 VM 雖然還沒有建立，Alias 只是對已規劃 IP 的命名清單，因此可以先建立，不會自動建立 VM 或放行流量。</p>
+<p>每一個 Alias 都使用下列步驟：</p>
+<ol>
+<li>在 <code>Firewall</code> → <code>Aliases</code> 按 <code>Add</code>。</li>
+<li><code>Type</code> 選 <code>Host(s)</code>。</li>
+<li>填入 <code>Name</code>。</li>
+<li>將每個 IP 分別加入 <code>Content</code>。</li>
+<li>填入用途說明，按 <code>Save</code>。</li>
+</ol>
+<p>依序建立：</p>
+<ul>
+<li><code>PROXY_NODES</code>：<code>10.77.20.21</code>、<code>10.77.20.22</code>。</li>
+<li><code>APP_NODES</code>：<code>10.77.20.31</code>、<code>10.77.20.32</code>。</li>
+<li><code>PG_NODES</code>：<code>10.77.30.11</code>、<code>10.77.30.12</code>、<code>10.77.30.13</code>。</li>
+<li><code>CA_NODE</code>：<code>10.77.30.10</code>。</li>
+<li><code>BACKUP_NODE</code>：<code>10.77.40.11</code>。</li>
+<li><code>BASTION_HOST</code>：<code>10.77.50.11</code>。</li>
+<li><code>WEB_VIP</code>：<code>10.77.20.10</code>。</li>
+<li><code>DB_RW_VIP</code>：<code>10.77.20.11</code>。</li>
+<li><code>DB_RO_VIP</code>：<code>10.77.20.12</code>。</li>
+<li><code>BASTION_TARGETS</code>：<code>10.77.20.21</code>、<code>10.77.20.22</code>、<code>10.77.30.11</code>、<code>10.77.30.12</code>、<code>10.77.30.13</code>、<code>10.77.40.11</code>。</li>
+</ul>
+<p>全部完成後按 <code>Apply</code>。<code>BASTION_TARGETS</code> 不要直接放入整個 <code>10.77.0.0/16</code>，否則 jump01 未來會可以嘗試 SSH 到過多主機。</p>
+<p><code>CA_NODE</code> 只先保留名稱，不加入 <code>BASTION_TARGETS</code>，也不在 Day 14 建立 Allow。Day 19 會在 ca01 使用 nftables Host Firewall 放行 <code>PG_NODES → CA_NODE TCP 9000</code>。因為這是同 VLAN 流量，OPNsense 看不到，必須由 ca01 自身的 Host Firewall 處理。</p>
+<p><img src="../../source/Day14/day14-fig02.png" alt="確認 Host、Network 與 Port Alias 清單"></p>
+<p><em>圖（二）確認 Host、Network 與 Port Alias 清單。</em></p>
+<h2>3. 建立 Port Alias</h2>
+<p>這一節需要實際操作。</p>
+<ol>
+<li>到 <code>Firewall</code> → <code>Aliases</code>，按 <code>Add</code>。</li>
+<li><code>Type</code> 選 <code>Port(s)</code>。</li>
+<li>建立 <code>WEB_PORTS</code>，<code>Content</code> 分別加入 <code>80</code> 與 <code>443</code>。</li>
+<li>按 <code>Save</code>。</li>
+<li>使用相同方法建立 <code>PGSQL_PORT</code>，加入 <code>5432</code>。</li>
+<li>建立 <code>PATRONI_API</code>，加入 <code>8008</code>。</li>
+<li>建立 <code>ETCD_PORTS</code>，分別加入 <code>2379</code> 與 <code>2380</code>。</li>
+<li>建立 <code>BASIC_OUTBOUND_TCP</code>，分別加入 <code>80</code> 與 <code>443</code>。</li>
+<li>最後按 <code>Apply</code>。</li>
+</ol>
+<h2>4. 使用 Interface Group 簡化共同規則</h2>
+<p>不需要對 <code>SERVICE</code>、<code>DATABASE</code>、<code>BACKUP</code>、<code>BASTION</code> 重複建立四套規則。先把四個 VLAN 放入同一個 Interface Group，再建立一套共同規則即可。</p>
+<p>不要直接在單一規則中同時勾選四個 Interface。在 OPNsense 新版 Rules 中，多個 Interface 會使這條規則成為 Floating Rule，處理順序比 Group Rule 與單一 Interface Rule 更早，未來加入例外規則時較難判讀。</p>
+<h3>4.1 建立 LAB_INTERNAL Interface Group</h3>
+<ol>
+<li>進入 <code>Firewall</code> → <code>Groups</code>。</li>
+<li>按右下角橘色 <code>+</code>。</li>
+<li><code>Name</code> 填入 <code>LAB_INTERNAL</code>。</li>
+<li><code>Members</code> 同時選擇 <code>SERVICE</code>、<code>DATABASE</code>、<code>BACKUP</code> 與 <code>BASTION</code>。</li>
+<li><code>No GUI groups</code> 不要勾選，這樣才能在 Rules 畫面看到這個 Group。</li>
+<li><code>Description</code> 填入 <code>Common policy for lab service VLANs</code>。</li>
+<li>按 <code>Save</code>，再按 <code>Apply</code>。</li>
+</ol>
+<p><code>LAN</code> 不加入這個 Group，避免影響現在從 <code>10.77.10.0/24</code> 進入 OPNsense Web GUI 的管理路徑。</p>
+<p><img src="../../source/Day14/day14-fig03.png" alt="建立包含 SERVICE、DATABASE、BACKUP 與 BASTION 的 LAB_INTERNAL Group"></p>
+<p><em>圖（三）建立包含 SERVICE、DATABASE、BACKUP 與 BASTION 的 LAB_INTERNAL Group。</em></p>
+<h3>4.2 建立共用 DNS 規則</h3>
+<ol>
+<li>進入 <code>Firewall</code> → <code>Rules</code>。</li>
+<li>按右下角橘色 <code>+</code>。</li>
+<li><code>Interface</code> 只選 Group <code>LAB_INTERNAL</code>，不要再勾選四個成員 Interface。</li>
+<li><code>Action</code> 選 <code>Pass</code>，<code>Quick</code> 保持勾選，<code>Direction</code> 選 <code>in</code>。</li>
+<li><code>Version</code> 選 <code>IPv4</code>，<code>Protocol</code> 選 <code>TCP/UDP</code>。</li>
+<li><code>Source</code> 選 <code>LAB_INTERNAL network</code>，Source Port 保持 <code>any</code>。</li>
+<li><code>Destination</code> 選 <code>This Firewall</code>。</li>
+<li><code>Destination Port</code> 填入 <code>53</code> 或選 <code>DNS</code>。</li>
+<li><code>Description</code> 填入 <code>LAB_INTERNAL to firewall DNS</code>。</li>
+<li>按 <code>Save</code>。</li>
+</ol>
+<p><code>LAB_INTERNAL network</code> 代表四個成員 Interface 的所有網段。<code>This Firewall</code> 則代表 OPNsense 本身的介面位址；這條規則仍只開放 TCP／UDP 53，不會開放其他服務。</p>
+<h3>4.3 建立共用 NTP 規則</h3>
+<ol>
+<li>回到 <code>Firewall</code> → <code>Rules</code>，再按右下角橘色 <code>+</code>。</li>
+<li><code>Interface</code> 選 <code>LAB_INTERNAL</code>，<code>Action</code> 選 <code>Pass</code>。</li>
+<li><code>Version</code> 選 <code>IPv4</code>，<code>Protocol</code> 選 <code>UDP</code>。</li>
+<li><code>Source</code> 選 <code>LAB_INTERNAL network</code>。</li>
+<li><code>Destination</code> 選 <code>This Firewall</code>。</li>
+<li><code>Destination Port</code> 填入 <code>123</code> 或選 <code>NTP</code>。</li>
+<li><code>Description</code> 填入 <code>LAB_INTERNAL to firewall NTP</code>。</li>
+<li>按 <code>Save</code>。</li>
+</ol>
+<p>這條規則只允許封包到達 OPNsense。若 OPNsense NTP 服務沒有監聽這些 Interface，後續仍要調整 NTP 服務設定。</p>
+<h3>4.4 建立共用內網 Block 規則</h3>
+<ol>
+<li>回到 <code>Firewall</code> → <code>Rules</code>，再按右下角橘色 <code>+</code>。</li>
+<li><code>Interface</code> 選 <code>LAB_INTERNAL</code>，<code>Action</code> 選 <code>Block</code>。</li>
+<li><code>Version</code> 選 <code>IPv4</code>，<code>Protocol</code> 選 <code>any</code>。</li>
+<li><code>Source</code> 選 <code>LAB_INTERNAL network</code>。</li>
+<li><code>Destination</code> 選 Alias <code>INTERNAL_NETWORKS</code>。</li>
+<li>勾選 <code>Log packets that are handled by this rule</code>。</li>
+<li><code>Description</code> 填入 <code>Block LAB_INTERNAL to internal networks</code>。</li>
+<li>按 <code>Save</code>。</li>
+</ol>
+<h3>4.5 建立共用套件更新規則</h3>
+<ol>
+<li>回到 <code>Firewall</code> → <code>Rules</code>，再按右下角橘色 <code>+</code>。</li>
+<li><code>Interface</code> 選 <code>LAB_INTERNAL</code>，<code>Action</code> 選 <code>Pass</code>。</li>
+<li><code>Version</code> 選 <code>IPv4</code>，<code>Protocol</code> 選 <code>TCP</code>。</li>
+<li><code>Source</code> 選 <code>LAB_INTERNAL network</code>。</li>
+<li><code>Destination</code> 選 <code>any</code>。</li>
+<li><code>Destination Port</code> 選 Alias <code>BASIC_OUTBOUND_TCP</code>。</li>
+<li><code>Description</code> 填入 <code>Allow LAB_INTERNAL HTTP HTTPS outbound</code>。</li>
+<li>按 <code>Save</code>。</li>
+</ol>
+<p><code>Destination</code> 不要選 <code>WAN network</code>。<code>WAN network</code> 只是 fw01 WAN 直接連接的上游網段，不代表整個 Internet。</p>
+<h3>4.6 確認 Group Rule 順序</h3>
+<ol>
+<li>回到 <code>Firewall</code> → <code>Rules</code>。</li>
+<li>在左上角 <code>All rules</code> 下拉選單選擇 <code>LAB_INTERNAL</code>。</li>
+<li>將規則排成：</li>
+</ol>
+<pre><code class="language-text">LAB_INTERNAL to firewall DNS
+LAB_INTERNAL to firewall NTP
+未來的明確跨區 Allow
+Block LAB_INTERNAL to internal networks
+Allow LAB_INTERNAL HTTP HTTPS outbound
+</code></pre>
+<ol start="4">
+<li>如果規則順序不對，勾選要移動的規則，再按目標規則右側的「Move selected rules before this rule」箭頭。</li>
+<li>按畫面左下角 <code>Apply</code>。</li>
+</ol>
+<p>內網 Block 規則必須放在 Internet 更新 Allow 之前，否則目的為內網主機的 TCP 80／443 也可能被寬鬆規則先命中。</p>
+<p><img src="../../source/Day14/day14-fig04.png" alt="確認 LAB_INTERNAL 共用規則的排列順序"></p>
+<p><em>圖（四）確認 LAB_INTERNAL 共用規則的排列順序。</em></p>
+<h2>5. 服務專屬規則今天不啟用</h2>
+<p>下列是後續部署日要建立的規則，今天只記錄，不要進入 GUI 新增：</p>
+<pre><code class="language-text">PROXY_NODES → PG_NODES TCP 5432
+PROXY_NODES → PG_NODES TCP 8008
+PG_NODES → PG_NODES TCP 5432
+PG_NODES → PG_NODES TCP 2379-2380
+PG_NODES → BACKUP_NODE TCP 22
+BASTION_HOST → BASTION_TARGETS TCP 22
+</code></pre>
+<p>實際新增時，Interface 也選 <code>LAB_INTERNAL</code>，再使用 Source 與 Destination Alias 限定真正的來源與目標。必須將這些規則放在 <code>Block LAB_INTERNAL to internal networks</code> 上方。等對應 VM 與服務存在後才啟用，才能判斷是規則、路由還是服務本身的問題。</p>
+<h2>6. 今天可以做的確認</h2>
+<p>因為服務 VM 尚未建立，今天不執行 <code>nc</code>、<code>curl</code> 或跨 VLAN 連線測試。也不必進入 <code>Firewall</code> → <code>Diagnostics</code> → <code>Aliases</code>；那是排錯時查看 Alias 實際載入內容的工具，不是必要設定步驟。</p>
+<p>今天只做下列確認：</p>
+<ol>
+<li>進入 <code>Firewall</code> → <code>Aliases</code>，在主清單搜尋 <code>INTERNAL_NETWORKS</code>。</li>
+<li>如果找到，按右側鉛筆開啟，確認 Type 是 <code>Network(s)</code>，Content 有 <code>10.77.10.0/24</code>、<code>10.77.20.0/24</code>、<code>10.77.30.0/24</code>、<code>10.77.40.0/24</code>、<code>10.77.50.0/24</code>。內容正確就取消離開，不用重建。</li>
+<li>如果主清單完全找不到 <code>INTERNAL_NETWORKS</code>，代表第 1 節沒有成功儲存，回到第 1 節建立後按 <code>Apply</code>。</li>
+<li>進入 <code>Firewall</code> → <code>Groups</code>，確認 <code>LAB_INTERNAL</code> 包含 <code>SERVICE</code>、<code>DATABASE</code>、<code>BACKUP</code> 與 <code>BASTION</code>。</li>
+<li>進入 <code>Firewall</code> → <code>Rules</code>，用左上角 <code>All rules</code> 下拉選單篩選 <code>LAB_INTERNAL</code>。</li>
+<li>確認 DNS、NTP 在內網 Block 之上，上網 Allow 在內網 Block 之下。</li>
+<li>OPNsense 不會顯示一個叫做 <code>Group Rule</code> 的狀態欄位。按其中一條規則右側的鉛筆進入編輯畫面，確認 <code>Interface</code> 只有 <code>LAB_INTERNAL</code> 一項，沒有同時勾選 SERVICE、DATABASE、BACKUP、BASTION。</li>
+<li>確認沒有新增跨區 <code>any to any</code>。</li>
+</ol>
+<p>以下兩張為 app01 與 pg01 建立後補做的驗證畫面，不屬於 Day 14 當日必要操作。</p>
+<p><img src="../../source/Day14/day14-fig05.png" alt="從測試主機確認允許與拒絕結果"></p>
+<p><em>圖（五）從測試主機確認允許與拒絕結果。</em></p>
+<p><img src="../../source/Day14/day14-fig06.png" alt="在 OPNsense Live View 確認規則命中結果"></p>
+<p><em>圖（六）在 OPNsense Live View 確認規則命中結果。</em></p>
+<h2>7. 儲存 Day 14 設定備份</h2>
+<ol>
+<li>進入 <code>System</code> → <code>Configuration</code> → <code>Backups</code>。</li>
+<li>下載完成 Alias 與基礎規則後的 <code>config.xml</code>。</li>
+<li>檔名記錄日期與 OPNsense 版本。</li>
+</ol>
+</main></body>
+</html>

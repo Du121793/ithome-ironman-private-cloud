@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 15｜SSH 跳板機的部署與權限設計（上）：Linux 路由切換與建立安全入口</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 15｜SSH 跳板機的部署與權限設計（上）：Linux 路由切換與建立安全入口</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 15｜SSH 跳板機的部署與權限設計（上）：Linux 路由切換與建立安全入口</a></p>
+<p>本日先將 pve01～pve03 的預設出口從現有路由器切換到 OPNsense，再建立 VMID <code>231</code>、IP <code>10.77.50.11/24</code> 的 jump01。WAN 使用 TCP <code>45222</code> 轉送到 jump01 TCP <code>22</code>。</p>
+<h2>1. 切換三台 PVE 的對外出口</h2>
+<p>Day 03～15 使用現有路由器是為了在 OPNsense 尚未完成時安裝、建立 Cluster 與保留救援路徑，不是長期安全架構。Day 14 已完成 OPNsense VLAN、Alias 與基礎規則，現在把三台 L1 PVE 的 Default Gateway 切到 VLAN 10，讓它們的 DNS、NTP 與套件更新經過 OPNsense。</p>
+<p>本 Lab 採分階段切換：</p>
+<ul>
+<li><code>vmbr1.10</code> 成為 PVE 正式管理與對外出口。</li>
+<li>原本 <code>vmbr0</code> 的 <code>192.168.0.x/24</code> 位址先保留，但移除 Default Gateway，只供同一路由器 LAN 與 L0 Console 救援。</li>
+<li>L0 <code>pve-l0</code> 繼續使用 <code>192.168.0.146/24</code> 與路由器 Gateway，因為 fw01 本身運行在 L0，L0 不能把唯一救援路徑放在自己承載的 Firewall VM 後方。</li>
+<li>Corosync <code>10.77.80.0/24</code> 與 Ceph <code>10.77.70.0/24</code> 不設 Gateway，本節不修改。</li>
+</ul>
+<p>暫時保留舊 <code>192.168.0.x</code> 位址，代表同一個路由器 LAN 在過渡期間仍可能直接碰到 PVE Web UI；它只是一條 Lab 救援路徑，不等於已完成管理平面隔離。正式環境應使用實體隔離或嚴格限制來源的 OOB 網路，並讓一般 PVE Management 流量經過具備備援的防火牆。</p>
+<h3>1.1 建立 PVE_NODES Alias</h3>
+<p>到 OPNsense <code>Firewall</code> → <code>Aliases</code> 按 <code>Add</code>：</p>
+<ol>
+<li><code>Name</code> 填 <code>PVE_NODES</code>。</li>
+<li><code>Type</code> 選 <code>Host(s)</code>。</li>
+<li><code>Content</code> 分別加入 <code>10.77.10.11</code>、<code>10.77.10.12</code>、<code>10.77.10.13</code>。</li>
+<li><code>Description</code> 填 <code>PVE management addresses after Day 15 cutover</code>。</li>
+<li>Save 後按 <code>Apply</code>。</li>
+</ol>
+<p>這是因 Day 15 新增 PVE Management 切換所需的 Alias；Day 14 已建立的其他 Alias 全部保留，不用重做。</p>
+<h3>1.2 先建立 PVE 出口規則</h3>
+<p>進入 OPNsense <code>Firewall</code> → <code>Rules</code>。每次按右下角橘色 <code>+</code>，Interface 都只選 <code>LAN</code>，依序建立：</p>
+<ol>
+<li>DNS：Interface <code>LAN</code>、Action <code>Pass</code>、Version <code>IPv4</code>、Protocol <code>TCP/UDP</code>、Source <code>PVE_NODES</code>、Destination <code>LAN address</code>、Destination Port <code>53</code>，Description 填 <code>PVE_NODES to OPNsense DNS</code>。</li>
+<li>Gateway 診斷：Interface <code>LAN</code>、Action <code>Pass</code>、Version <code>IPv4</code>、Protocol <code>ICMP</code>、Source <code>PVE_NODES</code>、Destination <code>LAN address</code>，Description 填 <code>PVE_NODES ping OPNsense gateway</code>。</li>
+<li>NTP：Interface <code>LAN</code>、Action <code>Pass</code>、Version <code>IPv4</code>、Protocol <code>UDP</code>、Source <code>PVE_NODES</code>、Destination <code>any</code>、Destination Port <code>123</code>，Description 填 <code>PVE_NODES outbound NTP</code>。</li>
+<li>阻擋其他內網：Interface <code>LAN</code>、Action <code>Block</code>、Version <code>IPv4</code>、Protocol <code>any</code>、Source <code>PVE_NODES</code>、Destination <code>INTERNAL_NETWORKS</code>，勾選 Log，Description 填 <code>Block PVE_NODES to routed internal networks</code>。</li>
+<li>套件更新：Interface <code>LAN</code>、Action <code>Pass</code>、Version <code>IPv4</code>、Protocol <code>TCP</code>、Source <code>PVE_NODES</code>、Destination <code>any</code>、Destination Port <code>BASIC_OUTBOUND_TCP</code>，Description 填 <code>PVE_NODES HTTP HTTPS updates</code>。</li>
+<li>其他對外流量：Interface <code>LAN</code>、Action <code>Block</code>、Version <code>IPv4</code>、Protocol <code>any</code>、Source <code>PVE_NODES</code>、Destination <code>any</code>，勾選 Log，Description 填 <code>Block other PVE_NODES egress</code>。</li>
+</ol>
+<p>規則順序必須是：</p>
+<pre><code class="language-text">PVE_NODES to OPNsense DNS
+PVE_NODES ping OPNsense gateway
+PVE_NODES outbound NTP
+未來明確允許的 PVE 管理或監控流量
+Block PVE_NODES to routed internal networks
+PVE_NODES HTTP HTTPS updates
+Block other PVE_NODES egress
+原本 Default allow LAN to any
+</code></pre>
+<p>最後按左下角 <code>Apply</code>。今天不先刪除 OPNsense 原本的 LAN Default Allow；新增的最後一條 Block 會先擋下 <code>PVE_NODES</code> 其他對外流量，其他尚未盤點的 LAN 管理主機不會因此立即斷線。</p>
+<h3>1.3 切換前備份與確認</h3>
+<p>切換期間始終從 L0 Web UI 打開對應 Nested PVE VM 的 Console，不要只保留瀏覽器中的 PVE Web UI。先在 pve01、pve02、pve03 各自執行：</p>
+<pre><code class="language-bash">cp /etc/network/interfaces /root/interfaces.before-day15
+ip -br address
+ip route
+pvecm status
+chronyc tracking
+ceph -s
+</code></pre>
+<p>確認：</p>
+<ul>
+<li>Cluster 目前 Quorate。</li>
+<li>Corosync Link 0 仍是對應的 <code>10.77.80.11</code>、<code>.12</code>、<code>.13</code>。</li>
+<li>Ceph 仍使用 <code>10.77.70.11</code>、<code>.12</code>、<code>.13</code>。</li>
+<li>L0 可直接開啟三台 Nested PVE Console。</li>
+</ul>
+<p><img src="../../source/Day15/1788107820531-image.png" alt="切換前確認 PVE Cluster 仍保有 Quorum"></p>
+<p><em>圖（一）切換前確認 PVE Cluster 仍保有 Quorum。</em></p>
+<p><img src="../../source/Day15/1788107827559-image.png" alt="切換前確認 Ceph 為 HEALTH_OK"></p>
+<p><em>圖（二）切換前確認 Ceph 為 HEALTH_OK。</em></p>
+<h3>1.4 先切換 pve01</h3>
+<p>使用 pve01 目前的 <code>192.168.0.x</code> Web UI，到 <code>pve01</code> → <code>System</code> → <code>Network</code>：</p>
+<ol>
+<li>選 <code>vmbr0</code> 按 <code>Edit</code>，保留原本 <code>192.168.0.191/24</code>，只將 <code>IPv4 Gateway</code> 清空，按 <code>OK</code>／<code>Save</code> 保存為 Pending Change，但先不按 <code>Apply Configuration</code>。</li>
+<li>選取 Day 05 已建立的 <code>vmbr1.10</code>，按 <code>Edit</code>。</li>
+<li>確認 VLAN raw device 是 <code>vmbr1</code>，VLAN Tag 是 <code>10</code>。</li>
+<li>確認 IPv4/CIDR 是 <code>10.77.10.11/24</code>。</li>
+<li>將原本留白的 IPv4 Gateway 改為 <code>10.77.10.1</code>。</li>
+<li>IPv6 保持不設定，確認 <code>Autostart</code> 已勾選，Comment 可改為 <code>PVE Management via OPNsense</code>。</li>
+<li>儲存後檢查 Pending Changes：<code>vmbr0</code> 只移除 Gateway，<code>vmbr1.10</code> 保留 <code>10.77.10.11/24</code> 並新增 Gateway。</li>
+<li>若先前略過 Day 05、畫面中沒有 <code>vmbr1.10</code>，才按 <code>Create</code> → <code>Linux VLAN</code>，依照上述數值補建。</li>
+<li>保持 L0 Console 開啟，按 <code>Apply Configuration</code>。</li>
+<li>到 pve01 <code>System</code> → <code>DNS</code>，DNS Server 改為 <code>10.77.10.1</code>，Search Domain 保持 <code>lab.home</code>。</li>
+</ol>
+<p><img src="../../source/Day15/1788107668471-image.png" alt="pve01 的 vmbr1.10 使用管理位址與 OPNsense 預設閘道"></p>
+<p><em>圖（三）pve01 的 <code>vmbr1.10</code> 使用 <code>10.77.10.11/24</code>，並將預設閘道設為 <code>10.77.10.1</code>。</em></p>
+<p>Proxmox VE 在 VLAN-aware Linux Bridge 上使用 <code>vmbr1.10</code> 作為 Host Management VLAN 是官方支援的配置方式。一台 Host 只保留一條 IPv4 Default Gateway；不可讓 <code>vmbr0</code> 與 <code>vmbr1.10</code> 同時存在 Default Gateway。</p>
+<h3>1.5 驗證 pve01 後才處理其他節點</h3>
+<p>在 pve01 Console 執行：</p>
+<pre><code class="language-bash">ip -br address show vmbr1.10
+ip route
+ip route get 1.1.1.1
+ping -c 3 10.77.10.1
+getent hosts download.proxmox.com
+curl -4I https://download.proxmox.com/
+apt update
+chronyc tracking
+pvecm status
+ceph -s
+</code></pre>
+<p>預期 <code>ip route get 1.1.1.1</code> 顯示：</p>
+<pre><code class="language-text">via 10.77.10.1 dev vmbr1.10 src 10.77.10.11
+</code></pre>
+<p>同時到 OPNsense <code>Firewall</code> → <code>Log Files</code> → <code>Live View</code>，使用 Source <code>10.77.10.11</code> 過濾，確認 DNS、NTP、HTTP／HTTPS 命中剛才建立的規則。</p>
+<p><img src="../../source/Day15/1788107727235-image.png" alt="從 pve01 驗證 Default Route 與 DNS"></p>
+<p><em>圖（四）路由查詢顯示外部流量經 <code>vmbr1.10</code> 與 <code>10.77.10.1</code> 送出，DNS 解析與 Gateway 連線也正常。</em></p>
+<p><img src="../../source/Day15/1788109476633-image.png" alt="pve01 切換出口後可更新套件並維持時間同步"></p>
+<p><em>圖（五）APT 更新與 Chrony 狀態確認套件出口及時間同步均可正常運作。</em></p>
+<p>只有 pve01 的 Web UI、APT、Time Sync、Cluster 與 Ceph 全部正常後，才使用相同步驟處理：</p>
+<ul>
+<li>pve02：<code>vmbr1.10</code> 設 <code>10.77.10.12/24</code>，Gateway <code>10.77.10.1</code>。</li>
+<li>pve03：<code>vmbr1.10</code> 設 <code>10.77.10.13/24</code>，Gateway <code>10.77.10.1</code>。</li>
+</ul>
+<p>不可同時 Apply 三台節點的網路設定。</p>
+<h3>1.6 切換完成後的名稱解析</h3>
+<p>三台都能從 VLAN 10 上網後，將內部 DNS 或每台 PVE 的 <code>/etc/hosts</code> 更新為：</p>
+<pre><code class="language-text">10.77.10.11 pve01.lab.home pve01
+10.77.10.12 pve02.lab.home pve02
+10.77.10.13 pve03.lab.home pve03
+</code></pre>
+<p>在三台分別確認：</p>
+<pre><code class="language-bash">getent hosts pve01.lab.home
+getent hosts pve02.lab.home
+getent hosts pve03.lab.home
+pvecm nodes
+pvecm status
+</code></pre>
+<p>本節不修改 Hostname，也不修改 Corosync <code>link0</code>，只是將原 Hostname 改解析到正式 Management VLAN 位址。後續使用 <code>https://pve01.lab.home:8006</code>、<code>pve02.lab.home:8006</code>、<code>pve03.lab.home:8006</code> 管理節點。</p>
+<p>目前 Windows 管理電腦仍在 <code>192.168.0.0/24</code>，上游路由器通常不知道 <code>10.77.10.0/24</code> 要往哪裡送。不要為了省事在上游建立一條會繞過 OPNsense 的一般路由；可經已連到 VLAN 10 的 L0 建立 SSH Tunnel：</p>
+<pre><code class="language-powershell">ssh -L 8011:10.77.10.11:8006 -L 8012:10.77.10.12:8006 -L 8013:10.77.10.13:8006 root@192.168.0.146
+</code></pre>
+<p>保持視窗開啟，分別瀏覽 <code>https://127.0.0.1:8011</code>、<code>:8012</code>、<code>:8013</code>。瀏覽器顯示憑證名稱警告是因為網址使用 <code>127.0.0.1</code>；這只是 Lab Tunnel 的已知限制，不是正式環境的憑證處理方式。若 L0 SSH 尚未開放，先使用 L0 PVE Console 與舊救援 IP 驗證，不要臨時建立不受控的跨網段路由。</p>
+<h3>1.7 失聯時回復</h3>
+<p>若切換後無法上網，不要連續修改其他節點。從 L0 開啟該 Nested PVE Console，先臨時恢復舊 Default Route：</p>
+<pre><code class="language-bash">ip route replace default via 192.168.0.1 dev vmbr0
+</code></pre>
+<p>這只是當次開機的臨時回復。要永久回復，使用舊 <code>192.168.0.x</code> Web UI 或 L0 Console：</p>
+<ol>
+<li>將 <code>vmbr1.10</code> 的 IPv4 Gateway 清空。</li>
+<li>將 <code>vmbr0</code> 的 IPv4 Gateway 恢復為 <code>192.168.0.1</code>。</li>
+<li>Apply Configuration。</li>
+<li>必要時依 <code>/root/interfaces.before-day15</code> 對照原設定，不要盲目覆蓋正在運作的網路檔。</li>
+</ol>
+<h2>2. 從 Template 建立 VM</h2>
+<p>在 pve03：</p>
+<ol>
+<li>右鍵 Debian Template → <code>Clone</code>。</li>
+<li>Mode 選 Full Clone。</li>
+<li>VMID <code>231</code>、Name <code>jump01</code>、Target Storage 選 <code>local-lvm</code>。</li>
+<li>完成 Clone 後先不要啟動 VM。Clone 畫面只能選擇儲存位置，磁碟容量會直接繼承 Template，不會出現 Disk Size 欄位。</li>
+<li>選擇 VM 231 <code>jump01</code> → <code>Hardware</code>，將 CPU 設為 1 vCPU、Memory 設為 1GB。</li>
+<li>在 <code>Hardware</code> 選取 <code>Hard Disk (scsi0)</code>，按 <code>Disk Action</code> → <code>Resize</code>。</li>
+<li>先看清單中 <code>scsi0</code> 目前容量。如果 Debian Cloud Image 是 3 GiB，<code>Size Increment (GiB)</code> 填入 <code>5</code>，完成後總容量就是 8 GiB。這個欄位填的是增加量，不是最終容量，因此不要填 <code>8</code>。</li>
+<li>如果 <code>scsi0</code> 已經是 8 GiB 或更大，不要再 Resize。Proxmox VE 可以擴大虛擬磁碟，但不支援直接將現有虛擬磁碟縮小到 8 GiB；Lab 可直接保留較大容量。</li>
+<li>Network Device 接 <code>vmbr1</code>、VLAN Tag <code>50</code>。</li>
+<li>Cloud-Init 設定管理用 SSH 公鑰，不設定共用密碼。</li>
+<li>IP 設 <code>10.77.50.11/24</code>、Gateway <code>10.77.50.1</code>、DNS <code>10.77.50.1</code>。</li>
+<li>Regenerate Image 後啟動。</li>
+</ol>
+<p><img src="../../source/Day15/1788107960188-image.png" alt="jump01 的 CPU、Memory、Disk 與 VLAN 50 NIC"></p>
+<p><em>圖（六）jump01 的 CPU、Memory、Disk 與 VLAN 50 NIC。</em></p>
+<p><img src="../../source/Day15/1788107988413-image.png" alt="jump01 的 Cloud-Init IP、Gateway 與 DNS"></p>
+<p><em>圖（七）jump01 的 Cloud-Init IP、Gateway 與 DNS。</em></p>
+<p>此圖只核對 IP、Gateway 與 DNS；畫面中的密碼與 SSH 公鑰為建置當時狀態，後續以 opsadmin 專用金鑰取代。</p>
+<p>如果 GUI 找不到 Resize，可在 VM 231 所在的 PVE 節點先確認磁碟名稱，再將它擴大到最終 8 GiB：</p>
+<pre><code class="language-bash">qm config 231 | grep &#39;^scsi0:&#39;
+qm disk resize 231 scsi0 8G
+</code></pre>
+<p><code>8G</code> 是 CLI 的最終容量寫法，與 GUI 要填「增加量」不同。磁碟擴大後啟動 jump01，Debian Cloud Image 通常會由 Cloud-Init 自動擴展 Partition 與 Filesystem。登入後確認：</p>
+<pre><code class="language-bash">lsblk
+df -h /
+cloud-init status --long
+</code></pre>
+<p>如果 <code>scsi0</code> 已是 8 GiB，但根目錄仍顯示舊容量，先不要猜測分割區名稱或直接執行 <code>resize2fs</code>；先保留 <code>lsblk -f</code> 與 <code>findmnt /</code> 輸出，依實際 Partition 與 Filesystem 類型處理。</p>
+<p>登入後：</p>
+<pre><code class="language-bash">sudo hostnamectl set-hostname jump01
+sudo apt update
+sudo apt full-upgrade -y
+sudo apt install -y openssh-server fail2ban auditd nftables
+ip -br address
+ip route
+</code></pre>
+<p>本日的安全驗證範圍為 OpenSSH 與 nftables；fail2ban 與 auditd 先完成安裝，相關規則留待後續設定。</p>
+<h2>3. 建立管理帳號</h2>
+<h3>3.1 在本地 Windows 電腦產生專用 SSH 金鑰</h3>
+<p>在管理電腦開啟 PowerShell。這裡為 jump01 建立一組獨立的 Ed25519 金鑰，不與其他主機共用：</p>
+<pre><code class="language-powershell">$Jump01KeyDirectory = Join-Path $env:USERPROFILE &#39;.ssh\ithome_jump01_ed25519&#39;
+$Jump01Key = Join-Path $Jump01KeyDirectory &#39;id_ed25519&#39;
+New-Item -ItemType Directory -Force -Path $Jump01KeyDirectory | Out-Null
+ssh-keygen -t ed25519 -a 100 -f $Jump01Key -C &#39;opsadmin@jump01&#39;
+</code></pre>
+<p><code>ssh-keygen</code> 會要求輸入兩次 Passphrase。正式使用建議設定 Passphrase；若檔案已存在，不要直接同意覆蓋，先換一個檔名或確認舊 Key 已不再使用。</p>
+<p>產生後會得到：</p>
+<pre><code class="language-text">%USERPROFILE%\.ssh\ithome_jump01_ed25519\id_ed25519      私鑰，只留在本地電腦
+%USERPROFILE%\.ssh\ithome_jump01_ed25519\id_ed25519.pub  公鑰，可以放到 jump01
+</code></pre>
+<p>顯示公鑰並複製到剪貼簿：</p>
+<pre><code class="language-powershell">Get-Content &quot;${Jump01Key}.pub&quot;
+Get-Content &quot;${Jump01Key}.pub&quot; | Set-Clipboard
+</code></pre>
+<p>公鑰應是一整行，開頭通常是 <code>ssh-ed25519</code>。不要把沒有 <code>.pub</code> 的私鑰貼進終端、文章、截圖或 Repository。</p>
+<h3>3.2 在 jump01 建立帳號並安裝公鑰</h3>
+<p>從 PVE 開啟 VM 231 Console、登入 <code>labadmin</code> 後先確認：</p>
+<pre><code class="language-bash">hostnamectl --static
+</code></pre>
+<pre><code class="language-text">jump01
+</code></pre>
+<p>若顯示 <code>pve01</code>～<code>pve03</code>，代表仍在 PVE 節點，請先切回 jump01。</p>
+<pre><code class="language-bash">sudo adduser opsadmin
+sudo usermod -aG sudo opsadmin
+sudo install -d -m 700 -o opsadmin -g opsadmin /home/opsadmin/.ssh
+sudo install -m 600 -o opsadmin -g opsadmin /dev/null /home/opsadmin/.ssh/authorized_keys
+</code></pre>
+<p>用編輯器將管理電腦的公鑰貼入：</p>
+<pre><code class="language-bash">sudoedit /home/opsadmin/.ssh/authorized_keys
+</code></pre>
+<p>把 PowerShell 複製的 <code>ssh-ed25519 ... opsadmin@jump01</code> 完整一行貼入。<code>authorized_keys</code> 只保留一份公鑰，不要重複貼上，也不要留下單獨的 <code>.</code>、提示符號或換行後的其他文字。儲存後再次修正擁有者與權限：</p>
+<pre><code class="language-bash">sudo chown -R opsadmin:opsadmin /home/opsadmin/.ssh
+sudo chmod 700 /home/opsadmin/.ssh
+sudo chmod 600 /home/opsadmin/.ssh/authorized_keys
+</code></pre>
+<p>完成第 6 節的 DNAT 後，在本地 PowerShell 讀取 fw01 當下的 WAN IP 並測試：</p>
+<pre><code class="language-powershell">$Fw01WanIp = Read-Host &#39;請輸入 fw01 目前顯示的 WAN IP&#39;
+ssh -i $Jump01Key -p 45222 &quot;opsadmin@$Fw01WanIp&quot;
+</code></pre>
+<p>第一次連線先核對畫面上的 Host Key Fingerprint，再輸入 <code>yes</code>。套用 OpenSSH 設定前先保持 PVE Console 開啟；完成第 6 節的目的地 NAT 與 WAN 規則後，再由另一個 PowerShell 視窗驗證 <code>opsadmin</code> Key 登入。若驗證失敗，可透過 Console 回復 OpenSSH 設定。</p>
+<h2>4. SSH 安全設定</h2>
+<p>建立 <code>/etc/ssh/sshd_config.d/20-bastion-hardening.conf</code>：</p>
+<pre><code class="language-sshconfig">PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AllowAgentForwarding no
+X11Forwarding no
+PermitTunnel no
+GatewayPorts no
+MaxAuthTries 3
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 2
+AllowUsers opsadmin
+</code></pre>
+<p>驗證後只 Reload：</p>
+<pre><code class="language-bash">sudo sshd -t
+sudo systemctl reload ssh
+sudo sshd -T | grep -E &#39;permitrootlogin|passwordauthentication|allowagentforwarding|maxauthtries&#39;
+</code></pre>
+<p><img src="../../source/Day15/1788785692103-image.png" alt="OpenSSH 有效設定與 opsadmin SSH 目錄權限"></p>
+<p><em>圖（八）OpenSSH 關閉 root、密碼及鍵盤互動式驗證並啟用公鑰驗證；opsadmin 的 SSH 目錄及 authorized_keys 權限分別為 700、600。</em></p>
+<p>不要在唯一 Session 中直接 Restart。保持 PVE Console 與既有 SSH Session，直到新 Session 驗證完成。</p>
+<h2>5. Debian 主機防火牆</h2>
+<p>建立 <code>/etc/nftables.conf</code>，只允許 SSH 與必要回應：</p>
+<pre><code class="language-nft">flush ruleset
+table inet filter {
+  chain input {
+    type filter hook input priority 0; policy drop;
+    ct state established,related accept
+    iifname &quot;lo&quot; accept
+    ip protocol icmp accept
+    tcp dport 22 ct state new accept
+  }
+  chain forward { type filter hook forward priority 0; policy drop; }
+  chain output { type filter hook output priority 0; policy accept; }
+}
+</code></pre>
+<pre><code class="language-bash">sudo nft -c -f /etc/nftables.conf
+sudo systemctl enable --now nftables
+sudo nft list ruleset
+</code></pre>
+<p>OPNsense 負責來源限制；主機防火牆再確保 jump01 不會成為 Router。</p>
+<p><img src="../../source/Day15/1788786148999-image.png" alt="確認 jump01 的 nftables 主機防火牆"></p>
+<p><em>圖（九）IPv4 Forwarding 已關閉，nftables 的 Input 與 Forward Chain 採預設丟棄，sshd 只監聽 TCP 22。</em></p>
+<h2>6. 啟用 OPNsense Port Forward</h2>
+<p>OPNsense 26.7 將舊版 <code>Port Forward</code> 選單改名為 <code>Destination NAT</code>。進入 <code>Firewall</code> → <code>NAT</code> → <code>Destination NAT</code>，按 <code>Add</code> 後依序設定：</p>
+<ol>
+<li>Interface 選 <code>WAN</code>。</li>
+<li>TCP/IP Version 選 <code>IPv4</code>。</li>
+<li>Protocol 選 <code>TCP</code>。</li>
+<li>Destination 選 <code>WAN address</code>。</li>
+<li>Destination Port 填 <code>45222</code>。</li>
+<li>Redirect target IP 填 <code>10.77.50.11</code>。</li>
+<li>Redirect target Port 填 <code>22</code>。</li>
+<li>Description 填 <code>WAN_45222_TO_JUMP01_SSH</code>。</li>
+<li>展開 <code>Options</code>；若畫面有 <code>Firewall rule</code>，選 <code>Manual</code>。若沒有這個欄位，就保留預設，下一節仍手動建立 WAN 規則。</li>
+</ol>
+<p>Save／Apply。這條規則只負責把 <code>fw01 WAN:45222</code> 改寫成 <code>10.77.50.11:22</code>。本系列將 <code>Firewall rule</code> 設為 <code>Manual</code>，因此下一節會另外建立可檢視及調整的 WAN 規則。</p>
+<p><img src="../../source/Day15/1788109564321-image.png" alt="Destination NAT 將 WAN TCP 45222 轉送至 jump01 TCP 22"></p>
+<p><em>圖（十）Destination NAT 將 <code>WAN address:45222</code> 轉送至 <code>10.77.50.11:22</code>。</em></p>
+<h3>6.1 手動建立 WAN Allow Rule</h3>
+<p>進入 <code>Firewall</code> → <code>Rules</code>，按右下角橘色 <code>+</code> 建立：</p>
+<ol>
+<li>Interface 選 <code>WAN</code>。</li>
+<li>Action 選 <code>Pass</code>。</li>
+<li>TCP/IP Version 選 <code>IPv4</code>。</li>
+<li>Protocol 選 <code>TCP</code>。</li>
+<li>Source 選 <code>any</code>；正式環境有固定管理來源時改用來源 IP Alias。</li>
+<li>Destination 選 Day 14 已建立的 <code>BASTION_HOST</code> Alias；其內容是 <code>10.77.50.11</code>。</li>
+<li>Destination Port 填 <code>22</code>。</li>
+<li>勾選 Log，Description 填 <code>ALLOW_WAN_DNAT_TO_JUMP01_SSH</code>。</li>
+<li>本 Lab 從與 fw01 WAN 同為 <code>192.168.0.0/24</code> 的 Windows 電腦測試，因此展開 Advanced，將 <code>Disable reply-to</code> 勾選，或將 <code>reply-to</code> 設為 <code>Disable／None</code>。</li>
+<li>Save 後按 <code>Apply</code>。本系列沒有另外建立一條可見的 WAN 最終 Block Rule；未命中這條 Allow 的其他 WAN 流量，會由 OPNsense／pf 內建的隱含 Default Deny 拒絕。若你自行建立過明確 Block，才需要確認這條 Allow 位於它上方。</li>
+</ol>
+<p><img src="../../source/Day15/1788108231495-image.png" alt="WAN Pass Rule 允許流量抵達 BASTION_HOST 的 SSH 連接埠"></p>
+<p><em>圖（十一）WAN Pass Rule 比對轉換後的 BASTION_HOST 與 SSH 連接埠。</em></p>
+<p>WAN 規則使用轉送後的目的 <code>10.77.50.11:22</code>，不是原始的 <code>WAN address:45222</code>，因為 Destination NAT 會先改寫目的位址，Firewall Filter 再比對封包。到 Live View 時可用 Description、來源位址與 <code>10.77.50.11:22</code> 確認命中。</p>
+<p>本 Lab 的 Windows 與 fw01 WAN 位於同一網段，因此這條規則要停用 <code>reply-to</code>。修改後到 <code>Firewall</code> → <code>Diagnostics</code> → <code>States</code> 刪除 TCP 45222 的舊測試 State 再重連；正式 Internet 或 Multi-WAN 環境不要直接照抄。</p>
+<p>Double NAT 時還要在上游路由器把 TCP 45222 轉送到 fw01 WAN IP。本系列已知上游具有可接受入站連線的公網 IPv4；完成兩層轉送後，必須從真正外部網路驗證，不能只用同網段或模擬 WAN 用戶端結果宣稱 Internet 可連入。</p>
+<h2>7. 驗證</h2>
+<p>從 WAN 側的 Windows PowerShell 使用本節建立的專用 Key 測試：</p>
+<pre><code class="language-powershell">$Jump01Key = Join-Path $env:USERPROFILE &#39;.ssh\ithome_jump01_ed25519\id_ed25519&#39;
+$Fw01WanIp = Read-Host &#39;請輸入 fw01 目前顯示的 WAN IP&#39;
+ssh -i $Jump01Key -p 45222 -o PasswordAuthentication=no &quot;opsadmin@$Fw01WanIp&quot;
+</code></pre>
+<p><img src="../../source/Day15/1788108559203-image.png" alt="管理者透過 fw01 WAN TCP 45222 使用專用金鑰登入 jump01"></p>
+<p><em>圖（十二）正確的管理帳號與專用私鑰可透過 fw01 WAN TCP 45222 登入 jump01。</em></p>
+<p><img src="../../source/Day15/1788785845914-image.png" alt="root、密碼、錯誤私鑰與未開放連接埠均無法通過 SSH 入口"></p>
+<p><em>圖（十三）root、密碼及錯誤私鑰均遭到 SSH 拒絕，未開放的 TCP 45223 也無法連線。</em></p>
+<p>確認：</p>
+<pre><code class="language-text">公鑰成功
+密碼登入失敗
+root 登入失敗
+錯誤 Key 失敗
+OPNsense Live View 有對應 State
+journalctl -u ssh 有登入紀錄
+</code></pre>
+</main></body>
+</html>

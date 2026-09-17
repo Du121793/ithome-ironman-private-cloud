@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 與單點風險</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 與單點風險</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 與單點風險</a></p>
+<p>本日先用 IDS Alert Mode 確認介面與規則，再切換 IPS。不要直接在唯一 WAN 管理路徑啟用阻擋模式。</p>
+<h2>1. 增加 fw01 記憶體與建立快照</h2>
+<p>確認 VM 110 至少 3GB RAM。啟用大量 Ruleset 前觀察實際用量；若 Suricata 發生 OOM，先增加到 4GB，而不是刪除所有安全規則。</p>
+<p>變更前：</p>
+<ol>
+<li>下載最新 <code>config.xml</code>。</li>
+<li>在 PVE 建立短期 Snapshot <code>before-suricata</code>。</li>
+<li>保持 PVE Console 與 SSH Tunnel 可用。</li>
+</ol>
+<p>Snapshot 只用於短期回復，不取代設定備份。</p>
+<h2>2. 關閉 Hardware Offloading</h2>
+<p>到 <code>Interfaces → Settings</code>，將以下三個以 <code>Disable</code> 開頭的選項全部勾選：</p>
+<pre><code class="language-text">Disable hardware checksum offload
+Disable hardware TCP segmentation offload
+Disable hardware large receive offload
+</code></pre>
+<p>這三個欄位是負向命名，因此「勾選」代表停用 Offloading，不是啟用它。Save／Apply，依畫面提示重新啟動。虛擬化環境若保留 Offloading，Packet Capture 與 IPS 可能看到不完整或錯誤的封包狀態。</p>
+<p><img src="../../source/Day18/1788538143775-image.png" alt="停用 OPNsense 的 Hardware Offloading"></p>
+<p><em>圖（一）停用 OPNsense 的 Hardware Offloading。</em></p>
+<h2>3. 啟用 IDS Alert Mode</h2>
+<p>到 <code>Services → Intrusion Detection → Administration → Settings</code>：</p>
+<ol>
+<li>勾選 Enabled。</li>
+<li>Capture mode 選 <code>PCAP live mode (IDS)</code>。新版介面不再提供獨立的 IPS Mode 核取方塊；這個模式只產生 Alert，不會丟棄封包。</li>
+<li>Promiscuous Mode 依介面需求保留預設。</li>
+<li>Interfaces 先選 WAN；要觀察跨 VLAN 流量時再加入承載 VLAN 的 Parent／對應介面。</li>
+<li>Home Networks 預設會帶入 <code>192.168.0.0/16</code>、<code>10.0.0.0/8</code>、<code>172.16.0.0/12</code>。這三筆是完整 RFC1918 私有位址範圍，而 <code>10.0.0.0/8</code> 已經包含所有 <code>10.77.x.x</code>，因此不要在預設值後面重複追加 Lab 網段。</li>
+<li>本系列要讓 HOME_NET 精確代表 OPNsense 後方受保護的網路，因此移除上述三筆預設值，改為逐筆加入 <code>10.77.10.0/24</code>、<code>10.77.20.0/24</code>、<code>10.77.30.0/24</code>、<code>10.77.40.0/24</code>、<code>10.77.50.0/24</code>、<code>10.77.60.0/24</code>。不要加入模擬 WAN <code>192.168.0.0/24</code>、Ceph <code>10.77.70.0/24</code> 或 Corosync <code>10.77.80.0/24</code>。</li>
+<li>Save／Apply。</li>
+</ol>
+<p><img src="../../source/Day18/1788538177856-image.png" alt="啟用 IDS Alert Mode 並選擇監看介面"></p>
+<p><em>圖（二）啟用 IDS Alert Mode 並選擇監看介面。</em></p>
+<p><img src="../../source/Day18/1788538220408-image.png" alt="將 HOME_NET 限定為本 Lab 受保護網段"></p>
+<p><em>圖（三）將 HOME_NET 限定為本 Lab 受保護網段。</em></p>
+<h2>4. 下載與啟用 Ruleset</h2>
+<p>到 <code>Download</code> 頁面：</p>
+<ol>
+<li>選取完整來源 <code>ET open/emerging.rules</code>，按 Download／Update Rules。Download 頁面負責下載整包 ET Open，不是在這一頁逐一挑選 Scan、Policy 等分類。</li>
+<li>下載完成後進入 <code>Services</code> → <code>Intrusion Detection</code> → <code>Administration</code> → <code>Rules</code>。</li>
+<li>搜尋 SID <code>2010939</code>，找到 <code>ET SCAN Suspicious inbound to PostgreSQL port 5432</code>。</li>
+<li>按該規則右側的 Edit 鉛筆圖示，勾選 <code>Enabled</code>，將 <code>Action</code> 設為 <code>Alert</code>，再按 <code>Save</code>。</li>
+<li>回到 Rules 頁面按 <code>Apply</code>，重新搜尋 SID <code>2010939</code>，確認規則已經 Enabled，而且 Action 是 Alert。</li>
+</ol>
+<p>這裡操作的是下載規則的單條手動覆寫，不要進入 <code>Administration</code> → <code>User defined</code>。User defined 的 Source IP、Destination IP、SSL/Fingerprint、Bypass 等欄位用來建立新的自訂規則，不能用來啟用既有的 ET Open 規則。</p>
+<h3>4.1 可選：改用 Policy 管理整個 Scan 分類</h3>
+<p>若希望一次管理 <code>emerging-scan</code> 裡的一批規則，可以用 Policy 取代前面的單條 Edit。兩種方法擇一使用；本日預設仍採用 SID <code>2010939</code> 的單條手動覆寫。</p>
+<ol>
+<li>進入 <code>Services</code> → <code>Intrusion Detection</code> → <code>Policy</code> → <code>Policies</code>，按 <code>Add</code>。</li>
+<li>依序設定：</li>
+</ol>
+<table>
+<thead>
+<tr>
+<th>欄位</th>
+<th>設定值</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Enabled</td>
+<td>勾選</td>
+<td>啟用這筆 Policy</td>
+</tr>
+<tr>
+<td>Priority</td>
+<td><code>10</code></td>
+<td>數字越低越優先；從 <code>10</code> 開始可替日後更高優先的 Policy 保留較小編號</td>
+</tr>
+<tr>
+<td>Rulesets</td>
+<td><code>ET open/emerging-scan.rules</code></td>
+<td>只比對 Scan 分類；不同版本可能省略 <code>.rules</code></td>
+</tr>
+<tr>
+<td>Action</td>
+<td><code>Disabled</code></td>
+<td>只挑出目前尚未啟用的規則</td>
+</tr>
+<tr>
+<td>Rules</td>
+<td>全部留空</td>
+<td>不再使用產品、部署位置等中繼資料縮小範圍</td>
+</tr>
+<tr>
+<td>New action</td>
+<td><code>Alert</code></td>
+<td>將符合條件的規則啟用為只告警</td>
+</tr>
+<tr>
+<td>Description</td>
+<td><code>LAB_ET_ALERT</code></td>
+<td>識別這筆 Lab Policy</td>
+</tr>
+</tbody></table>
+<ol start="3">
+<li>按 <code>Save</code>，再按頁面上的 <code>Apply</code>。</li>
+<li>回到 <code>Administration</code> → <code>Rules</code>，以 <code>scan</code> 或 <code>matched_policy</code> 篩選，確認符合條件的規則已經 Enabled、Action 是 Alert，套用來源是 <code>LAB_ET_ALERT</code>。</li>
+</ol>
+<p>這筆 Policy 會處理 <code>emerging-scan</code> 中所有符合條件的 Disabled 規則，不只 SID <code>2010939</code>。如果先前已對 SID <code>2010939</code> 建立手動覆寫，請保留本日預設作法，不要再疊加這筆 Policy；要全面改用 Policy 時，應先到 <code>Policy</code> → <code>Rule adjustments</code> 移除對應的手動調整，再重新 Apply。</p>
+<p>本日只手動啟用 <code>emerging-scan</code> 分類中的 SID <code>2010939</code>，因為它直接對應接下來送往 PostgreSQL Port 的 Nmap 探測，測試流量可由自己控制、停止與重複。其他分類留到服務存在且有明確觀察目的時再啟用：</p>
+<ul>
+<li><code>emerging-scan</code>：包含連接埠掃描、服務探測與部分 Nmap 行為的偵測規則；本日只啟用其中一條可重現的規則。</li>
+<li><code>emerging-policy</code>：偵測代理工具、異常協定使用方式及可能違反組織政策的流量。它不一定代表入侵，而且較容易產生雜訊，本日不啟用。</li>
+<li><code>emerging-dns</code>：可選分類，用於觀察可疑 DNS 查詢與已知異常行為，本日不啟用。</li>
+<li><code>emerging-web_server</code>：為後續 Nginx／應用服務提供 Web Server 攻擊與異常請求的偵測規則；Day 18 先下載，等對應服務與流量存在後再展示命中結果。</li>
+<li><code>emerging-malware</code>：如果目前版本有顯示，可用來偵測已知惡意軟體與部分 C2 通訊；沒有顯示就略過。正常 Lab 不應為了命中它而下載或執行真正惡意程式。</li>
+</ul>
+<p>本日暫時不要啟用整套 <code>dos</code>、<code>exploit</code>、<code>current_events</code>、<code>p2p</code>、<code>games</code>、<code>voip</code>、<code>mobile_malware</code> 或所有 ET Open 規則。它們不是全部沒有價值，而是與目前 Lab 服務不一定相關；一次啟用過多會增加記憶體用量、告警雜訊與誤判排查工作，也不利於解釋是哪一類規則產生結果。</p>
+<p>Ruleset 是規則來源；規則的 Enabled 狀態與 Action 可以由 Policy 批次管理，也可以在 Rules 頁面手動覆寫。OPNsense 官方建議大量或長期管理時使用 Policy，因為它能按照 Ruleset、既有 Action 與規則中繼資料批次套用設定。本日只驗證一條規則，因此直接在 Rules 頁面手動覆寫；第 6 節也只把同一條已命中的 Signature 改為 Drop，不把整個 <code>emerging-scan</code> 或其他分類一次全部切成 Drop。</p>
+<p>Policy 位於 <code>Services</code> → <code>Intrusion Detection</code> → <code>Policy</code>，不是 <code>Administration</code> 裡的分頁。本日預設不建立 Policy，避免為了單一 SID 改動整個 Scan 分類；需要示範批次管理時，可以改做 4.1 節，但不要和單條手動覆寫混在一起。</p>
+<p>記錄 Ruleset 更新時間與啟用數量。</p>
+<h2>5. 產生受控測試流量</h2>
+<p>Day 18 尚未建立 Day 25 的 proxy01 <code>10.77.20.21</code>，因此本日改用 Day 16 已建立的 app01 <code>10.77.20.31</code> 當作受控目標。</p>
+<h3>5.1 先確認 PVE L0 的封包會經過 fw01</h3>
+<p>在 PVE L0 執行：</p>
+<pre><code class="language-bash">ip route get 10.77.20.31
+</code></pre>
+<p>如果結果顯示 <code>via 192.168.0.1</code>，代表封包被送往原本的家用路由器，根本沒有經過 fw01，因此 Suricata 不可能看到。加入只針對本次測試目標的暫時 Route：</p>
+<pre><code class="language-bash">ip route replace 10.77.20.31/32 via 192.168.0.84 dev vmbr0
+ip route get 10.77.20.31
+</code></pre>
+<p>第二次結果必須顯示 <code>via 192.168.0.84 dev vmbr0</code>。<code>192.168.0.84</code> 是目前 fw01 的 WAN 位址；若 <code>Interfaces</code> → <code>Overview</code> 顯示的 fw01 WAN 已改變，這裡也要使用實際位址。</p>
+<h3>5.2 用 Packet Capture 證明路徑</h3>
+<p>到 OPNsense <code>Interfaces</code> → <code>Diagnostics</code> → <code>Packet Capture</code>：</p>
+<ol>
+<li>Interface 選 <code>WAN</code>。</li>
+<li>Address Family 選 <code>IPv4</code>。</li>
+<li>Protocol 選 <code>TCP</code>。</li>
+<li>Host Address 填 PVE L0 <code>192.168.0.146</code>。</li>
+<li>Count 填 <code>100</code>，開始 Capture。</li>
+</ol>
+<p>回 PVE L0 執行：</p>
+<pre><code class="language-bash">sudo apt update
+sudo apt install -y nmap
+sudo nmap -sS -Pn -p 22,80,443,5432 10.77.20.31
+</code></pre>
+<p>停止 Capture 並檢視結果。必須看到來源 <code>192.168.0.146</code>、目的 <code>10.77.20.31</code> 的 TCP SYN；若完全沒有封包，先處理 Route，不要繼續修改 IDS Ruleset。</p>
+<h3>5.3 核對 ET Open Alert</h3>
+<p>到 <code>Services</code> → <code>Intrusion Detection</code> → <code>Administration</code> → <code>Alerts</code>，依來源 <code>192.168.0.146</code>、目的 <code>10.77.20.31</code> 或 SID <code>2010939</code> 過濾。本次實測命中結果為：</p>
+<pre><code class="language-text">Interface：WAN
+Action：allowed
+Source：192.168.0.146
+Destination：10.77.20.31
+Destination Port：5432
+SID：2010939
+Signature：ET SCAN Suspicious inbound to PostgreSQL port 5432
+</code></pre>
+<p><code>allowed</code> 是正常結果，因為目前 Capture mode 是 <code>PCAP live mode (IDS)</code>，只告警而不丟棄封包。既然 ET Open 已經穩定命中 SID <code>2010939</code>，本系列不需要另外建立 User defined 測試規則。</p>
+<p><img src="../../source/Day18/1788539958033-image.png" alt="檢視 SID 2010939 的 Alert 詳細資料"></p>
+<p><em>圖（四）Alert 詳細資料顯示 SID <code>2010939</code>、測試來源與目的，設定動作為 Alert。</em></p>
+<p>若仍沒有 Alert：</p>
+<ol>
+<li>確認流量真的經過所選介面。</li>
+<li>確認 Intrusion Detection 狀態是 Running，而且 Capture mode 是 <code>PCAP live mode (IDS)</code>。</li>
+<li>到 Rules 搜尋 SID <code>2010939</code>，確認它已由手動覆寫設為 Enabled／Alert。</li>
+<li>清除 Alerts 頁面的時間、Action 或 Ruleset 篩選後重新整理。</li>
+<li>不要靠重複掃描外部網站測試。</li>
+</ol>
+<h2>6. 切換 IPS</h2>
+<p>確認 Alert Mode 正常後：</p>
+<ol>
+<li>到 <code>Services</code> → <code>Intrusion Detection</code> → <code>Administration</code> → <code>Rules</code> 搜尋 SID <code>2010939</code>，按 Edit，只將這一條已驗證的 ET 規則 Action 由 Alert 改成 Drop，再按 Save 與 Apply。不要把整個 <code>emerging-scan</code> 設成 Drop。</li>
+<li>回到 Settings，將 Capture mode 從 <code>PCAP live mode (IDS)</code> 改成 <code>Netmap (IPS)</code>。本 Lab 不選 <code>Divert (IPS)</code>；Divert 模式還必須另外建立帶有 Divert-to 的新版 Firewall Rule。</li>
+<li>Apply 後重做同一項測試。</li>
+<li>在 Alerts 確認 SID <code>2010939</code> 的 Action 從 <code>allowed</code> 變成 <code>blocked</code>／<code>drop</code>。由於 WAN Firewall 本來就會拒絕未授權的連線，Nmap 結果可能前後相同；本次以 Suricata Alert Action 的變化作為 IPS 已執行 Drop 的主要證據。</li>
+</ol>
+<p><img src="../../source/Day18/1788540093592-image.png" alt="將 SID 2010939 的單條規則動作改為 Drop"></p>
+<p><em>圖（五）單條規則 <code>2010939</code> 的 Action 設為 Drop。</em></p>
+<p><img src="../../source/Day18/1788540156938-image.png" alt="比較 SID 2010939 切換前後的 Alerts 處理結果"></p>
+<p><em>圖（六）相同 SID 的紀錄先顯示 <code>allowed</code>，切換 Netmap 與 Drop 後顯示 <code>blocked</code>。</em></p>
+<p>如果管理連線中斷，從 PVE Console 停用 Intrusion Detection 或還原設定，不在失聯狀態盲目修改更多規則。</p>
+<p>測試完成後可在 PVE L0 移除本次暫時 Route：</p>
+<pre><code class="language-bash">sudo ip route del 10.77.20.31/32
+</code></pre>
+</main></body>
+</html>

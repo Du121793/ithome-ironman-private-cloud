@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 17｜外部人員如何安全連入內部服務？OpenVPN、Road Warrior 與 Split Tunnel</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 17｜外部人員如何安全連入內部服務？OpenVPN、Road Warrior 與 Split Tunnel</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 17｜外部人員如何安全連入內部服務？OpenVPN、Road Warrior 與 Split Tunnel</a></p>
+<p>本日建立 OPNsense OpenVPN Road Warrior。Tunnel Network 固定為 <code>10.77.60.0/24</code>。一般 VPN 使用者只能連固定服務入口；只有獨立 <code>vpn-admin</code> 群組可以連 PVE Web UI 8006，而且仍不能直接連 pg01～pg03、Patroni 或 etcd。</p>
+<h2>1. 確認內建 OpenVPN 功能</h2>
+<p>OPNsense 26.7 已將 OpenVPN 與新版 <code>Instances</code>、<code>Client Export</code> 功能整合在基礎系統。</p>
+<ol>
+<li>到 <code>System</code> → <code>Firmware</code> → <code>Packages</code>，搜尋 <code>openvpn</code>，確認套件已安裝。</li>
+<li>到 <code>VPN</code> → <code>OpenVPN</code>，確認可以看到 <code>Instances</code>。</li>
+<li>同一選單確認可以看到 <code>Client Export</code>、<code>Connection Status</code> 與 <code>Log File</code>。</li>
+<li><code>System</code> → <code>Firmware</code> → <code>Plugins</code> 只搜尋到 <code>os-openvpn-legacy</code> 是正常的，不要安裝它。本系列使用新版 <code>Instances</code>，不使用舊版 Servers／Clients 設定頁。</li>
+</ol>
+<h2>2. 建立內部 CA</h2>
+<p>到 <code>System → Trust → Authorities</code>：</p>
+<ol>
+<li>Add。</li>
+<li>Method 選 Create an internal Certificate Authority。</li>
+<li><code>Common Name</code> 填 <code>IRON-LAB-OPENVPN-CA</code>。OPNsense 26.7 的目前畫面若沒有 <code>Descriptive Name</code>，不需要另外尋找；若有選用的 <code>Description</code> 欄位，可填相同名稱方便辨識。</li>
+<li>Key Type 選 RSA 3072 位元或畫面提供的更高安全等級。</li>
+<li>Digest Algorithm 選 SHA256 以上。</li>
+<li>Issuer 保持 Self-signed。</li>
+<li>Lifetime 依 Lab 設定並記錄到期日，例如 <code>3650</code> 天只作為教學 CA 的有效期限。</li>
+<li>Country、State、City、Organization 等識別欄位可以依實際資料填寫；不影響本 Lab 路由設定。</li>
+<li>OCSP URI 留空，本系列沒有另外部署 OCSP Responder。</li>
+<li>按 Save，回到 Authorities 清單確認 <code>IRON-LAB-OPENVPN-CA</code> 已出現。</li>
+</ol>
+<p><img src="../../source/Day17/1788455974963-image.png" alt="建立 OpenVPN 內部 CA"></p>
+<p><em>圖（一）建立 <code>IRON-LAB-OPENVPN-CA</code> 內部 CA。</em></p>
+<p>不要把 CA Private Key 放入 Git。</p>
+<h2>3. 建立 Server Certificate</h2>
+<p>到 <code>System → Trust → Certificates</code>：</p>
+<ol>
+<li>按 Add，Method 選 <code>Create an internal Certificate</code>。若選成 Import 或 CSR，後面不會出現簽發者選項。</li>
+<li>Type 選 <code>Server Certificate</code>。</li>
+<li>Private Key Location 選 <code>Save on this firewall</code>。</li>
+<li>Key Type 選 RSA 3072 位元或畫面提供的更高安全等級，Digest Algorithm 選 SHA256 以上。</li>
+<li>新版畫面不會顯示名為 <code>CA</code> 的欄位；在 <code>Issuer</code> 選 <code>IRON-LAB-OPENVPN-CA</code>。這就是簽發本張 Server Certificate 的 CA。</li>
+<li>Common Name 填 <code>vpn.lab.home</code>。</li>
+<li>在 <code>DNS domain names</code> 加入 <code>vpn.lab.home</code>。這個欄位就是憑證的 DNS Subject Alternative Name（SAN），OPNsense 26.7 不需要另外選 Type／Value。</li>
+<li>Lifetime 依 Lab 設定並記錄到期日，例如 <code>825</code> 天。</li>
+<li>Description 若有顯示，可填 <code>IRON-LAB-OPENVPN-SERVER</code>；沒有就略過。</li>
+<li>Save 後回到 Certificates 清單，確認 Type 是 Server、Issuer 是 <code>IRON-LAB-OPENVPN-CA</code>。</li>
+</ol>
+<p>如果選了 <code>Create an internal Certificate</code> 仍完全看不到 <code>Issuer</code>，先回 <code>System</code> → <code>Trust</code> → <code>Authorities</code>，確認 <code>IRON-LAB-OPENVPN-CA</code> 已成功儲存且帶有 Private Key；只有可簽發憑證的內部 CA 才能出現在 Issuer 清單。</p>
+<h2>4. 建立使用者與個人憑證</h2>
+<p>到 <code>System → Access → Users</code>，為每位測試者建立獨立帳號：</p>
+<pre><code class="language-text">vpn-rw01
+vpn-ro01
+vpn-monitor01
+vpn-admin01
+</code></pre>
+<p>每個帳號都要建立自己的 Client Certificate，而且必須與 OpenVPN Server Certificate 由同一個 CA 簽發。以 <code>vpn-admin01</code> 為例：</p>
+<ol>
+<li>編輯 <code>vpn-admin01</code> 使用者。</li>
+<li>到該使用者的 Certificates 區域，按新增憑證。</li>
+<li>Method 選 <code>Create an internal Certificate</code>。</li>
+<li>Type 選 <code>Client Certificate</code>，不要選 Server Certificate。</li>
+<li>Issuer 選 <code>IRON-LAB-OPENVPN-CA</code>。</li>
+<li>Common Name 必須是 <code>vpn-admin01</code>，與 Username 完全相同；從使用者頁面建立時通常會自動帶入。</li>
+<li>Save，並為其餘三個帳號各自重複一次，不共用憑證或 Profile。</li>
+</ol>
+<p>完成後到 <code>System</code> → <code>Trust</code> → <code>Certificates</code> 核對：</p>
+<pre><code class="language-text">vpn.lab.home   Type：Server   Issuer：IRON-LAB-OPENVPN-CA
+vpn-rw01       Type：Client   Issuer：IRON-LAB-OPENVPN-CA
+vpn-ro01       Type：Client   Issuer：IRON-LAB-OPENVPN-CA
+vpn-monitor01  Type：Client   Issuer：IRON-LAB-OPENVPN-CA
+vpn-admin01    Type：Client   Issuer：IRON-LAB-OPENVPN-CA
+</code></pre>
+<p><img src="../../source/Day17/1788455684090-image.png" alt="確認 OpenVPN 測試帳號"></p>
+<p><em>圖（二）確認四個 OpenVPN 測試帳號已建立。</em></p>
+<p>若 Client Certificate 的 Issuer 是其他 CA，不能直接修改原憑證的簽發者；回到對應使用者建立一張由 <code>IRON-LAB-OPENVPN-CA</code> 簽發的新憑證。先保留舊憑證，等新 Profile 匯出並連線成功後再撤銷舊憑證。</p>
+<p>若啟用 TOTP，先確認 fw01 與手機時間一致，再測試 OTP。</p>
+<p>另外建立本機群組 <code>vpn-admin</code>，只把 <code>vpn-admin01</code> 加入。一般 VPN 使用者不能加入這個群組。</p>
+<h2>5. 建立 OpenVPN Instance</h2>
+<p>先到 <code>VPN</code> → <code>OpenVPN</code> → <code>Instances</code> → <code>Static Keys</code>：</p>
+<ol>
+<li>按 Add。</li>
+<li>Mode 選 <code>auth</code>。</li>
+<li>Description 填 <code>IRON-LAB-OPENVPN-TLS-AUTH</code>。</li>
+<li>使用畫面上的齒輪／Generate 產生 Static Key。</li>
+<li>Save／Apply。</li>
+</ol>
+<p>儲存後必須先回到 Static Keys 清單，確認能看到 <code>IRON-LAB-OPENVPN-TLS-AUTH</code>，再重新開啟／重新整理 Server Instance 表單。若只填 Description、沒有按齒輪產生 Key，或尚未 Save／Apply，<code>TLS static key</code> 選單會保持空白。</p>
+<p><img src="../../source/Day17/1788456094855-image.png" alt="建立 OpenVPN TLS Static Key"></p>
+<p><em>圖（三）建立 OpenVPN TLS Static Key。</em></p>
+<p>再回到 <code>VPN</code> → <code>OpenVPN</code> → <code>Instances</code> 新增 Server。OPNsense 26.7 的欄位名稱是 <code>Certificate</code>，不叫 <code>Server Certificate</code>；在這個欄位選前一節建立的 <code>vpn.lab.home</code> Server Certificate。</p>
+<ol>
+<li>Role 選 <code>Server</code>。</li>
+<li>Description 填 <code>IRON-LAB-ROAD-WARRIOR</code>。</li>
+<li>Protocol 選 <code>UDP (IPv4)</code>。</li>
+<li>Port number 填 <code>1194</code>。</li>
+<li>Bind address 留空；fw01 WAN 使用 DHCP，留空會綁定可用位址。</li>
+<li>Server (IPv4) 填 <code>10.77.60.0/24</code>。</li>
+<li>Certificate 選 <code>IRON-LAB-OPENVPN-SERVER</code>。</li>
+<li>TLS static key 選 <code>IRON-LAB-OPENVPN-TLS-AUTH</code>。</li>
+<li>Authentication 選 <code>Local Database</code>；OTP 依實際啟用。</li>
+<li>Strict User/CN Matching 勾選；每位使用者憑證 CN 必須與 Username 相同。</li>
+<li>Local Network 加入 <code>10.77.10.0/24</code> 與 <code>10.77.20.0/24</code>；不要推送整個 <code>10.77.0.0/16</code>。</li>
+<li>Redirect gateway 留空，使用 Split Tunnel。</li>
+<li>DNS Server 填 <code>10.77.10.1</code>，也就是 fw01 的 Management VLAN 位址；這個欄位要填 IP，不能填 <code>lab.home</code> 或 <code>home.lab</code>。</li>
+<li>DNS Default Domain／Search Domain 若畫面有提供，填 <code>lab.home</code>。本系列主機名稱統一為 <code>pve01.lab.home</code>、<code>app01.lab.home</code> 等，不使用 <code>home.lab</code>。</li>
+</ol>
+<p>使用現代 TLS 與 Data Cipher 預設值，不啟用 Compression。Save／Apply 後確認 Instance Running。</p>
+<p><img src="../../source/Day17/1788456127387-image.png" alt="確認 OpenVPN Instance 已啟用"></p>
+<p><em>圖（四）確認 OpenVPN Instance 已啟用。</em></p>
+<h2>6. WAN 與 OpenVPN Firewall Rule</h2>
+<h3>6.1 建立 WAN UDP 1194 規則</h3>
+<ol>
+<li>進入 <code>Firewall</code> → <code>Rules</code>，按右下角橘色 <code>+</code>。</li>
+<li>Interface 只選 <code>WAN</code>。</li>
+<li>Action 選 <code>Pass</code>，Direction 選 <code>in</code>，Quick 保持勾選。</li>
+<li>TCP/IP Version 選 <code>IPv4</code>，Protocol 選 <code>UDP</code>。</li>
+<li>Source 選 <code>any</code>。</li>
+<li>Destination 選 <code>WAN address</code>。</li>
+<li>Destination Port 填 <code>1194</code>。</li>
+<li>勾選 Log，Description 填 <code>ALLOW_WAN_TO_OPENVPN_1194</code>。</li>
+<li>本 Lab 的測試電腦與 fw01 WAN 同在 <code>192.168.0.0/24</code>，展開 Advanced，將 <code>Disable reply-to</code> 勾選，或把 reply-to 設為 <code>Disable／None</code>。正式 Internet／PPPoE 環境不需要直接照抄這項。</li>
+<li>Save 後按 <code>Apply</code>。本系列沒有另外建立一條可見的 WAN 最終 Block Rule；未命中 Allow 的其他 WAN 流量會由 OPNsense／pf 內建的隱含 Default Deny 拒絕。若你自行建立過明確 Block，才需要把這條 Allow 排在它上方。</li>
+</ol>
+<p>這條規則只讓 Client 建立 VPN Tunnel，不代表 Client 已經可以存取任何內部服務。</p>
+<h3>6.2 建立 VPN-Admin 動態 Alias</h3>
+<ol>
+<li>進入 <code>Firewall</code> → <code>Aliases</code>，按右下角橘色 <code>+</code>。</li>
+<li>Name 填 <code>VPN_ADMIN_CLIENTS</code>。</li>
+<li>Type 選 <code>OpenVPN group</code>。</li>
+<li>Content 選／填入 Day 17 建立的本機群組 <code>vpn-admin</code>。</li>
+<li>Description 填 <code>Connected OpenVPN members of vpn-admin</code>。</li>
+<li>Save，再按 <code>Apply</code>。</li>
+</ol>
+<p>這個 Alias 在還沒有人登入 VPN 時可以是空的。<code>vpn-admin01</code> 連線後，OPNsense 才會把它取得的 <code>10.77.60.x</code> Tunnel IP 動態加入 Alias。憑證 Common Name 必須與 Username <code>vpn-admin01</code> 相同，且該使用者必須屬於 <code>vpn-admin</code>。</p>
+<h3>6.3 建立 OpenVPN DNS 規則</h3>
+<ol>
+<li>回到 <code>Firewall</code> → <code>Rules</code>，按 <code>+</code>。</li>
+<li>Interface 選 <code>OpenVPN</code>。這是 OPNsense 將所有 OpenVPN Tunnel 集合起來的介面群組，不要選 WAN 或 LAB_INTERNAL。</li>
+<li>Action 選 <code>Pass</code>，Direction 選 <code>in</code>，Quick 保持勾選。</li>
+<li>Version 選 <code>IPv4</code>，Protocol 選 <code>TCP/UDP</code>。</li>
+<li>Source 選 <code>OpenVPN network</code>；若目前畫面沒有這個內建選項，Source Type 選 <code>Network</code> 並填 <code>10.77.60.0/24</code>。</li>
+<li>Destination 選 <code>This Firewall</code>。</li>
+<li>Destination Port 填 <code>53</code>。</li>
+<li>Description 填 <code>ALLOW_OPENVPN_TO_FIREWALL_DNS</code>。</li>
+<li>Save／Apply。</li>
+</ol>
+<h3>6.4 只讓 VPN-Admin 存取 PVE Web UI</h3>
+<p>新增第一條規則：</p>
+<ol>
+<li>Interface 選 <code>OpenVPN</code>，Action 選 <code>Pass</code>，Version 選 <code>IPv4</code>，Protocol 選 <code>TCP</code>。</li>
+<li>Source 選 Alias <code>VPN_ADMIN_CLIENTS</code>。</li>
+<li>Destination 選 Alias <code>PVE_NODES</code>。</li>
+<li>Destination Port 填 <code>8006</code>。</li>
+<li>勾選 Log，Description 填 <code>ALLOW_VPN_ADMIN_TO_PVE_WEB</code>。</li>
+<li>Save／Apply。</li>
+</ol>
+<p>緊接著新增第二條規則：</p>
+<ol>
+<li>Interface 選 <code>OpenVPN</code>，Action 選 <code>Block</code>，Version 選 <code>IPv4</code>，Protocol 選 <code>any</code>。</li>
+<li>Source 使用 <code>OpenVPN network</code>；沒有內建選項時填 <code>10.77.60.0/24</code>。</li>
+<li>Destination 選 <code>PVE_NODES</code>，Destination Port 保持 <code>any</code>。</li>
+<li>勾選 Log，Description 填 <code>BLOCK_OTHER_OPENVPN_TO_PVE_NODES</code>。</li>
+<li>Save／Apply。</li>
+</ol>
+<p>第一條 Allow 必須位於第二條 Block 上方。如此 <code>vpn-admin01</code> 只能連 PVE TCP 8006；它連 PVE SSH 22 仍會命中第二條 Block，一般 VPN 使用者連 8006 也會被同一條規則拒絕。</p>
+<p><img src="../../source/Day17/1788456267152-image.png" alt="確認 OpenVPN 最小權限規則與排列順序"></p>
+<p><em>圖（五）確認 OpenVPN 最小權限規則與排列順序。</em></p>
+<h3>6.5 明確阻擋 VPN 直連 PostgreSQL 節點</h3>
+<ol>
+<li>新增規則，Interface 選 <code>OpenVPN</code>，Action 選 <code>Block</code>。</li>
+<li>Version 選 <code>IPv4</code>，Protocol 選 <code>any</code>。</li>
+<li>Source 使用 <code>OpenVPN network</code> 或 <code>10.77.60.0/24</code>。</li>
+<li>Destination 選 Day 14 已建立的 <code>PG_NODES</code>。</li>
+<li>Destination Port 保持 <code>any</code>。</li>
+<li>勾選 Log，Description 填 <code>BLOCK_OPENVPN_TO_PG_NODES</code>。</li>
+<li>Save／Apply。</li>
+</ol>
+<p>這一條直接阻擋 VPN 使用者連 pg01～pg03，比拆成 5432、8008、2379、2380 四組規則簡單，也能避免遺漏其他管理 Port。Day 26 完成的 DB RW／RO VIP 位於 Service VLAN，不屬於 <code>PG_NODES</code>，後續仍能另外建立精確的 VIP Allow。</p>
+<h3>6.6 確認規則順序</h3>
+<p>在 <code>Firewall</code> → <code>Rules</code> 左上角的篩選選擇 <code>OpenVPN</code>，順序應為：</p>
+<pre><code class="language-text">ALLOW_OPENVPN_TO_FIREWALL_DNS
+ALLOW_VPN_ADMIN_TO_PVE_WEB
+BLOCK_OTHER_OPENVPN_TO_PVE_NODES
+BLOCK_OPENVPN_TO_PG_NODES
+未來 Day 26／29 的服務 Allow
+其他未授權流量由 OPNsense／pf 隱含 Default Deny 拒絕
+</code></pre>
+<p>不另外建立 <code>OpenVPN network → any</code> 的明確最終 Block。沒有命中任何 Pass Rule 的其他流量，直接由 OPNsense／pf 內建的隱含 Default Deny 拒絕。</p>
+<h3>6.7 今天先不要建立的規則</h3>
+<p>下列服務尚未完成，Day 17 只記錄，不進入 GUI 建立：</p>
+<pre><code class="language-text">Day 26：VPN-DB-RW → DB RW VIP TCP 5432
+Day 26：VPN-DB-RO → DB RO VIP TCP 5432
+Day 29：VPN-Monitor → monitor01 Grafana 指定 Port
+</code></pre>
+<p>正式環境若需要更嚴格的群組與固定位址隔離，可以使用不同 OpenVPN Instance／Tunnel Pool、Client Specific Override 或外部身分系統；本 Lab 先用 <code>OpenVPN group</code> Alias 完成 VPN-Admin 的動態授權。</p>
+<h2>7. 匯出與連線</h2>
+<p>到 <code>VPN → OpenVPN → Client Export</code>：</p>
+<ol>
+<li>Remote Access Server 選 <code>IRON-LAB-ROAD-WARRIOR</code>。</li>
+<li>Host Name Resolution 填實際 WAN DNS／IP。</li>
+<li>確認清單顯示的是剛建立、Issuer 為 <code>IRON-LAB-OPENVPN-CA</code> 的使用者憑證。</li>
+<li>Export Type 選 <code>File only</code>／<code>Inline configuration</code>，下載把 CA、使用者憑證、Private Key 與 TLS Static Key 內嵌在同一份 <code>.ovpn</code> 的版本。</li>
+<li>將 Profile 透過受控方式交付，不上傳 Repository。</li>
+</ol>
+<p>如果 Client Export 顯示 <code>Certificate does not belong to server CA</code>，代表所選 Client Certificate 與 Server Certificate 的 Issuer 不一致。回到 <code>System</code> → <code>Trust</code> → <code>Certificates</code> 比對兩者的 Issuer；不要重做防火牆規則，也不要更換 WAN Port。若 Instance 的 Certificate 選錯，回 <code>VPN</code> → <code>OpenVPN</code> → <code>Instances</code>，把 Certificate 改回由 <code>IRON-LAB-OPENVPN-CA</code> 簽發的 <code>vpn.lab.home</code> Server Certificate。</p>
+<p>如果 Client 啟動時顯示 <code>Cannot pre-load keyfile (...-tls.key)</code>，代表下載的是多檔案版本，卻只複製或匯入了 <code>.ovpn</code>。最簡單的修正是重新匯出 Inline／File only 版本；若要保留原本的匯出格式，必須完整解壓縮，並讓 <code>.ovpn</code> 與它引用的 <code>...-tls.key</code>、憑證及 Private Key 保持在同一個目錄，不要只取出 <code>.ovpn</code>。<code>--cipher is not set</code> 在這個案例只是警告，不是程式退出的原因，不要為了消除警告加入已淘汰的 BF-CBC。</p>
+<p>Client 連線後確認：</p>
+<pre><code class="language-powershell">ipconfig
+route print
+Resolve-DnsName pve01.lab.home -Server 10.77.10.1
+Test-NetConnection 10.77.20.11 -Port 5432
+Test-NetConnection 10.77.30.11 -Port 5432
+</code></pre>
+<h3>連線後補上內部 DNS 記錄</h3>
+<p>Windows 的 OpenVPN 介面取得 <code>10.77.60.x/24</code>，而且 <code>route print</code> 顯示 <code>10.77.10.0/24</code>、<code>10.77.20.0/24</code> 經由 <code>10.77.60.1</code> 時，代表 Split Tunnel 已正常建立。OpenVPN 介面沒有 Default Gateway 是正常現象；一般上網仍走本機原有閘道，只有指定的 Lab 網段走 VPN。</p>
+<p>如果執行下列命令時收到 <code>DNS_ERROR_RCODE_NAME_ERROR</code>：</p>
+<pre><code class="language-powershell">Resolve-DnsName pve01.lab.home -Server 10.77.10.1
+</code></pre>
+<p>這個結果不是 VPN 或 DNS Firewall Rule 不通。OPNsense 已經收到查詢並回覆 NXDOMAIN，只是 Unbound DNS 還沒有 <code>pve01.lab.home</code> 記錄。</p>
+<p>到 <code>Services</code> → <code>Unbound DNS</code> → <code>Overrides</code>，依序新增三筆 Host Override：</p>
+<pre><code class="language-text">Host：pve01
+Domain：lab.home
+Type：A
+IP Address：10.77.10.11
+
+Host：pve02
+Domain：lab.home
+Type：A
+IP Address：10.77.10.12
+
+Host：pve03
+Domain：lab.home
+Type：A
+IP Address：10.77.10.13
+</code></pre>
+<p>Save／Apply 後回到 Windows 清除 DNS Cache 並重新查詢：</p>
+<pre><code class="language-powershell">Clear-DnsClientCache
+Resolve-DnsName pve01.lab.home -Server 10.77.10.1
+Resolve-DnsName pve02.lab.home -Server 10.77.10.1
+Resolve-DnsName pve03.lab.home -Server 10.77.10.1
+</code></pre>
+<p>預期分別取得 <code>10.77.10.11</code>、<code>10.77.10.12</code>、<code>10.77.10.13</code>。</p>
+<p>Day 26 前第一條 DB VIP 測試可以尚未成功，但直連 <code>10.77.30.11</code> 必須被拒絕。</p>
+<p>使用 <code>vpn-admin01</code> Profile 連線後，在 Windows PowerShell 測試：</p>
+<pre><code class="language-powershell">Test-NetConnection 10.77.10.11 -Port 8006
+Test-NetConnection 10.77.10.12 -Port 8006
+Test-NetConnection 10.77.10.13 -Port 8006
+Test-NetConnection 10.77.10.11 -Port 22
+</code></pre>
+<p>前三項應成功，TCP 22 應失敗。接著使用瀏覽器開啟 <code>https://10.77.10.11:8006</code>，以 PVE 管理員身分登入。</p>
+<p><img src="../../source/Day17/1788456484001-image.png" alt="確認 VPN 管理帳號對 PVE 8006 與 SSH 22 的連線結果"></p>
+<p><em>圖（六）<code>vpn-admin01</code> 連入三台 PVE 的 TCP 8006 成功、連入 TCP 22 失敗。</em></p>
+<p>再換成 <code>vpn-ro01</code> 或 <code>vpn-monitor01</code> Profile，重測 TCP 8006，必須被拒絕並在 Live View 命中 PVE Block Rule。</p>
+<p>本次 <code>vpn-admin01</code> 實測中，三台 PVE 的 TCP 8006 均可連線、PVE SSH 22 與 pg01 TCP 5432 均被拒絕，代表 VPN 路由和 Day 17 的最小權限規則符合預期。</p>
+<h2>8. 撤銷測試</h2>
+<ol>
+<li>停用 <code>vpn-ro01</code> 帳號。</li>
+<li>撤銷該 Client Certificate，更新 CRL。</li>
+<li>中止既有 Session。</li>
+<li>確認舊 Profile 無法重新連線。</li>
+</ol>
+</main></body>
+</html>

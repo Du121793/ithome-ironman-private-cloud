@@ -1,6 +1,6 @@
-# Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 與單點風險
+# Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 的運作與實測
 
-對應文章：[Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 與單點風險](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 的運作與實測](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
 
 本日先用 IDS Alert Mode 確認介面與規則，再切換 IPS。不要直接在唯一 WAN 管理路徑啟用阻擋模式。
 

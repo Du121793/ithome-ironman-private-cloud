@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 與單點風險</title>
+  <title>Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 的運作與實測</title>
   <style>
     :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
     *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
@@ -12,8 +12,8 @@
     table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
   </style>
 </head>
-<body><main><h1>Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 與單點風險</h1>
-<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 與單點風險</a></p>
+<body><main><h1>Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 的運作與實測</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 的運作與實測</a></p>
 <p>本日先用 IDS Alert Mode 確認介面與規則，再切換 IPS。不要直接在唯一 WAN 管理路徑啟用阻擋模式。</p>
 <h2>1. 增加 fw01 記憶體與建立快照</h2>
 <p>確認 VM 110 至少 3GB RAM。啟用大量 Ruleset 前觀察實際用量；若 Suricata 發生 OOM，先增加到 4GB，而不是刪除所有安全規則。</p>

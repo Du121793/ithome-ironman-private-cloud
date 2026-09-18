@@ -1,6 +1,6 @@
 # Day 08｜節點故障後 VM 如何接手：Proxmox VE 遷移、HA 隔離與恢復時間量測
 
-對應文章：[Day 08｜節點故障後 VM 如何接手：Proxmox VE 遷移、HA 隔離與恢復時間量測](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 08｜節點故障後 VM 如何接手：Proxmox VE 遷移、HA 隔離與恢復時間量測](https://ithelp.ithome.com.tw/articles/10408380)
 
 今日將聚焦 Proxmox VE 的高可用。基於 Day 07 已建立的 `ceph-vm` RBD Storage，我們可以使用可丟棄測試 VM 實地展示 Migration 與 PVE HA Recovery。
 

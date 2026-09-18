@@ -1,20 +1,10 @@
 <!doctype html>
-<html lang="zh-Hant">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 的運作與實測</title>
-  <style>
-    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
-    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
-    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
-    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
-    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
-  </style>
-</head>
-<body><main><h1>Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 的運作與實測</h1>
+<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 的運作與實測</title><style>
+:root{--orange:#f47b20;--ink:#30343b;--line:#e6e8eb}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:#fff;font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}main{width:min(940px,calc(100% - 40px));margin:auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35}h2{margin-top:42px;padding-bottom:10px;border-bottom:1px solid var(--line)}h3{margin-top:30px}a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2}code{padding:.15em .35em;border-radius:4px;background:#f4f5f6;color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}table{width:100%;border-collapse:collapse;margin:22px 0}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+</style></head><body><main><h1>Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 的運作與實測</h1>
 <p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 的運作與實測</a></p>
-<p>本日先用 IDS Alert Mode 確認介面與規則，再切換 IPS。不要直接在唯一 WAN 管理路徑啟用阻擋模式。</p>
+<p>本日先用 IDS Alert Mode 確認介面與規則，再切換 IPS。</p>
 <h2>1. 增加 fw01 記憶體與建立快照</h2>
 <p>確認 VM 110 至少 3GB RAM。啟用大量 Ruleset 前觀察實際用量；若 Suricata 發生 OOM，先增加到 4GB，而不是刪除所有安全規則。</p>
 <p>變更前：</p>
@@ -126,7 +116,7 @@ Disable hardware large receive offload
 <p>Policy 位於 <code>Services</code> → <code>Intrusion Detection</code> → <code>Policy</code>，不是 <code>Administration</code> 裡的分頁。本日預設不建立 Policy，避免為了單一 SID 改動整個 Scan 分類；需要示範批次管理時，可以改做 4.1 節，但不要和單條手動覆寫混在一起。</p>
 <p>記錄 Ruleset 更新時間與啟用數量。</p>
 <h2>5. 產生受控測試流量</h2>
-<p>Day 18 尚未建立 Day 25 的 proxy01 <code>10.77.20.21</code>，因此本日改用 Day 16 已建立的 app01 <code>10.77.20.31</code> 當作受控目標。</p>
+<p>Day 18 尚未建立 proxy01 <code>10.77.20.21</code>，因此本日改用 Day 16 已建立的 app01 <code>10.77.20.31</code> 當作受控目標。</p>
 <h3>5.1 先確認 PVE L0 的封包會經過 fw01</h3>
 <p>在 PVE L0 執行：</p>
 <pre><code class="language-bash">ip route get 10.77.20.31
@@ -188,5 +178,4 @@ Signature：ET SCAN Suspicious inbound to PostgreSQL port 5432
 <p>測試完成後可在 PVE L0 移除本次暫時 Route：</p>
 <pre><code class="language-bash">sudo ip route del 10.77.20.31/32
 </code></pre>
-</main></body>
-</html>
+</main></body></html>

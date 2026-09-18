@@ -1,6 +1,6 @@
 # Day 08 額外實作｜PVE Migration、HA Recovery 與 Ceph Recovery 時間量測
 
-對應文章：[Day 08｜節點故障後 VM 如何接手：Proxmox VE 遷移、HA 隔離與恢復時間量測](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 08｜節點故障後 VM 如何接手：Proxmox VE 遷移、HA 隔離與恢復時間量測](https://ithelp.ithome.com.tw/articles/10408380)
 
 ## 0. 測試前的停止條件
 

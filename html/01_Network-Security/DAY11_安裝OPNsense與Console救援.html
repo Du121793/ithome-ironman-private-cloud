@@ -13,7 +13,7 @@
   </style>
 </head>
 <body><main><h1>Day 11｜在 Proxmox VE 安裝 OPNsense：vNIC、WAN／LAN 介面指派與主控台（Console）救援</h1>
-<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 11｜在 Proxmox VE 安裝 OPNsense：vNIC、WAN／LAN 介面指派與主控台（Console）救援</a></p>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/articles/10409291">Day 11｜在 Proxmox VE 安裝 OPNsense：vNIC、WAN／LAN 介面指派與主控台（Console）救援</a></p>
 <p><code>fw01</code> 放在 L0 <code>pve-l0</code>，VMID <code>110</code>。本日完成安裝、三張網卡、管理介面與設定備份；VLAN 在 Day 13 建立。</p>
 <p>Day 11 先讓 OPNsense 本身上線。pve01～pve03 此時仍使用 Day 03 建立的路由器 Bootstrap Gateway，避免在 VLAN 與規則尚未完成前失去管理路徑。等 Day 14 完成基本規則後，Day 15 才逐台把 PVE Management 與一般對外出口切到 OPNsense。</p>
 <h2>1. 下載 OPNsense DVD ISO</h2>

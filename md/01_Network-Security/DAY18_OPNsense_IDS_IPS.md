@@ -2,7 +2,7 @@
 
 對應文章：[Day 18｜在網路邊界發現並阻擋威脅：OPNsense Suricata IDS／IPS 的運作與實測](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
 
-本日先用 IDS Alert Mode 確認介面與規則，再切換 IPS。不要直接在唯一 WAN 管理路徑啟用阻擋模式。
+本日先用 IDS Alert Mode 確認介面與規則，再切換 IPS。
 
 ## 1. 增加 fw01 記憶體與建立快照
 
@@ -104,7 +104,7 @@ Policy 位於 `Services` → `Intrusion Detection` → `Policy`，不是 `Admini
 
 ## 5. 產生受控測試流量
 
-Day 18 尚未建立 Day 25 的 proxy01 `10.77.20.21`，因此本日改用 Day 16 已建立的 app01 `10.77.20.31` 當作受控目標。
+Day 18 尚未建立 proxy01 `10.77.20.21`，因此本日改用 Day 16 已建立的 app01 `10.77.20.31` 當作受控目標。
 
 ### 5.1 先確認 PVE L0 的封包會經過 fw01
 

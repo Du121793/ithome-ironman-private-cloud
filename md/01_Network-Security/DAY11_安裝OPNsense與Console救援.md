@@ -1,6 +1,6 @@
 # Day 11｜在 Proxmox VE 安裝 OPNsense：vNIC、WAN／LAN 介面指派與主控台（Console）救援
 
-對應文章：[Day 11｜在 Proxmox VE 安裝 OPNsense：vNIC、WAN／LAN 介面指派與主控台（Console）救援](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 11｜在 Proxmox VE 安裝 OPNsense：vNIC、WAN／LAN 介面指派與主控台（Console）救援](https://ithelp.ithome.com.tw/articles/10409291)
 
 `fw01` 放在 L0 `pve-l0`，VMID `110`。本日完成安裝、三張網卡、管理介面與設定備份；VLAN 在 Day 13 建立。
 

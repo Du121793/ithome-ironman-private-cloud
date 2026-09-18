@@ -1,6 +1,6 @@
 # Day 10｜防火牆種類與部署位置：封包過濾、代理防火牆、WAF、IDS／IPS 與 NGFW
 
-對應文章：[Day 10｜防火牆種類與部署位置：封包過濾、代理防火牆、WAF、IDS／IPS 與 NGFW](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 10｜防火牆種類與部署位置：封包過濾、代理防火牆、WAF、IDS／IPS 與 NGFW](https://ithelp.ithome.com.tw/articles/10409006)
 
 本日不急著部署 OPNsense，先確認每一層負責的工作，避免同一條規則在 PVE、OPNsense 與 Debian Host 同時修改後無法排錯。
 

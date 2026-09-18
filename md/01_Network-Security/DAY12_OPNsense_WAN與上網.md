@@ -1,6 +1,6 @@
 # Day 12｜WAN 如何連上網際網路：OPNsense 的 DHCP、PPPoE、NAT 與 DDNS
 
-對應文章：[Day 12｜WAN 如何連上網際網路：OPNsense 的 DHCP、PPPoE、NAT 與 DDNS](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 12｜WAN 如何連上網際網路：OPNsense 的 DHCP、PPPoE、NAT 與 DDNS](https://ithelp.ithome.com.tw/articles/10409585)
 
 本 Lab 先使用上游路由器 DHCP，等所有服務完成後再決定是否把實體 WAN 直接交給 OPNsense。沒有實體 Console 或獨立救援路徑時，不要直接切換 PPPoE。
 

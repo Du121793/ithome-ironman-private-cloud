@@ -1,6 +1,6 @@
 # Day 19｜從金鑰到信任鏈：使用 step-ca 為 PostgreSQL HA 建立專用內部 CA
 
-對應文章：[Day 19｜從金鑰到信任鏈：使用 step-ca 為 PostgreSQL HA 建立專用內部 CA](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 19｜從金鑰到信任鏈：使用 step-ca 為 PostgreSQL HA 建立專用內部 CA](https://ithelp.ithome.com.tw/articles/10413552)
 
 本日建立 `ca01`、初始化 `step-ca`、完成 nftables Host Firewall，最後簽發一張暫時 Certificate 驗證信任鏈。
 ## 完成後的狀態

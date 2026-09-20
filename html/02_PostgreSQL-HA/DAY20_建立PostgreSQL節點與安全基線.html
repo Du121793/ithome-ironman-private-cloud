@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 20｜準備 PostgreSQL HA 的三個資料庫節點：PostgreSQL 18、資料磁碟、TLS 與 SCRAM-SHA-256</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 20｜準備 PostgreSQL HA 的三個資料庫節點：PostgreSQL 18、資料磁碟、TLS 與 SCRAM-SHA-256</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 20｜準備 PostgreSQL HA 的三個資料庫節點：PostgreSQL 18、資料磁碟、TLS 與 SCRAM-SHA-256</a></p>
+<p>本日建立 pg01～pg03，逐台完成 Data Disk、PGDG Repository、PostgreSQL 18、名稱解析與 TLS，形成三台可獨立驗收的資料庫節點。</p>
+<h2>本日操作原則</h2>
+<ul>
+<li>每一節都會標示操作位置。</li>
+<li>寫「三台逐台執行」時，先完整做完 pg01，再做 pg02、pg03。</li>
+<li>不要把三段磁碟格式化指令同時貼到三個 Console。</li>
+<li>指令中的 <code>/dev/sdb</code> 只有在 <code>lsblk</code> 驗證它是 16 GiB 空白 Data Disk 後才能使用。</li>
+<li>Private Key 必須在目前 PG Node 本機產生，不經 ca01 或 jump01 複製。</li>
+</ul>
+<h2>1. 建立 pg01</h2>
+<p>操作位置：PVE Web UI。</p>
+<ol>
+<li>左側選 Day 06 的 Debian 13 Template。</li>
+<li>右上角按 <code>More</code> → <code>Clone</code>。</li>
+<li><code>Target Node</code> 選 <code>pve01</code>。</li>
+<li><code>VM ID</code> 填 <code>221</code>。</li>
+<li><code>Name</code> 填 <code>pg01</code>。</li>
+<li><code>Mode</code> 選 <code>Full Clone</code>。</li>
+<li><code>Target Storage</code> 選 pve01 的 <code>local-lvm</code>。</li>
+<li>按 <code>Clone</code>，等待 Task 顯示 <code>OK</code>。</li>
+<li>選 VM 221 → <code>Hardware</code> → <code>Processors</code> → <code>Edit</code>。</li>
+<li>Sockets 填 <code>1</code>、Cores 填 <code>2</code>，CPU Type 使用目前已驗證可 Migration 的相容模式，按 <code>OK</code>。</li>
+<li>選 <code>Memory</code> → <code>Edit</code>，Memory 填 <code>2048 MiB</code>，取消 Ballooning，按 <code>OK</code>。</li>
+<li>選 System Disk → <code>Disk Action</code> → <code>Resize</code>。</li>
+<li>讓 System Disk 最終至少為 24 GiB；Resize 欄位填的是增加量，不是最終容量。</li>
+<li>選 <code>Network Device (net0)</code> → <code>Edit</code>。</li>
+<li>Bridge 選 <code>vmbr1</code>、VLAN Tag 填 <code>30</code>、Model 選 <code>VirtIO</code>、Firewall 勾選，按 <code>OK</code>。</li>
+<li>選 <code>Cloud-Init</code>。</li>
+<li>User 使用 <code>labadmin</code>，Password 使用本次 Lab 管理密碼。</li>
+<li><code>IP Config (net0)</code> → <code>Edit</code>，IPv4 選 <code>Static</code>。</li>
+<li>IPv4/CIDR 填 <code>10.77.30.11/24</code>，Gateway 填 <code>10.77.30.1</code>，按 <code>OK</code>。</li>
+<li>DNS Domain 填 <code>lab.home</code>，DNS Server 填 <code>10.77.30.1</code>。</li>
+<li>按 <code>Regenerate Image</code>。</li>
+<li>到 <code>Hardware</code> → <code>Add</code> → <code>Hard Disk</code>。</li>
+<li>Bus／Device 選 <code>SCSI</code>，Storage 選 pve01 的 <code>local-lvm</code>，Disk size 填 <code>16 GiB</code>。</li>
+<li>勾選 <code>Discard</code> 與 <code>IO thread</code>，按 <code>Add</code>。</li>
+<li>到 <code>Options</code> → <code>Start at boot</code> → <code>Edit</code>，勾選後按 <code>OK</code>。</li>
+<li>按 <code>Start</code>，開啟 <code>Console</code>。</li>
+</ol>
+<p><img src="../../source/Day20/day20-fig01.png" alt="pg01 的處理器、記憶體、系統磁碟與 VLAN 30 網卡設定"></p>
+<p>圖（一）pg01 使用 2 vCPU、2 GiB 記憶體與 24 GiB 系統磁碟，網卡連接 <code>vmbr1</code> 並標記 VLAN 30。</p>
+<p><img src="../../source/Day20/day20-fig02.png" alt="pg01 的 Cloud-Init DNS 與靜態 IP 設定"></p>
+<p>圖（二）Cloud-Init 設定 <code>labadmin</code>、<code>lab.home</code>、DNS <code>10.77.30.1</code> 與靜態 IP <code>10.77.30.11/24</code>。</p>
+<h2>2. 建立 pg02 與 pg03</h2>
+<p>操作位置：PVE Web UI。</p>
+<p>按照第 1 節完整重複兩次，只替換以下值：</p>
+<ul>
+<li>pg02：Target Node <code>pve02</code>、VMID <code>222</code>、Name <code>pg02</code>、IP <code>10.77.30.12/24</code>。</li>
+<li>pg03：Target Node <code>pve03</code>、VMID <code>223</code>、Name <code>pg03</code>、IP <code>10.77.30.13/24</code>。</li>
+</ul>
+<p>每台都必須有：</p>
+<ul>
+<li>2 vCPU、2048 MiB RAM。</li>
+<li>至少 24 GiB System Disk。</li>
+<li>16 GiB SCSI Data Disk。</li>
+<li><code>vmbr1</code>、VLAN Tag 30、VirtIO、Firewall Enabled。</li>
+<li>Gateway／DNS <code>10.77.30.1</code>。</li>
+<li>System Disk 與 16 GiB Data Disk 都使用目前節點的 <code>local-lvm</code>。</li>
+</ul>
+<p>三台開機後各自在 Console 執行：</p>
+<pre><code class="language-bash">hostnamectl --static
+ip -br address
+ip route
+lsblk
+curl -4I --connect-timeout 10 https://apt.postgresql.org/
+</code></pre>
+<p><img src="../../source/Day20/day20-fig03.png" alt="pg01 初次開機後的主機名稱、網路、路由與磁碟檢查"></p>
+<p>圖（三）pg01 已套用主機名稱、<code>10.77.30.11/24</code>、預設閘道與 24 GiB 系統磁碟，16 GiB 資料磁碟此時尚未建立檔案系統。</p>
+<p><img src="../../source/Day20/day20-fig04.png" alt="pg01 連線至 PostgreSQL Apt 軟體庫"></p>
+<p>圖（四）<code>apt.postgresql.org</code> 回傳 HTTP 302 重新導向，確認 pg01 可以連到 PostgreSQL Apt 軟體庫入口。</p>
+<p>如果 Hostname 仍是 Template 名稱，分別執行：</p>
+<pre><code class="language-bash">sudo hostnamectl set-hostname pg01
+</code></pre>
+<p>pg02、pg03 改成自己的名稱，重新登入 Console 後再確認。</p>
+<h2>3. 三台先完成時間同步</h2>
+<p>操作位置：pg01、pg02、pg03 Console。三台都要完成，不能只在 pg01 執行。</p>
+<p>PostgreSQL 的 Log、TLS Certificate 有效期，以及後續 etcd 的 Raft Election 和 Patroni Leader Lock 都需要一致的時間。三台 PG VM 建立後，先把 Chrony 當作共同基線完成。</p>
+<p>先在 pg01 執行：</p>
+<pre><code class="language-bash">sudo timedatectl set-timezone Asia/Taipei
+sudo apt update
+sudo apt install -y chrony
+echo &#39;server 10.77.30.1 iburst prefer&#39; | \
+  sudo tee /etc/chrony/sources.d/opnsense.sources
+sudo systemctl enable --now chrony
+sudo systemctl restart chrony
+sudo chronyc makestep
+chronyc waitsync 30 0.1
+systemctl is-enabled chrony
+systemctl is-active chrony
+chronyc tracking
+chronyc sources -n -v
+timedatectl
+</code></pre>
+<p>完成後，在 pg02、pg03 逐台執行完全相同的指令。</p>
+<p><code>10.77.30.1</code> 是 Database VLAN 上的 OPNsense Gateway。三台使用相同的內部時間來源，不依賴各自能否直接連到公用 NTP。新增 <code>opnsense.sources</code> 不需要刪除套件原有的來源；<code>prefer</code> 只表示可用時優先選擇 OPNsense。</p>
+<p>檢查結果必須符合：</p>
+<ul>
+<li><code>systemctl is-enabled chrony</code> 顯示 <code>enabled</code>。</li>
+<li><code>systemctl is-active chrony</code> 顯示 <code>active</code>。</li>
+<li><code>chronyc tracking</code> 的 <code>Leap status</code> 顯示 <code>Normal</code>。</li>
+<li><code>chronyc sources -n -v</code> 中，<code>10.77.30.1</code> 所在列以 <code>^*</code> 開頭，確認目前選用 OPNsense 同步。</li>
+<li><code>timedatectl</code> 顯示 <code>Time zone: Asia/Taipei</code> 與 <code>System clock synchronized: yes</code>。</li>
+</ul>
+<p><code>chronyc waitsync 30 0.1</code> 最多檢查 30 次，等待系統時間誤差降到 0.1 秒內；成功時可能不會顯示額外訊息。若 <code>10.77.30.1</code> 一直未成為 <code>^*</code>，先檢查 <code>LAB_INTERNAL to firewall NTP</code> 規則，以及 OPNsense 是否對 Database VLAN 提供 NTP，確認同步後再繼續建立服務。</p>
+<p>pg01、pg02、pg03 都要實際完成安裝與同步，並逐台以 <code>chronyc tracking</code> 與 <code>chronyc sources -n -v</code> 驗證結果。</p>
+<h2>4. 初始化 pg01 Data Disk</h2>
+<p>操作位置：pg01 Console。</p>
+<p>先執行：</p>
+<pre><code class="language-bash">sudo lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL
+sudo wipefs -n /dev/sdb
+</code></pre>
+<p>只有同時符合以下條件才能繼續：</p>
+<ul>
+<li><code>/dev/sdb</code> 容量為 16 GiB。</li>
+<li>Type 為 <code>disk</code>。</li>
+<li>FSTYPE 與 MOUNTPOINTS 都是空白。</li>
+<li><code>wipefs -n</code> 沒有顯示既有 Filesystem Signature。</li>
+</ul>
+<p><img src="../../source/Day20/day20-fig05.png" alt="pg01 格式化前的 16 GiB 空白資料磁碟"></p>
+<p>圖（五）格式化前確認 <code>/dev/sdb</code> 為 16 GiB 磁碟，FSTYPE 與掛載位置皆為空白。</p>
+<p>確認後執行：</p>
+<pre><code class="language-bash">sudo mkfs.ext4 -L pgdata /dev/sdb
+sudo mkdir -p /var/lib/postgresql
+grep -q &#39;^LABEL=pgdata /var/lib/postgresql &#39; /etc/fstab || \
+  echo &#39;LABEL=pgdata /var/lib/postgresql ext4 defaults,noatime 0 2&#39; | \
+  sudo tee -a /etc/fstab
+sudo systemctl daemon-reload
+sudo findmnt --verify --verbose
+sudo mount -a
+findmnt /var/lib/postgresql
+df -hT /var/lib/postgresql
+</code></pre>
+<p><code>findmnt</code> 必須顯示 <code>/dev/sdb</code> 掛載到 <code>/var/lib/postgresql</code>，Filesystem 為 ext4。</p>
+<p><img src="../../source/Day20/day20-fig06.png" alt="pg01 建立 ext4 並掛載 PostgreSQL 資料磁碟"></p>
+<p>圖（六）<code>/dev/sdb</code> 完成 ext4 格式化、寫入 <code>/etc/fstab</code> 並掛載至 <code>/var/lib/postgresql</code>。畫面中的 AF_VSOCK 提示與磁碟掛載分開判讀；<code>findmnt --verify</code> 顯示檢查成功，最後的 <code>findmnt</code> 與 <code>df</code> 也確認掛載結果。</p>
+<h2>5. 初始化 pg02、pg03 Data Disk</h2>
+<p>操作位置：先 pg02 Console，再 pg03 Console。</p>
+<ol>
+<li>在 pg02 重複第 4 節全部指令。</li>
+<li>完成 <code>findmnt</code> 與 <code>df -hT</code> 驗證後才離開 pg02。</li>
+<li>在 pg03 重複第 4 節全部指令。</li>
+<li>三台都再次執行：</li>
+</ol>
+<pre><code class="language-bash">findmnt /var/lib/postgresql
+grep &#39;^LABEL=pgdata /var/lib/postgresql &#39; /etc/fstab
+</code></pre>
+<p>每台 <code>/etc/fstab</code> 只能有一行 <code>LABEL=pgdata</code>。若先前誤貼多次，先用 <code>sudo nano /etc/fstab</code> 保留一行，再執行 <code>sudo systemctl daemon-reload</code> 與 <code>sudo mount -a</code>。</p>
+<h2>6. 加入 PGDG Repository 並安裝 PostgreSQL 18</h2>
+<p>操作位置：pg01、pg02、pg03 逐台執行。</p>
+<p>先在 pg01 執行完整流程：</p>
+<pre><code class="language-bash">sudo apt update
+sudo apt install -y postgresql-common ca-certificates curl
+sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+sudo apt update
+apt-cache policy postgresql-18
+</code></pre>
+<p>Repository Script 顯示確認畫面時按 Enter。<code>apt-cache policy</code> 出現 Candidate 後才安裝：</p>
+<pre><code class="language-bash">sudo chown postgres:postgres /var/lib/postgresql
+sudo chmod 0750 /var/lib/postgresql
+sudo apt install -y postgresql-18 postgresql-client-18 postgresql-contrib-18
+psql --version
+sudo pg_lsclusters
+</code></pre>
+<p><img src="../../source/Day20/day20-fig07.png" alt="pg01 安裝 PostgreSQL 18 後的版本與執行個體狀態"></p>
+<p>圖（七）pg01 已安裝 PostgreSQL 18.4，<code>pg_lsclusters</code> 顯示 <code>18/main</code> 位於資料磁碟下並處於 online。</p>
+<p>完成 pg01 後，在 pg02、pg03 重複相同流程。安裝 <code>postgresql-common</code> 不會自動執行 PGDG Script；三台都要明確執行一次。</p>
+<h2>7. 固定名稱解析</h2>
+<p>操作位置：ca01、pg01、pg02、pg03。</p>
+<p>這四台都是由 Cloud Image 建立。只修改 <code>/etc/hosts</code>，重新開機後可能會被 Cloud-Init 覆蓋，因此四台都要同步修改 Debian hosts Template。</p>
+<p>先在每台備份並開啟 Template：</p>
+<pre><code class="language-bash">sudo cp -a /etc/cloud/templates/hosts.debian.tmpl \
+  /etc/cloud/templates/hosts.debian.tmpl.before-day21
+sudo nano /etc/cloud/templates/hosts.debian.tmpl
+</code></pre>
+<p>刪除 Template 中把 <code>{{fqdn}}</code> 與 <code>{{hostname}}</code> 指向 <code>127.0.1.1</code> 的那一行。ca01 已在 Day 19 改為 <code>10.77.30.10 {{fqdn}} {{hostname}}</code>，這一行也一起換成下面的完整靜態名稱清單。保留原有的 <code>127.0.0.1 localhost</code> 與 IPv6 內容：</p>
+<pre><code class="language-text">10.77.30.10 ca01.lab.home ca01
+10.77.30.11 pg01.lab.home pg01
+10.77.30.12 pg02.lab.home pg02
+10.77.30.13 pg03.lab.home pg03
+10.77.20.21 proxy01.lab.home proxy01
+10.77.20.22 proxy02.lab.home proxy02
+10.77.20.11 db-rw.lab.home db-rw
+10.77.20.12 db-ro.lab.home db-ro
+10.77.40.11 backup01.lab.home backup01
+</code></pre>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code>。接著同步修改目前正在使用的 <code>/etc/hosts</code>：</p>
+<pre><code class="language-bash">sudo nano /etc/hosts
+</code></pre>
+<p>刪除把本機 FQDN 指向 <code>127.0.1.1</code> 的項目，保留 <code>127.0.0.1 localhost</code> 與 IPv6 內容，再加入相同的靜態名稱清單：</p>
+<pre><code class="language-text">10.77.30.10 ca01.lab.home ca01
+10.77.30.11 pg01.lab.home pg01
+10.77.30.12 pg02.lab.home pg02
+10.77.30.13 pg03.lab.home pg03
+10.77.20.21 proxy01.lab.home proxy01
+10.77.20.22 proxy02.lab.home proxy02
+10.77.20.11 db-rw.lab.home db-rw
+10.77.20.12 db-ro.lab.home db-ro
+10.77.40.11 backup01.lab.home backup01
+</code></pre>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code>。四台都逐一驗證完整 FQDN：</p>
+<pre><code class="language-bash">for host in ca01.lab.home pg01.lab.home pg02.lab.home pg03.lab.home; do
+  getent ahostsv4 &quot;$host&quot; | head -n 1
+done
+</code></pre>
+<p>結果必須依序使用 <code>10.77.30.10</code>～<code>10.77.30.13</code>，不能出現 <code>127.0.1.1</code>。pg01、pg02、pg03 可以逐台重新開機並重複上述檢查，確認 Cloud-Init 依照修改後的 Template 重建 <code>/etc/hosts</code>；一次只重新開機一台。ca01 已在 Day 19 完成相同的重新開機驗證。</p>
+<h2>8. 從三台 PG 測試 ca01 Firewall</h2>
+<p>操作位置：pg01、pg02、pg03。</p>
+<p>每台執行：</p>
+<pre><code class="language-bash">curl -sk --connect-timeout 5 \
+  https://ca01.lab.home:9000/health
+</code></pre>
+<p>這裡的 <code>-k</code> 只用來確認三台 PG 節點能經由 TCP 9000 通過 ca01 nftables Host Firewall；完成 Bootstrap 後，正式連線改用已驗證的信任鏈。</p>
+<p><img src="../../source/Day20/day20-fig08.png" alt="pg01 通過 ca01 TCP 9000 主機防火牆規則"></p>
+<p>圖（八）pg01 存取 ca01 健康檢查端點並取得 <code>{&quot;status&quot;:&quot;ok&quot;}</code>，確認 TCP 9000 路徑可用。</p>
+<h2>9. 在三台安裝 step CLI</h2>
+<p>操作位置：pg01、pg02、pg03 逐台執行。</p>
+<pre><code class="language-bash">sudo apt update
+sudo apt install -y curl gpg ca-certificates
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSL https://packages.smallstep.com/keys/apt/repo-signing-key.gpg \
+  -o /etc/apt/keyrings/smallstep.asc
+sudo nano /etc/apt/sources.list.d/smallstep.sources
+</code></pre>
+<p>填入：</p>
+<pre><code class="language-text">Types: deb
+URIs: https://packages.smallstep.com/stable/debian
+Suites: debs
+Components: main
+Signed-By: /etc/apt/keyrings/smallstep.asc
+</code></pre>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code>，再執行：</p>
+<pre><code class="language-bash">sudo apt update
+sudo apt install -y step-cli
+step version
+</code></pre>
+<p><img src="../../source/Day20/day20-fig09.png" alt="pg01 安裝 step CLI 後的版本資訊"></p>
+<p>圖（九）pg01 已可執行 step CLI，畫面中的版本為 0.30.6。</p>
+<h2>10. Bootstrap ca01 Root Trust</h2>
+<p>操作位置：先 ca01，再 pg01、pg02、pg03。</p>
+<p>在 ca01 Console 顯示 Fingerprint：</p>
+<pre><code class="language-bash">sudo -u step-ca step certificate fingerprint \
+  /var/lib/step-ca/certs/root_ca.crt
+</code></pre>
+<p>透過受控方式把 Fingerprint 記錄下來。回到 pg01，將值貼入：</p>
+<pre><code class="language-bash">CA_FINGERPRINT=&#39;貼上-ca01-輸出的-SHA256-Fingerprint&#39;
+sudo step ca bootstrap \
+  --ca-url https://ca01.lab.home:9000 \
+  --fingerprint &quot;$CA_FINGERPRINT&quot;
+sudo install -d -m 750 -o postgres -g postgres /etc/postgresql/tls
+sudo install -m 644 -o postgres -g postgres \
+  /root/.step/certs/root_ca.crt /etc/postgresql/tls/ca.crt
+</code></pre>
+<p>在 pg02、pg03 重複相同指令。三台使用同一個 Root Fingerprint。</p>
+<h2>11. 在 pg01 本機申請 Server Certificate</h2>
+<p>操作位置：pg01 Console。</p>
+<pre><code class="language-bash">sudo step ca certificate pg01.lab.home \
+  /etc/postgresql/tls/server.crt \
+  /etc/postgresql/tls/server.key \
+  --ca-url https://ca01.lab.home:9000 \
+  --root /etc/postgresql/tls/ca.crt \
+  --provisioner iron-lab-admin \
+  --not-after=2160h \
+  --san pg01 \
+  --san pg01.lab.home \
+  --san db-rw.lab.home \
+  --san db-ro.lab.home \
+  --san 10.77.30.11
+</code></pre>
+<p><img src="../../source/Day20/day20-fig10.png" alt="pg01 在本機向 ca01 申請伺服器憑證"></p>
+<p>圖（十）pg01 使用 <code>iron-lab-admin</code> Provisioner 向 ca01 申請憑證，伺服器憑證與私鑰直接寫入本機 TLS 目錄。</p>
+<p>提示輸入 Password 時，輸入 Day 19 建立的 <code>iron-lab-admin</code> Provisioner Password。不要輸入 CA Key Password。</p>
+<p>設定權限並檢查：</p>
+<pre><code class="language-bash">sudo chown -R postgres:postgres /etc/postgresql/tls
+sudo chmod 750 /etc/postgresql/tls
+sudo chmod 644 /etc/postgresql/tls/ca.crt /etc/postgresql/tls/server.crt
+sudo chmod 600 /etc/postgresql/tls/server.key
+sudo -u postgres test -r /etc/postgresql/tls/server.key &amp;&amp; echo &#39;server key readable&#39;
+sudo -u postgres grep -c &#39;^-----BEGIN CERTIFICATE-----$&#39; \
+  /etc/postgresql/tls/server.crt
+sudo -u postgres openssl verify \
+  -show_chain \
+  -CAfile /etc/postgresql/tls/ca.crt \
+  -untrusted /etc/postgresql/tls/server.crt \
+  /etc/postgresql/tls/server.crt
+sudo -u postgres openssl x509 -in /etc/postgresql/tls/server.crt \
+  -noout -subject -issuer -dates -ext subjectAltName
+</code></pre>
+<p><code>server.crt</code> 內應有兩段 <code>BEGIN CERTIFICATE</code>，分別是 Server Leaf Certificate 與 Intermediate CA Certificate。<code>ca.crt</code> 保存受信任的 Root CA；OpenSSL 驗證時使用 <code>-untrusted server.crt</code>，讓它取用 Bundle 內的 Intermediate 並建立 <code>Leaf → Intermediate → Root</code> Chain。</p>
+<p><img src="../../source/Day20/day20-fig11.png" alt="pg01 的伺服器憑證 Bundle 包含兩段憑證"></p>
+<p>圖（十一）<code>server.crt</code> 共有兩段憑證，分別提供伺服器葉憑證與中繼 CA 憑證。</p>
+<p><code>/etc/postgresql/tls</code> 使用 <code>750 postgres:postgres</code>，因此 <code>labadmin</code> 即使看到 Certificate File 是 <code>644</code>，仍不能穿越上層目錄讀取檔案。不要把目錄放寬成 <code>755</code>；Certificate 與 Private Key 的檢查都使用 <code>sudo -u postgres</code> 執行。驗證成功時必須顯示 <code>server.crt: OK</code>，並列出深度 0～2 的完整 Chain。</p>
+<h2>12. 在 pg02、pg03 本機申請 Server Certificate</h2>
+<p>操作位置：pg02 Console，再 pg03 Console。</p>
+<p>pg02 使用：</p>
+<pre><code class="language-bash">sudo step ca certificate pg02.lab.home \
+  /etc/postgresql/tls/server.crt \
+  /etc/postgresql/tls/server.key \
+  --ca-url https://ca01.lab.home:9000 \
+  --root /etc/postgresql/tls/ca.crt \
+  --provisioner iron-lab-admin \
+  --not-after=2160h \
+  --san pg02 \
+  --san pg02.lab.home \
+  --san db-rw.lab.home \
+  --san db-ro.lab.home \
+  --san 10.77.30.12
+</code></pre>
+<p>pg03 使用：</p>
+<pre><code class="language-bash">sudo step ca certificate pg03.lab.home \
+  /etc/postgresql/tls/server.crt \
+  /etc/postgresql/tls/server.key \
+  --ca-url https://ca01.lab.home:9000 \
+  --root /etc/postgresql/tls/ca.crt \
+  --provisioner iron-lab-admin \
+  --not-after=2160h \
+  --san pg03 \
+  --san pg03.lab.home \
+  --san db-rw.lab.home \
+  --san db-ro.lab.home \
+  --san 10.77.30.13
+</code></pre>
+<p>因為上述簽發命令透過 <code>sudo step</code> 執行，新產生的 <code>server.crt</code> 與 <code>server.key</code> 可能屬於 <code>root</code>。完成 pg02 的簽發後立刻執行以下完整區塊；完成 pg03 的簽發後，再在 pg03 執行同一個區塊：</p>
+<pre><code class="language-bash">sudo chown -R postgres:postgres /etc/postgresql/tls
+sudo chmod 750 /etc/postgresql/tls
+sudo chmod 644 /etc/postgresql/tls/ca.crt /etc/postgresql/tls/server.crt
+sudo chmod 600 /etc/postgresql/tls/server.key
+
+sudo -u postgres test -r /etc/postgresql/tls/ca.crt &amp;&amp; echo &#39;ca readable&#39;
+sudo -u postgres test -r /etc/postgresql/tls/server.crt &amp;&amp; echo &#39;certificate readable&#39;
+sudo -u postgres test -r /etc/postgresql/tls/server.key &amp;&amp; echo &#39;key readable&#39;
+
+sudo -u postgres grep -c &#39;^-----BEGIN CERTIFICATE-----$&#39; \
+  /etc/postgresql/tls/server.crt
+sudo -u postgres openssl verify \
+  -show_chain \
+  -CAfile /etc/postgresql/tls/ca.crt \
+  -untrusted /etc/postgresql/tls/server.crt \
+  /etc/postgresql/tls/server.crt
+sudo -u postgres openssl x509 -in /etc/postgresql/tls/server.crt \
+  -noout -subject -issuer -dates -ext subjectAltName
+</code></pre>
+<p>三個 Readable Check 都必須顯示結果，Certificate 數量應為 <code>2</code>，而 Chain 驗證必須顯示 <code>server.crt: OK</code>。若其中一個 <code>echo</code> 沒有出現，不要繼續 Restart PostgreSQL，先用 <code>sudo stat -c &#39;%U %G %a %n&#39; /etc/postgresql/tls/*</code> 核對 Owner、Group 與 Mode。</p>
+<p>最後，三台 <code>server.key</code> 不應有相同 Hash：</p>
+<pre><code class="language-bash">sudo sha256sum /etc/postgresql/tls/server.key
+</code></pre>
+<p>只比較三台輸出的 Hash 是否不同，不把 Private Key 內容貼到任何地方。</p>
+<h2>13. 設定 PostgreSQL 18</h2>
+<p>操作位置：pg01、pg02、pg03。</p>
+<p>先在 pg01 開啟：</p>
+<pre><code class="language-bash">sudo nano /etc/postgresql/18/main/postgresql.conf
+</code></pre>
+<p>找到或新增：</p>
+<pre><code class="language-ini">listen_addresses = &#39;localhost,10.77.30.11&#39;
+port = 5432
+password_encryption = &#39;scram-sha-256&#39;
+ssl = on
+ssl_cert_file = &#39;/etc/postgresql/tls/server.crt&#39;
+ssl_key_file = &#39;/etc/postgresql/tls/server.key&#39;
+ssl_ca_file = &#39;/etc/postgresql/tls/ca.crt&#39;
+wal_level = replica
+max_wal_senders = 10
+max_replication_slots = 10
+wal_log_hints = on
+logging_collector = on
+log_connections = &#39;receipt,authentication,authorization&#39;
+log_disconnections = on
+log_line_prefix = &#39;%m [%p] %q%u@%d &#39;
+</code></pre>
+<p>PostgreSQL 18 的 <code>log_connections</code> 已是 String Parameter，不再只用 Boolean 表達。雖然 <code>on</code> 為了向下相容仍可使用，而且等同於 <code>receipt,authentication,authorization</code>，本文件直接列出三個實際啟用的 Connection Stage，避免讀者誤以為 <code>setup_durations</code> 也會一起記錄。若要連建立連線各階段的耗時都寫入 Log，再把 <code>setup_durations</code> 加入清單，或改用 <code>all</code>。</p>
+<p><code>log_disconnections</code> 目前仍是 Boolean，因此使用 <code>on</code> 沒有問題。這些連線記錄預設關閉，是因為每次連入、驗證與離線都可能產生 Log I/O、儲存量與敏感資訊暴露；PostgreSQL 使用保守的通用預設，讓管理者依工作負載、稽核需求與 Log 保存能力自行開啟。本 Lab 為了保留連線與切換證據才明確啟用。</p>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code>。</p>
+<p>pg02 使用相同設定，但 <code>listen_addresses</code> 改為 <code>localhost,10.77.30.12</code>。pg03 改為 <code>localhost,10.77.30.13</code>。</p>
+<h2>14. 設定最小 pg_hba.conf</h2>
+<p>操作位置：pg01、pg02、pg03。</p>
+<pre><code class="language-bash">sudo cp -a /etc/postgresql/18/main/pg_hba.conf \
+  /etc/postgresql/18/main/pg_hba.conf.before-day21
+sudo nano /etc/postgresql/18/main/pg_hba.conf
+</code></pre>
+<p>保留套件建立的 Local Administrative Login，並在檔案末端確認有最終 Reject：</p>
+<pre><code class="language-text">host all all 0.0.0.0/0 reject
+host all all ::/0 reject
+</code></pre>
+<p>目前的遠端規則以最終 <code>reject</code> 收尾；Application、VPN 與 Replication Network 會在具備實際角色及來源位址後，再加入精確的 <code>hostssl</code> 規則。</p>
+<p><img src="../../source/Day20/day20-fig12.png" alt="pg01 的本機管理與最終拒絕規則"></p>
+<p>圖（十二）保留 Unix Socket 與 Loopback 管理規則，並以 IPv4、IPv6 的最終 <code>reject</code> 收斂其餘遠端連線。</p>
+<h2>15. Restart 並逐台驗證</h2>
+<p>操作位置：pg01、pg02、pg03。</p>
+<p>每台執行：</p>
+<pre><code class="language-bash">sudo pg_ctlcluster 18 main restart
+sudo pg_lsclusters
+sudo -u postgres psql -Atqc &#39;SHOW data_directory;&#39;
+sudo -u postgres psql -Atqc &#39;SHOW ssl;&#39;
+sudo -u postgres psql -Atqc &#39;SHOW hba_file;&#39;
+sudo -u postgres psql -P pager=off -x \
+  -c &#39;SELECT line_number,type,database,user_name,address,auth_method,error FROM pg_hba_file_rules;&#39;
+sudo ss -lntp | grep &#39;:5432&#39;
+findmnt /var/lib/postgresql
+sudo journalctl -u postgresql -b -n 50 --no-pager
+</code></pre>
+<p><code>pg_hba_file_rules.error</code> 必須全部為空。Data Directory 必須位於掛載的 Data Disk 之下。</p>
+<p><img src="../../source/Day20/day20-fig13.png" alt="pg01 重新啟動後的 PostgreSQL 18 服務基線"></p>
+<p>圖（十三）重新啟動後，<code>18/main</code> 維持 online，資料目錄位於 <code>/var/lib/postgresql/18/main</code>，TLS 已啟用並使用預期的 pg_hba.conf。</p>
+<h2>16. 建立本日管理 Role</h2>
+<p>操作位置：只在 pg01。</p>
+<pre><code class="language-bash">sudo -u postgres psql
+</code></pre>
+<p>在 psql 內執行：</p>
+<pre><code class="language-sql">CREATE DATABASE appdb;
+CREATE ROLE dba_admin LOGIN;
+\password dba_admin
+GRANT CONNECT ON DATABASE appdb TO dba_admin;
+\du dba_admin
+\q
+</code></pre>
+<p>使用 <code>\password</code> 互動輸入，避免把密碼寫進 Shell History。本日以 <code>dba_admin</code> 完成管理角色基線。</p>
+<p><img src="../../source/Day20/day20-fig14.png" alt="pg01 建立 appdb 與 dba_admin 管理角色"></p>
+<p>圖（十四）pg01 建立 <code>appdb</code> 與具備 LOGIN 的 <code>dba_admin</code>，並授予該角色資料庫 CONNECT 權限。</p>
+<p><img src="../../source/Day20/day20-fig15.png" alt="pg02 的資料磁碟、PostgreSQL 18 與伺服器憑證基準"></p>
+<p>圖（十五）再抽查 pg02，資料磁碟掛載、<code>18/main</code> 狀態、資料目錄與憑證 SAN 均符合該節點的規劃值。</p>
+<h2>參考資料</h2>
+<ul>
+<li><a href="https://www.postgresql.org/download/linux/debian/">PostgreSQL｜Linux Downloads</a></li>
+<li><a href="https://www.postgresql.org/docs/18/ssl-tcp.html">PostgreSQL 18｜SSL Support</a></li>
+<li><a href="https://www.postgresql.org/docs/18/auth-pg-hba-conf.html">PostgreSQL 18｜The pg_hba.conf File</a></li>
+</ul>
+</main></body>
+</html>

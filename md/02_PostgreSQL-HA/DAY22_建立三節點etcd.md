@@ -12,10 +12,11 @@ etcd01～03 分別部署在 pg01～03，同一組 Database VLAN。Lab 可以演�
 4. 逐台寫入自己的 etcd Name、IP 與相同的 Initial Cluster 清單。
 5. 先啟動 pg01，再於短時間內啟動 pg02、pg03，建立第一個三成員 Cluster。
 6. 確認三台健康後，依序驗證 2／3、1／3 與恢復後的 Quorum 行為。
+7. 使用主機防火牆限制 TCP 2379／2380，完成允許與阻擋測試。
 
 ## 0. 開始前確認時間同步
 
-**操作節點：pg01、pg02、pg03。這裡只驗證 Day 20 已完成的 Chrony 基線。**
+**操作節點：pg01、pg02、pg03。這裡只驗證 Day 20 已完成的 Chrony 基線，不重新安裝。**
 
 三台逐台執行：
 
@@ -429,7 +430,7 @@ etcdctl_tls endpoint health --cluster
 
 ## 6. Quorum 實驗
 
-**操作順序：準備三個 Console，先完成單一 Member 故障並恢復 3/3 Healthy，接著才演示失去 Quorum。**
+**操作順序：準備三個 Console，先記錄 3／3 基準，再依序驗證 2／3、1／3 與完整恢復。**
 
 ### 6.1 準備三個 Console 並記錄初始狀態
 
@@ -446,15 +447,24 @@ etcdctl_tls endpoint health --cluster
 4. `member list` 應列出 etcd01、etcd02、etcd03。`endpoint status` 應有三列，而且只有一列的 `IS LEADER` 是 `true`。
 5. 記下 Leader 所在的 Endpoint。`10.77.30.11` 是 pg01、`.12` 是 pg02、`.13` 是 pg03。
 6. 三列都 Healthy 才能開始。若初始狀態已缺少 Member，不要繼續製造第二個故障。
+7. 在完整健康狀態先寫入一筆資料，作為故障前已提交的基準：
+
+```bash
+etcdctl_tls del /lab/day22/no-quorum
+etcdctl_tls put /lab/day22/before-failure committed-before-failure
+etcdctl_tls get /lab/day22/before-failure
+```
+
+8. `put` 應回傳 `OK`，`get` 應顯示 Key 與 `committed-before-failure`。
 
 ![三個 etcd 成員屬於同一叢集，三個端點健康且只有一個 Raft 領導者](../../source/Day22/day22-fig02.png)
 
 圖（二）三個成員均已啟動，三個端點可以提交提案，且當下只有 etcd03 為 Raft 領導者。
 
-### 6.2 停止一個非 Leader Member
+### 6.2 停止 etcd02，驗證 2／3 Quorum
 
-1. 優先選 pg03 作為停止對象。若 pg03 是 Leader，就改選 pg02；本節先停止非 Leader，避免同時混入 Leader Election 的畫面。
-2. 到選定節點的 Console。例如選擇 pg03 時執行：
+1. 本系列畫面中 etcd03 是 Leader，因此停止非 Leader 的 etcd02，單獨觀察少一票後的 Quorum 行為。若實際 Leader 已經改變，停止 etcd02 會同時觸發一次 Leader Election，但 2／3 的判讀方式相同。
+2. 到 pg02 Console 執行：
 
 ```bash
 sudo systemctl stop etcd
@@ -466,6 +476,7 @@ systemctl is-active etcd
 ![非領導者 etcd02 的服務已停止](../../source/Day22/day22-fig03.png)
 
 圖（三）停止一個非領導者成員後，該節點的 etcd 服務顯示為 `inactive`。
+
 4. 回到 pg01 執行：
 
 ```bash
@@ -477,68 +488,26 @@ etcdctl_tls endpoint health --cluster
 6. 在 pg01 寫入並讀回測試 Key，證明 2／3 狀態可完成一致寫入：
 
 ```bash
-etcdctl_tls put /lab/day22/status healthy
-etcdctl_tls get /lab/day22/status
-```
-
-7. `put` 應回傳 `OK`，`get` 應顯示 Key 與 `healthy`。
-8. 回到剛才停止的節點。例如 pg03 執行：
-
-```bash
-sudo systemctl start etcd
-systemctl is-active etcd
-sudo journalctl -u etcd -b -n 20 -o cat --no-pager
-```
-
-9. 預期服務回到 `active`。回到 pg01 重複執行：
-
-```bash
-etcdctl_tls endpoint health --cluster
-etcdctl_tls endpoint status --cluster -w table
-```
-
-10. 等三台全部 Healthy，再進行下一節。如果剛啟動時尚未恢復，可以等待數秒後重查，不要重建 Member 或清空 Data Directory。
-
-### 6.3 保留 pg01，停止 pg03
-
-1. 在 pg01 再次確認 3/3 Healthy，並清除上次可能留下的測試 Key：
-
-```bash
-etcdctl_tls endpoint health --cluster
-etcdctl_tls del /lab/day22/no-quorum
-```
-
-2. 到 pg03 Console 執行：
-
-```bash
-sudo systemctl stop etcd
-systemctl is-active etcd
-```
-
-3. 回到 pg01。此時 pg01、pg02 還有 2 票，應可正常讀寫：
-
-```bash
 etcdctl_tls put /lab/day22/two-of-three still-writable
 etcdctl_tls get /lab/day22/two-of-three
-etcdctl_tls endpoint health --cluster
 ```
 
-4. `put` 應回傳 `OK`，證明停止一台後保有 Quorum。pg03 顯示 Unhealthy 是本節預期結果。
+7. `put` 應回傳 `OK`，`get` 應顯示 Key 與 `still-writable`。維持 etcd02 停止，直接進入下一節。
 
 ![停止一個成員後，其餘兩個端點可以提交並讀回測試資料](../../source/Day22/day22-fig04.png)
 
 圖（四）叢集保有 2／3 法定票數，可以提交並讀回 `/lab/day22/two-of-three`。
 
-### 6.4 再停止 pg02，實際失去 Quorum
+### 6.3 再停止 etcd03，實際失去 Quorum
 
-1. 保持 pg03 停止，到 pg02 Console 執行：
+1. 保持 etcd02 停止，到 pg03 Console 執行：
 
 ```bash
 sudo systemctl stop etcd
 systemctl is-active etcd
 ```
 
-2. 確認 pg02 顯示 `inactive`。此時只剩 pg01 的 1 票，不足三節點叢集需要的 2 票。
+2. 確認 pg03 顯示 `inactive`。此時只剩 pg01 的 1 票，不足三節點叢集需要的 2 票。
 3. 回到 pg01，先確認 etcd Process 的執行狀態：
 
 ```bash
@@ -561,7 +530,7 @@ etcdctl_tls --command-timeout=5s \
 
 圖（五）只剩 1／3 成員時，pg01 的 etcd 程序維持 `active`，新的 `put` 則因無法取得多數確認而逾時。
 
-### 6.5 依序恢復 pg02、pg03
+### 6.4 依序恢復 etcd02、etcd03
 
 1. 先到 pg02 Console 恢復第二票：
 
@@ -575,12 +544,12 @@ sudo journalctl -u etcd -b -n 20 -o cat --no-pager
 
 ```bash
 etcdctl_tls endpoint health --cluster
-etcdctl_tls get /lab/day22/status
+etcdctl_tls get /lab/day22/before-failure
 etcdctl_tls get /lab/day22/two-of-three
 etcdctl_tls get /lab/day22/no-quorum
 ```
 
-3. pg01、pg02 應恢復 Healthy，`status` 與 `two-of-three` 應可讀回。記錄 `no-quorum` 是否存在，並以這次查詢結果判定先前逾時寫入的最終狀態。
+3. pg01、pg02 應恢復 Healthy，`before-failure` 與 `two-of-three` 應可讀回。記錄 `no-quorum` 是否存在，並以這次查詢結果判定先前逾時寫入的最終狀態。
 4. 到 pg03 Console 恢復第三個 Member：
 
 ```bash
@@ -651,11 +620,16 @@ for ip in 10.77.30.11 10.77.30.12 10.77.30.13; do
 done
 ```
 
-最後從同 VLAN、但未列入允許來源的 ca01 測試 pg01。兩個連線都應逾時或失敗：
+最後從同 VLAN、但未列入允許來源的 ca01 測試 pg01。使用 Bash 內建的 `/dev/tcp`，不需要在 ca01 額外安裝 netcat；兩個連線都應逾時或失敗：
 
 ```bash
-nc -vz -w 3 10.77.30.11 2379
-nc -vz -w 3 10.77.30.11 2380
+for port in 2379 2380; do
+  if timeout 3 bash -c "</dev/tcp/10.77.30.11/$port" 2>/dev/null; then
+    echo "ERROR: TCP $port is reachable"
+  else
+    echo "OK: TCP $port is blocked"
+  fi
+done
 ```
 
 這組正反測試同時確認三個 etcd 成員可以互連，ca01 則無法存取 Client 與 Peer Port。
@@ -693,3 +667,10 @@ fi
 ![測試 Key 在租約有效期間可以讀取，租約到期後由 etcd 自動移除](../../source/Day22/day22-fig07.png)
 
 圖（七）測試 Key 綁定 15 秒租約後可正常讀取；未執行 KeepAlive 並超過 TTL 後，etcd 自動移除該 Key。
+
+## 參考資料
+
+- [Smallstep｜Add a Provisioner](https://smallstep.com/docs/step-cli/reference/ca/provisioner/add/)
+- [Smallstep｜Request a Certificate](https://smallstep.com/docs/step-cli/reference/ca/certificate/)
+- [etcd｜Transport Security Model](https://etcd.io/docs/v3.5/op-guide/security/)
+- [etcd｜Runtime Reconfiguration](https://etcd.io/docs/v3.5/op-guide/runtime-configuration/)

@@ -1,8 +1,18 @@
 <!doctype html>
-<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Day 22｜Patroni 如何讓 PostgreSQL 叢集取得一致決策？三節點 etcd、Raft 與 mTLS</title><style>
-:root{--orange:#f47b20;--ink:#30343b;--line:#e6e8eb}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:#fff;font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}main{width:min(940px,calc(100% - 40px));margin:auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35}h2{margin-top:42px;padding-bottom:10px;border-bottom:1px solid var(--line)}h3{margin-top:30px}a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2}code{padding:.15em .35em;border-radius:4px;background:#f4f5f6;color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}table{width:100%;border-collapse:collapse;margin:22px 0}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
-</style></head><body><main><h1>Day 22｜Patroni 如何讓 PostgreSQL 叢集取得一致決策？三節點 etcd、Raft 與 mTLS</h1>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 22｜Patroni 如何讓 PostgreSQL 叢集取得一致決策？三節點 etcd、Raft 與 mTLS</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 22｜Patroni 如何讓 PostgreSQL 叢集取得一致決策？三節點 etcd、Raft 與 mTLS</h1>
 <p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 22｜Patroni 如何讓 PostgreSQL 叢集取得一致決策？三節點 etcd、Raft 與 mTLS</a></p>
 <p>etcd01～03 分別部署在 pg01～03，同一組 Database VLAN。Lab 可以演示 Quorum，容錯範圍則限於三台 VM，三者共用的 L0 Host 是共同故障域。</p>
 <h2>本日操作順序</h2>
@@ -13,9 +23,10 @@
 <li>逐台寫入自己的 etcd Name、IP 與相同的 Initial Cluster 清單。</li>
 <li>先啟動 pg01，再於短時間內啟動 pg02、pg03，建立第一個三成員 Cluster。</li>
 <li>確認三台健康後，依序驗證 2／3、1／3 與恢復後的 Quorum 行為。</li>
+<li>使用主機防火牆限制 TCP 2379／2380，完成允許與阻擋測試。</li>
 </ol>
 <h2>0. 開始前確認時間同步</h2>
-<p><strong>操作節點：pg01、pg02、pg03。這裡只驗證 Day 20 已完成的 Chrony 基線。</strong></p>
+<p><strong>操作節點：pg01、pg02、pg03。這裡只驗證 Day 20 已完成的 Chrony 基線，不重新安裝。</strong></p>
 <p>三台逐台執行：</p>
 <pre><code class="language-bash">systemctl is-enabled chrony
 systemctl is-active chrony
@@ -309,7 +320,7 @@ etcdctl_tls endpoint health --cluster
 </code></pre>
 <p>這個 Function 只存在於目前的 Terminal Session，不會寫入系統設定，也不會放寬 Private Key 權限。若關閉 Terminal 或重新登入，先重新執行上面的 Function 定義，再繼續本日實驗。</p>
 <h2>6. Quorum 實驗</h2>
-<p><strong>操作順序：準備三個 Console，先完成單一 Member 故障並恢復 3/3 Healthy，接著才演示失去 Quorum。</strong></p>
+<p><strong>操作順序：準備三個 Console，先記錄 3／3 基準，再依序驗證 2／3、1／3 與完整恢復。</strong></p>
 <h3>6.1 準備三個 Console 並記錄初始狀態</h3>
 <ol>
 <li>開啟 pg01 Console，保留第 5 節已定義 <code>etcdctl_tls</code> 的 Bash Session。後續叢集查詢與測試 Key 都在這個 Console 執行。</li>
@@ -324,13 +335,21 @@ etcdctl_tls endpoint health --cluster
 <li><code>member list</code> 應列出 etcd01、etcd02、etcd03。<code>endpoint status</code> 應有三列，而且只有一列的 <code>IS LEADER</code> 是 <code>true</code>。</li>
 <li>記下 Leader 所在的 Endpoint。<code>10.77.30.11</code> 是 pg01、<code>.12</code> 是 pg02、<code>.13</code> 是 pg03。</li>
 <li>三列都 Healthy 才能開始。若初始狀態已缺少 Member，不要繼續製造第二個故障。</li>
+<li>在完整健康狀態先寫入一筆資料，作為故障前已提交的基準：</li>
+</ol>
+<pre><code class="language-bash">etcdctl_tls del /lab/day22/no-quorum
+etcdctl_tls put /lab/day22/before-failure committed-before-failure
+etcdctl_tls get /lab/day22/before-failure
+</code></pre>
+<ol start="8">
+<li><code>put</code> 應回傳 <code>OK</code>，<code>get</code> 應顯示 Key 與 <code>committed-before-failure</code>。</li>
 </ol>
 <p><img src="../../source/Day22/day22-fig02.png" alt="三個 etcd 成員屬於同一叢集，三個端點健康且只有一個 Raft 領導者"></p>
 <p>圖（二）三個成員均已啟動，三個端點可以提交提案，且當下只有 etcd03 為 Raft 領導者。</p>
-<h3>6.2 停止一個非 Leader Member</h3>
+<h3>6.2 停止 etcd02，驗證 2／3 Quorum</h3>
 <ol>
-<li>優先選 pg03 作為停止對象。若 pg03 是 Leader，就改選 pg02；本節先停止非 Leader，避免同時混入 Leader Election 的畫面。</li>
-<li>到選定節點的 Console。例如選擇 pg03 時執行：</li>
+<li>本系列畫面中 etcd03 是 Leader，因此停止非 Leader 的 etcd02，單獨觀察少一票後的 Quorum 行為。若實際 Leader 已經改變，停止 etcd02 會同時觸發一次 Leader Election，但 2／3 的判讀方式相同。</li>
+<li>到 pg02 Console 執行：</li>
 </ol>
 <pre><code class="language-bash">sudo systemctl stop etcd
 systemctl is-active etcd
@@ -339,8 +358,10 @@ systemctl is-active etcd
 <li>預期 <code>systemctl is-active</code> 顯示 <code>inactive</code>。不要關閉整台 VM，也不要刪除 <code>/var/lib/etcd/iron-pg</code>。</li>
 </ol>
 <p><img src="../../source/Day22/day22-fig03.png" alt="非領導者 etcd02 的服務已停止"></p>
-<p>圖（三）停止一個非領導者成員後，該節點的 etcd 服務顯示為 <code>inactive</code>。
-4. 回到 pg01 執行：</p>
+<p>圖（三）停止一個非領導者成員後，該節點的 etcd 服務顯示為 <code>inactive</code>。</p>
+<ol start="4">
+<li>回到 pg01 執行：</li>
+</ol>
 <pre><code class="language-bash">etcdctl_tls endpoint status --cluster -w table
 etcdctl_tls endpoint health --cluster
 </code></pre>
@@ -348,60 +369,23 @@ etcdctl_tls endpoint health --cluster
 <li>被停止的 Endpoint 應顯示 Unhealthy、Timeout 或無法連線，其餘兩個 Endpoint 為 Healthy。三節點叢集保有 2 票與 Quorum。</li>
 <li>在 pg01 寫入並讀回測試 Key，證明 2／3 狀態可完成一致寫入：</li>
 </ol>
-<pre><code class="language-bash">etcdctl_tls put /lab/day22/status healthy
-etcdctl_tls get /lab/day22/status
-</code></pre>
-<ol start="7">
-<li><code>put</code> 應回傳 <code>OK</code>，<code>get</code> 應顯示 Key 與 <code>healthy</code>。</li>
-<li>回到剛才停止的節點。例如 pg03 執行：</li>
-</ol>
-<pre><code class="language-bash">sudo systemctl start etcd
-systemctl is-active etcd
-sudo journalctl -u etcd -b -n 20 -o cat --no-pager
-</code></pre>
-<ol start="9">
-<li>預期服務回到 <code>active</code>。回到 pg01 重複執行：</li>
-</ol>
-<pre><code class="language-bash">etcdctl_tls endpoint health --cluster
-etcdctl_tls endpoint status --cluster -w table
-</code></pre>
-<ol start="10">
-<li>等三台全部 Healthy，再進行下一節。如果剛啟動時尚未恢復，可以等待數秒後重查，不要重建 Member 或清空 Data Directory。</li>
-</ol>
-<h3>6.3 保留 pg01，停止 pg03</h3>
-<ol>
-<li>在 pg01 再次確認 3/3 Healthy，並清除上次可能留下的測試 Key：</li>
-</ol>
-<pre><code class="language-bash">etcdctl_tls endpoint health --cluster
-etcdctl_tls del /lab/day22/no-quorum
-</code></pre>
-<ol start="2">
-<li>到 pg03 Console 執行：</li>
-</ol>
-<pre><code class="language-bash">sudo systemctl stop etcd
-systemctl is-active etcd
-</code></pre>
-<ol start="3">
-<li>回到 pg01。此時 pg01、pg02 還有 2 票，應可正常讀寫：</li>
-</ol>
 <pre><code class="language-bash">etcdctl_tls put /lab/day22/two-of-three still-writable
 etcdctl_tls get /lab/day22/two-of-three
-etcdctl_tls endpoint health --cluster
 </code></pre>
-<ol start="4">
-<li><code>put</code> 應回傳 <code>OK</code>，證明停止一台後保有 Quorum。pg03 顯示 Unhealthy 是本節預期結果。</li>
+<ol start="7">
+<li><code>put</code> 應回傳 <code>OK</code>，<code>get</code> 應顯示 Key 與 <code>still-writable</code>。維持 etcd02 停止，直接進入下一節。</li>
 </ol>
 <p><img src="../../source/Day22/day22-fig04.png" alt="停止一個成員後，其餘兩個端點可以提交並讀回測試資料"></p>
 <p>圖（四）叢集保有 2／3 法定票數，可以提交並讀回 <code>/lab/day22/two-of-three</code>。</p>
-<h3>6.4 再停止 pg02，實際失去 Quorum</h3>
+<h3>6.3 再停止 etcd03，實際失去 Quorum</h3>
 <ol>
-<li>保持 pg03 停止，到 pg02 Console 執行：</li>
+<li>保持 etcd02 停止，到 pg03 Console 執行：</li>
 </ol>
 <pre><code class="language-bash">sudo systemctl stop etcd
 systemctl is-active etcd
 </code></pre>
 <ol start="2">
-<li>確認 pg02 顯示 <code>inactive</code>。此時只剩 pg01 的 1 票，不足三節點叢集需要的 2 票。</li>
+<li>確認 pg03 顯示 <code>inactive</code>。此時只剩 pg01 的 1 票，不足三節點叢集需要的 2 票。</li>
 <li>回到 pg01，先確認 etcd Process 的執行狀態：</li>
 </ol>
 <pre><code class="language-bash">systemctl is-active etcd
@@ -420,7 +404,7 @@ systemctl is-active etcd
 </ol>
 <p><img src="../../source/Day22/day22-fig05.png" alt="只剩 pg01 時 etcd 程序維持執行，但新的寫入無法取得多數確認"></p>
 <p>圖（五）只剩 1／3 成員時，pg01 的 etcd 程序維持 <code>active</code>，新的 <code>put</code> 則因無法取得多數確認而逾時。</p>
-<h3>6.5 依序恢復 pg02、pg03</h3>
+<h3>6.4 依序恢復 etcd02、etcd03</h3>
 <ol>
 <li>先到 pg02 Console 恢復第二票：</li>
 </ol>
@@ -432,12 +416,12 @@ sudo journalctl -u etcd -b -n 20 -o cat --no-pager
 <li>確認 pg02 為 <code>active</code>，回到 pg01 執行：</li>
 </ol>
 <pre><code class="language-bash">etcdctl_tls endpoint health --cluster
-etcdctl_tls get /lab/day22/status
+etcdctl_tls get /lab/day22/before-failure
 etcdctl_tls get /lab/day22/two-of-three
 etcdctl_tls get /lab/day22/no-quorum
 </code></pre>
 <ol start="3">
-<li>pg01、pg02 應恢復 Healthy，<code>status</code> 與 <code>two-of-three</code> 應可讀回。記錄 <code>no-quorum</code> 是否存在，並以這次查詢結果判定先前逾時寫入的最終狀態。</li>
+<li>pg01、pg02 應恢復 Healthy，<code>before-failure</code> 與 <code>two-of-three</code> 應可讀回。記錄 <code>no-quorum</code> 是否存在，並以這次查詢結果判定先前逾時寫入的最終狀態。</li>
 <li>到 pg03 Console 恢復第三個 Member：</li>
 </ol>
 <pre><code class="language-bash">sudo systemctl start etcd
@@ -489,9 +473,14 @@ for ip in 10.77.30.11 10.77.30.12 10.77.30.13; do
   nc -vz -w 3 &quot;$ip&quot; 2380
 done
 </code></pre>
-<p>最後從同 VLAN、但未列入允許來源的 ca01 測試 pg01。兩個連線都應逾時或失敗：</p>
-<pre><code class="language-bash">nc -vz -w 3 10.77.30.11 2379
-nc -vz -w 3 10.77.30.11 2380
+<p>最後從同 VLAN、但未列入允許來源的 ca01 測試 pg01。使用 Bash 內建的 <code>/dev/tcp</code>，不需要在 ca01 額外安裝 netcat；兩個連線都應逾時或失敗：</p>
+<pre><code class="language-bash">for port in 2379 2380; do
+  if timeout 3 bash -c &quot;&lt;/dev/tcp/10.77.30.11/$port&quot; 2&gt;/dev/null; then
+    echo &quot;ERROR: TCP $port is reachable&quot;
+  else
+    echo &quot;OK: TCP $port is blocked&quot;
+  fi
+done
 </code></pre>
 <p>這組正反測試同時確認三個 etcd 成員可以互連，ca01 則無法存取 Client 與 Peer Port。</p>
 <h2>額外實作：驗證租約到期後自動移除 Key</h2>
@@ -521,4 +510,12 @@ fi
 </code></pre>
 <p><img src="../../source/Day22/day22-fig07.png" alt="測試 Key 在租約有效期間可以讀取，租約到期後由 etcd 自動移除"></p>
 <p>圖（七）測試 Key 綁定 15 秒租約後可正常讀取；未執行 KeepAlive 並超過 TTL 後，etcd 自動移除該 Key。</p>
-</main></body></html>
+<h2>參考資料</h2>
+<ul>
+<li><a href="https://smallstep.com/docs/step-cli/reference/ca/provisioner/add/">Smallstep｜Add a Provisioner</a></li>
+<li><a href="https://smallstep.com/docs/step-cli/reference/ca/certificate/">Smallstep｜Request a Certificate</a></li>
+<li><a href="https://etcd.io/docs/v3.5/op-guide/security/">etcd｜Transport Security Model</a></li>
+<li><a href="https://etcd.io/docs/v3.5/op-guide/runtime-configuration/">etcd｜Runtime Reconfiguration</a></li>
+</ul>
+</main></body>
+</html>

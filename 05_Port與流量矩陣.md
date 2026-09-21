@@ -10,6 +10,7 @@
 | `PVE_NODES` | Host(s) | `10.77.10.11`、`10.77.10.12`、`10.77.10.13` |
 | `PROXY_NODES` | Host(s) | `10.77.20.21`、`10.77.20.22` |
 | `APP_NODES` | Host(s) | `10.77.20.31`、`10.77.20.32` |
+| `MONITOR_NODE` | Host(s) | `10.77.20.51` |
 | `PG_NODES` | Host(s) | `10.77.30.11`、`10.77.30.12`、`10.77.30.13` |
 | `CA_NODE` | Host(s) | `10.77.30.10` |
 | `BACKUP_NODE` | Host(s) | `10.77.40.11` |
@@ -20,12 +21,17 @@
 | `DB_RO_VIP` | Host(s) | `10.77.20.12` |
 | `CLOUDFLARE_IPV4` | URL Table (IPs) | `https://www.cloudflare.com/ips-v4`，每日更新 |
 | `VPN_ADMIN_CLIENTS` | OpenVPN group | `vpn-admin` 目前已連線成員的 Tunnel IP |
+| `VPN_DB_RW_CLIENTS` | OpenVPN group | `vpn-db-rw` 目前已連線成員的 Tunnel IP |
+| `VPN_DB_RO_CLIENTS` | OpenVPN group | `vpn-db-ro` 目前已連線成員的 Tunnel IP |
+| `VPN_MONITOR_CLIENTS` | OpenVPN group | `vpn-monitor` 目前已連線成員的 Tunnel IP |
 | `WEB_PORTS` | Port(s) | `80`、`443` |
 | `PGSQL_PORT` | Port(s) | `5432` |
 | `PATRONI_API` | Port(s) | `8008` |
 | `ETCD_PORTS` | Port(s) | `2379`、`2380` |
 | `STEP_CA_PORT` | Port(s) | `9000` |
 | `BASIC_OUTBOUND_TCP` | Port(s) | `80`、`443` |
+| `MONITOR_PORTS` | Port(s) | `8008`、`8405`、`9100`、`9187` |
+| `MONITOR_UI_PORTS` | Port(s) | `3000`、`9090` |
 
 `BASTION_TARGETS` 是網路層可到達上限；Alice、Bob 等個別帳號仍由 jump01 的 SSH `PermitOpen` 進一步縮小到各自獲准的主機。
 
@@ -66,7 +72,7 @@
 | pg01～03 | pg01～03 | TCP 5432 | PostgreSQL Streaming Replication |
 | pg01～03 | pg01～03 | TCP 2379 | etcd Client API |
 | pg01～03 | pg01～03 | TCP 2380 | etcd Peer |
-| pg01～03 | ca01 | TCP 9000 | 使用一次性 Token 申請／更新 PostgreSQL 與 etcd Certificate |
+| pg01～03 | ca01 | TCP 9000 | PostgreSQL 使用 `iron-lab-admin`、etcd 使用 `iron-lab-etcd` 申請／更新 Certificate |
 | pg01～03 | backup01 | TCP 22 | pgBackRest Archive／Restore SSH |
 | backup01 | pg01～03 | TCP 22 | pgBackRest 讀取 Primary／Standby |
 | pg-restore01 | backup01 | TCP 22 | PITR Restore；不接受 Application 流量 |
@@ -92,10 +98,12 @@
 | monitor01 | pg01～03 | 9187 | PostgreSQL Exporter |
 | monitor01 | proxy01／02 | 8405 | HAProxy Prometheus Exporter |
 | monitor01 | Cloudflare 公開 Hostname | TCP 443 | 端到端 Blackbox HTTPS Probe |
-| VPN 授權管理者 | monitor01 | 3000 | Grafana |
+| VPN-Monitor `VPN_MONITOR_CLIENTS` | monitor01 | 3000、9090 | Grafana 與 Prometheus Web UI |
 | monitor01 本機 | 9090 | Prometheus |
 | monitor01 本機 | 9093 | Alertmanager |
 
 Ceph `10.77.70.0/24` 與 Corosync `10.77.80.0/24` 是無 Gateway 封閉網路，不建立 OPNsense 跨 VLAN 規則。其 Daemon Port 以部署當下產生的 Ceph／Corosync 設定與官方版本文件為準，不將未實測範圍硬寫成防火牆白名單。
 
 `pg01～03 → ca01 TCP 9000` 是同 VLAN 流量，OPNsense 看不到。實際 Allow 由 ca01 的 nftables Host Firewall 建立；ca01 不加入 `BASTION_TARGETS`、不接受 SSH，也不得主動連線 PostgreSQL 5432、Patroni 8008 或 etcd 2379／2380。
+
+`pg01～03` 之間的 PostgreSQL 5432、etcd 2379／2380 同樣屬於 Database VLAN 內部流量，不會經過 OPNsense。實際 Allow 由各 pg 節點的 nftables Host Firewall 建立；跨 VLAN 流量則維持 OPNsense Default Deny。

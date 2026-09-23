@@ -106,4 +106,4 @@ Ceph `10.77.70.0/24` 與 Corosync `10.77.80.0/24` 是無 Gateway 封閉網路，
 
 `pg01～03 → ca01 TCP 9000` 是同 VLAN 流量，OPNsense 看不到。實際 Allow 由 ca01 的 nftables Host Firewall 建立；ca01 不加入 `BASTION_TARGETS`、不接受 SSH，也不得主動連線 PostgreSQL 5432、Patroni 8008 或 etcd 2379／2380。
 
-`pg01～03` 之間的 PostgreSQL 5432、etcd 2379／2380 同樣屬於 Database VLAN 內部流量，不會經過 OPNsense。實際 Allow 由各 pg 節點的 nftables Host Firewall 建立；跨 VLAN 流量則維持 OPNsense Default Deny。
+`pg01～03` 之間的 PostgreSQL 5432、Patroni 8008 與 etcd 2379／2380 都屬於 Database VLAN 內部流量，不會經過 OPNsense。各 pg 節點的 nftables 主機防火牆負責限制實際來源；跨 VLAN 流量則維持 OPNsense 預設拒絕。會變更叢集狀態的 Patroni REST 方法另由三台 Patroni 的 `restapi.allowlist` 限制為 pg01～03；HAProxy 與監控跨 VLAN 使用 `GET` 健康／狀態端點。

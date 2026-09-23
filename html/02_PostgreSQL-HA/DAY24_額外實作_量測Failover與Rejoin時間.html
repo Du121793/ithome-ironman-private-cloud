@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 24 額外實作｜量測 Primary 故障切換與舊 Primary 重新加入時間</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 24 額外實作｜量測 Primary 故障切換與舊 Primary 重新加入時間</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 24｜PostgreSQL HA 叢集實作（下）：計畫性切換、故障切換與舊 Primary 安全回歸</a></p>
+<p>本文件接續 Day 24 主實作，以 0.2 秒探測分開記錄新 Primary 角色端點恢復、第一筆直接 SQL 寫入成功，以及舊 Primary 以 Replica 身分重新加入的時間。實驗會強制停止當下的 Primary VM，只適合可丟棄的 Lab。</p>
+<table>
+<thead>
+<tr>
+<th>時間點</th>
+<th>事件</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>T0</td>
+<td>送出停止 Primary VM 指令</td>
+</tr>
+<tr>
+<td>T2</td>
+<td>新 Primary 的 <code>/primary</code> 首次回傳 HTTP 200</td>
+</tr>
+<tr>
+<td>T3</td>
+<td>新 Primary 第一筆直接 SQL 寫入成功</td>
+</tr>
+<tr>
+<td>T4</td>
+<td>舊 Primary 的 <code>/replica</code> 首次回傳 HTTP 200</td>
+</tr>
+</tbody></table>
+<p><code>T2 - T0</code> 是角色切換時間，<code>T3 - T0</code> 是直接 SQL 可寫恢復時間。這些結果尚未包含代理、固定入口與用戶端重連時間。</p>
+<h2>1. 確認健康基準</h2>
+<p>T0 由 PVE 節點記錄，T2、T3 與 T4 由 PostgreSQL 節點記錄。開始前先在參與量測的 PVE 與 PostgreSQL 節點執行：</p>
+<pre><code class="language-bash">timedatectl show -p NTPSynchronized --value
+chronyc tracking
+</code></pre>
+<p><code>NTPSynchronized</code> 應為 <code>yes</code>，<code>chronyc tracking</code> 的 <code>Leap status</code> 應為 <code>Normal</code>。兩端完成時間同步後，才計算跨主機時間差。</p>
+<p>在任一 PostgreSQL 節點執行：</p>
+<pre><code class="language-bash">sudo -u postgres patronictl -c /etc/patroni/config.yml list -e
+</code></pre>
+<p>開始前應只有一台 Leader，兩台 Replica 的狀態為 <code>streaming</code>，Lag 為 0。在當下 Primary 寫入一筆故障前標記，並保留成功回傳：</p>
+<pre><code class="language-bash">DAY24_BEFORE_MARK=&quot;day24-before-failover-$(date +%s)&quot;
+sudo -u postgres psql -d appdb -v ON_ERROR_STOP=1 \
+  -v marker=&quot;$DAY24_BEFORE_MARK&quot; \
+  -c &quot;INSERT INTO public.replication_demo(source) VALUES (:&#39;marker&#39;) RETURNING id,created_at,source;&quot;
+printf &#39;before_marker=%s\n&#39; &quot;$DAY24_BEFORE_MARK&quot;
+</code></pre>
+<h2>2. 在兩台 Replica 啟動候選節點探測</h2>
+<p>在兩台 Replica 分別開啟 Console，執行相同腳本。只有成為 Primary 的節點會取得 HTTP 200，並繼續嘗試 SQL 寫入。</p>
+<pre><code class="language-bash">DAY24_NODE=&quot;$(hostname -s)&quot;
+case &quot;$DAY24_NODE&quot; in
+  pg01) DAY24_REST_IP=&#39;10.77.30.11&#39; ;;
+  pg02) DAY24_REST_IP=&#39;10.77.30.12&#39; ;;
+  pg03) DAY24_REST_IP=&#39;10.77.30.13&#39; ;;
+  *) echo &quot;ERROR: unexpected hostname: $DAY24_NODE&quot;; exit 1 ;;
+esac
+
+DAY24_DIR=&#39;/tmp/day24-failover&#39;
+DAY24_LOG=&quot;$DAY24_DIR/${DAY24_NODE}-candidate.log&quot;
+mkdir -p &quot;$DAY24_DIR&quot;
+rm -f &quot;$DAY24_LOG&quot;
+
+while true; do
+  DAY24_CHECK_EPOCH=&quot;$(date +%s.%N)&quot;
+  DAY24_HTTP_CODE=&quot;$(curl -sS -o /dev/null -w &#39;%{http_code}&#39; \
+    --connect-timeout 1 --max-time 1 \
+    &quot;http://${DAY24_REST_IP}:8008/primary&quot; || true)&quot;
+  printf &#39;check_epoch=%s http_code=%s\n&#39; \
+    &quot;$DAY24_CHECK_EPOCH&quot; &quot;$DAY24_HTTP_CODE&quot; &gt;&gt; &quot;$DAY24_LOG&quot;
+
+  if [ &quot;$DAY24_HTTP_CODE&quot; = &#39;200&#39; ]; then
+    if ! grep -q &#39;^new_primary_epoch=&#39; &quot;$DAY24_LOG&quot;; then
+      printf &#39;new_primary_node=%s\n&#39; &quot;$DAY24_NODE&quot; | tee -a &quot;$DAY24_LOG&quot;
+      printf &#39;new_primary_epoch=%s\n&#39; &quot;$DAY24_CHECK_EPOCH&quot; | tee -a &quot;$DAY24_LOG&quot;
+      printf &#39;new_primary_time=%s\n&#39; &quot;$(date --iso-8601=ns)&quot; | tee -a &quot;$DAY24_LOG&quot;
+    fi
+
+    DAY24_SQL_OUTPUT=&quot;$(sudo -u postgres psql -d appdb -v ON_ERROR_STOP=1 \
+      -c &quot;INSERT INTO public.replication_demo(source) VALUES (&#39;day24-after-failover&#39;) RETURNING id,created_at,source;&quot; 2&gt;&amp;1)&quot;
+    DAY24_SQL_STATUS=$?
+    printf &#39;%s\n&#39; &quot;$DAY24_SQL_OUTPUT&quot; | tee -a &quot;$DAY24_LOG&quot;
+    if [ &quot;$DAY24_SQL_STATUS&quot; -eq 0 ]; then
+      printf &#39;sql_success_epoch=%s\n&#39; &quot;$(date +%s.%N)&quot; | tee -a &quot;$DAY24_LOG&quot;
+      printf &#39;sql_success_time=%s\n&#39; &quot;$(date --iso-8601=ns)&quot; | tee -a &quot;$DAY24_LOG&quot;
+      break
+    fi
+  fi
+  sleep 0.2
+done
+</code></pre>
+<h2>3. 記錄 T0 並停止當下 Primary VM</h2>
+<p>本次實測的 Primary 是 pg02，位於 pve02，VMID 為 222。在可操作 PVE Cluster API 的節點執行：</p>
+<pre><code class="language-bash">DAY24_PRIMARY=&#39;pg02&#39;
+DAY24_VMID=&#39;222&#39;
+DAY24_PVE_NODE=&#39;pve02&#39;
+DAY24_DIR=&#39;/root/day24-failover&#39;
+mkdir -p &quot;$DAY24_DIR&quot;
+
+DAY24_FAULT_EPOCH=&quot;$(date +%s.%N)&quot;
+DAY24_FAULT_TIME=&quot;$(date --iso-8601=ns)&quot;
+printf &#39;primary=%s\n&#39; &quot;$DAY24_PRIMARY&quot; | tee &quot;$DAY24_DIR/fault.txt&quot;
+printf &#39;vmid=%s\n&#39; &quot;$DAY24_VMID&quot; | tee -a &quot;$DAY24_DIR/fault.txt&quot;
+printf &#39;fault_epoch=%s\n&#39; &quot;$DAY24_FAULT_EPOCH&quot; | tee -a &quot;$DAY24_DIR/fault.txt&quot;
+printf &#39;fault_time=%s\n&#39; &quot;$DAY24_FAULT_TIME&quot; | tee -a &quot;$DAY24_DIR/fault.txt&quot;
+
+pvesh create &quot;/nodes/${DAY24_PVE_NODE}/qemu/${DAY24_VMID}/status/stop&quot;
+pvesh get &quot;/nodes/${DAY24_PVE_NODE}/qemu/${DAY24_VMID}/status/current&quot;
+cat &quot;$DAY24_DIR/fault.txt&quot;
+</code></pre>
+<p>腳本會在呼叫停止 VM 的 PVE API 前立即記錄 T0，因此量測結果包含 PVE API 處理與 VM 停止所需的時間。</p>
+<p><img src="../../source/Day24/day24-fig08.png" alt="PVE 停止 pg02 並記錄故障注入時間"></p>
+<p>圖（一）停止當下 Primary pg02，同時保存 VMID、Epoch 與 ISO 8601 時間。</p>
+<h3>90 秒內沒有出現新 Primary 時安全復原</h3>
+<p>本 Lab 先以 90 秒作為單次觀察上限。兩台候選節點在停止指令送出後都沒有取得 <code>/primary</code> HTTP 200 時，依序執行：</p>
+<ol>
+<li><p>在兩個探測 Console 按 <code>Ctrl+C</code>，停止候選節點探測。</p>
+</li>
+<li><p>保持各節點原有角色設定，不手動促升 Replica。</p>
+</li>
+<li><p>回到 PVE 節點啟動剛才停止的 VM：</p>
+<pre><code class="language-bash">pvesh create &quot;/nodes/${DAY24_PVE_NODE}/qemu/${DAY24_VMID}/status/start&quot;
+</code></pre>
+</li>
+<li><p>在各服務所在節點保存故障期間的 Patroni、PostgreSQL 與 etcd 紀錄；服務單元名稱不同時，改用環境中的實際名稱或 PostgreSQL 日誌路徑：</p>
+<pre><code class="language-bash">sudo journalctl -u patroni --since &#39;-10 min&#39; --no-pager &gt; /tmp/day24-patroni.log
+sudo journalctl -u postgresql --since &#39;-10 min&#39; --no-pager &gt; /tmp/day24-postgresql.log
+sudo journalctl -u etcd --since &#39;-10 min&#39; --no-pager &gt; /tmp/day24-etcd.log
+</code></pre>
+</li>
+<li><p>在 PostgreSQL 節點檢查叢集：</p>
+<pre><code class="language-bash">sudo -u postgres patronictl -c /etc/patroni/config.yml list -e
+</code></pre>
+</li>
+</ol>
+<p>看到一台 Leader、兩台狀態為 <code>streaming</code> 的 Replica 後，再根據紀錄排除 DCS、複寫延遲或候選資格問題。叢集恢復健康前先結束本次量測。</p>
+<h2>4. 計算角色切換與可寫恢復時間</h2>
+<p><img src="../../source/Day24/day24-fig09.png" alt="pg03 的 Primary 端點恢復後嘗試 SQL，最後成功寫入"></p>
+<p>圖（二）pg03 的 <code>/primary</code> 首次回傳 HTTP 200 後，SQL 經過短暫唯讀階段才成功寫入。</p>
+<p>把 PVE 上 <code>fault.txt</code> 的 <code>fault_epoch</code> 複製到新 Primary，再執行：</p>
+<pre><code class="language-bash">DAY24_FAULT_EPOCH=&#39;1789065782.290522332&#39;
+DAY24_LOG=&#39;/tmp/day24-failover/pg03-candidate.log&#39;
+DAY24_NEW_PRIMARY_EPOCH=&quot;$(awk -F= &#39;/^new_primary_epoch=/{print $2; exit}&#39; &quot;$DAY24_LOG&quot;)&quot;
+DAY24_SQL_SUCCESS_EPOCH=&quot;$(awk -F= &#39;/^sql_success_epoch=/{print $2; exit}&#39; &quot;$DAY24_LOG&quot;)&quot;
+awk -v start=&quot;$DAY24_FAULT_EPOCH&quot; \
+  -v primary=&quot;$DAY24_NEW_PRIMARY_EPOCH&quot; \
+  -v sql=&quot;$DAY24_SQL_SUCCESS_EPOCH&quot; \
+  &#39;BEGIN {
+    printf &quot;role_switch_seconds=%.3f\n&quot;, primary-start
+    printf &quot;direct_sql_write_seconds=%.3f\n&quot;, sql-start
+  }&#39;
+</code></pre>
+<p>上面的 Epoch 是本次實測值；重新執行時要換成自己 <code>fault.txt</code> 中的數值。本次角色端點恢復為 24.293 秒，第一筆直接 SQL 寫入成功為 25.960 秒。</p>
+<p>新 Primary 的腳本結束後，到另一台候選節點按 <code>Ctrl+C</code> 停止探測。</p>
+<p>再確認只有一個 Primary，並比較故障前後資料：</p>
+<pre><code class="language-bash">for ip in 10.77.30.11 10.77.30.12 10.77.30.13; do
+  printf &#39;%s &#39; &quot;$ip&quot;
+  curl -sS -o /dev/null -w &#39;primary=%{http_code}\n&#39; \
+    --connect-timeout 1 --max-time 2 &quot;http://${ip}:8008/primary&quot; || echo &#39;unreachable&#39;
+done
+
+sudo -u postgres patronictl -c /etc/patroni/config.yml list -e
+sudo -u postgres psql -d appdb -P pager=off \
+  -c &quot;SELECT id,created_at,source FROM public.replication_demo WHERE source LIKE &#39;day24-%&#39; ORDER BY id;&quot;
+</code></pre>
+<p><img src="../../source/Day24/day24-fig10.png" alt="故障切換後只有 pg03 的 Primary 端點回傳 HTTP 200"></p>
+<p>圖（三）pg02 停止後，pg03 是時間軸 23 的唯一 Leader。</p>
+<p><img src="../../source/Day24/day24-fig11.png" alt="新 Primary pg03 保留故障前後的測試資料"></p>
+<p>圖（四）新 Primary 保留本次故障前已確認的資料，並能接受故障後寫入。這項查詢只能判讀本次實驗是否觀察到資料遺失。</p>
+<h2>5. 量測舊 Primary 重新加入時間</h2>
+<p>先在存活的 PostgreSQL 節點啟動探測：</p>
+<pre><code class="language-bash">DAY24_OLD_PRIMARY_IP=&#39;10.77.30.12&#39;
+DAY24_DIR=&#39;/tmp/day24-rejoin&#39;
+DAY24_REJOIN_LOG=&quot;$DAY24_DIR/replica-monitor.log&quot;
+mkdir -p &quot;$DAY24_DIR&quot;
+rm -f &quot;$DAY24_REJOIN_LOG&quot;
+
+while true; do
+  DAY24_CHECK_EPOCH=&quot;$(date +%s.%N)&quot;
+  DAY24_HTTP_CODE=&quot;$(curl -sS -o /dev/null -w &#39;%{http_code}&#39; \
+    --connect-timeout 1 --max-time 1 \
+    &quot;http://${DAY24_OLD_PRIMARY_IP}:8008/replica&quot; || true)&quot;
+  printf &#39;check_epoch=%s http_code=%s\n&#39; \
+    &quot;$DAY24_CHECK_EPOCH&quot; &quot;$DAY24_HTTP_CODE&quot; &gt;&gt; &quot;$DAY24_REJOIN_LOG&quot;
+  if [ &quot;$DAY24_HTTP_CODE&quot; = &#39;200&#39; ]; then
+    printf &#39;replica_ready_epoch=%s\n&#39; &quot;$DAY24_CHECK_EPOCH&quot; | tee -a &quot;$DAY24_REJOIN_LOG&quot;
+    printf &#39;replica_ready_time=%s\n&#39; &quot;$(date --iso-8601=ns)&quot; | tee -a &quot;$DAY24_REJOIN_LOG&quot;
+    break
+  fi
+  sleep 0.2
+done
+</code></pre>
+<p>探測開始後，在 PVE 節點呼叫啟動 VM 的 API 前立即記錄起點：</p>
+<pre><code class="language-bash">DAY24_OLD_PRIMARY=&#39;pg02&#39;
+DAY24_VMID=&#39;222&#39;
+DAY24_PVE_NODE=&#39;pve02&#39;
+DAY24_DIR=&#39;/root/day24-rejoin&#39;
+mkdir -p &quot;$DAY24_DIR&quot;
+
+DAY24_REJOIN_START_EPOCH=&quot;$(date +%s.%N)&quot;
+DAY24_REJOIN_START_TIME=&quot;$(date --iso-8601=ns)&quot;
+printf &#39;old_primary=%s\n&#39; &quot;$DAY24_OLD_PRIMARY&quot; | tee &quot;$DAY24_DIR/start.txt&quot;
+printf &#39;vmid=%s\n&#39; &quot;$DAY24_VMID&quot; | tee -a &quot;$DAY24_DIR/start.txt&quot;
+printf &#39;rejoin_start_epoch=%s\n&#39; &quot;$DAY24_REJOIN_START_EPOCH&quot; | tee -a &quot;$DAY24_DIR/start.txt&quot;
+printf &#39;rejoin_start_time=%s\n&#39; &quot;$DAY24_REJOIN_START_TIME&quot; | tee -a &quot;$DAY24_DIR/start.txt&quot;
+
+pvesh create &quot;/nodes/${DAY24_PVE_NODE}/qemu/${DAY24_VMID}/status/start&quot;
+pvesh get &quot;/nodes/${DAY24_PVE_NODE}/qemu/${DAY24_VMID}/status/current&quot;
+cat &quot;$DAY24_DIR/start.txt&quot;
+</code></pre>
+<p><img src="../../source/Day24/day24-fig12.png" alt="PVE 啟動舊 Primary pg02 並記錄重新加入起點"></p>
+<p>圖（五）啟動 pg02 VM，並保存重新加入的起點時間。</p>
+<p>等待探測結束後，在舊 Primary 檢查 Patroni 處理過程：</p>
+<pre><code class="language-bash">sudo journalctl -u patroni -b -n 150 -o cat --no-pager
+sudo -u postgres patronictl -c /etc/patroni/config.yml list -e
+sudo -u postgres psql -d appdb -Atqc &#39;SELECT pg_is_in_recovery();&#39;
+</code></pre>
+<p><img src="../../source/Day24/day24-fig13.png" alt="Patroni 使用 pg_rewind 讓 pg02 以 Replica 身分重新加入"></p>
+<p>圖（六）Patroni 辨識分岔的時間軸，執行 <code>pg_rewind</code> 後讓 pg02 在時間軸 23 恢復串流複寫。</p>
+<p>把 PVE 上 <code>start.txt</code> 的 <code>rejoin_start_epoch</code> 複製到存活節點，計算耗時：</p>
+<pre><code class="language-bash">DAY24_REJOIN_START_EPOCH=&#39;1789066011.615939130&#39;
+DAY24_REJOIN_LOG=&#39;/tmp/day24-rejoin/replica-monitor.log&#39;
+DAY24_REPLICA_READY_EPOCH=&quot;$(awk -F= &#39;/^replica_ready_epoch=/{print $2; exit}&#39; &quot;$DAY24_REJOIN_LOG&quot;)&quot;
+awk -v start=&quot;$DAY24_REJOIN_START_EPOCH&quot; \
+  -v ready=&quot;$DAY24_REPLICA_READY_EPOCH&quot; \
+  &#39;BEGIN {printf &quot;old_primary_start_to_replica_ready=%.3f_seconds\n&quot;, ready-start}&#39;
+</code></pre>
+<p><img src="../../source/Day24/day24-fig14.png" alt="舊 Primary 從 VM 啟動到 Replica 端點恢復的量測結果"></p>
+<p>圖（七）本次實測從送出啟動 pg02 VM 指令到 <code>/replica</code> 首次回傳 HTTP 200，共 97.237 秒；這段時間包含 PVE API 處理與 VM 開機。</p>
+<h2>6. 結果記錄</h2>
+<table>
+<thead>
+<tr>
+<th>量測項目</th>
+<th>起點</th>
+<th>終點</th>
+<th>本次實測</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>資料庫角色切換</td>
+<td>T0：送出停止 Primary VM 指令</td>
+<td>T2：<code>/primary</code> 首次回傳 HTTP 200</td>
+<td>24.293 秒</td>
+</tr>
+<tr>
+<td>直接 SQL 可寫恢復</td>
+<td>T0：送出停止 Primary VM 指令</td>
+<td>T3：第一筆寫入成功</td>
+<td>25.960 秒</td>
+</tr>
+<tr>
+<td>舊 Primary 重新加入</td>
+<td>送出啟動舊 Primary VM 指令</td>
+<td>T4：<code>/replica</code> 首次回傳 HTTP 200</td>
+<td>97.237 秒</td>
+</tr>
+<tr>
+<td>故障前資料可見性</td>
+<td>最後一筆已確認寫入</td>
+<td>新 Primary 查到相同標記</td>
+<td>本次沒有觀察到資料遺失</td>
+</tr>
+</tbody></table>
+<p>角色切換與可寫恢復的起點包含 PVE API 處理及 VM 停止時間；重新加入的起點包含 PVE API 處理及 VM 開機時間。數值只適用於本次 Lab 的資源、網路、Patroni 設定與故障時點。正式環境需要重複多次，並把用戶端、代理、連線池與應用程式恢復一起納入 RTO／RPO 判讀。</p>
+</main></body>
+</html>

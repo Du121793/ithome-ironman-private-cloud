@@ -1,0 +1,726 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 25｜為 Web 與資料庫建立服務入口：Nginx 負載平衡、TLS 邊界與 HAProxy 讀寫分流</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 25｜為 Web 與資料庫建立服務入口：Nginx 負載平衡、TLS 邊界與 HAProxy 讀寫分流</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 25｜為 Web 與資料庫建立服務入口：Nginx 負載平衡、TLS 邊界與 HAProxy 讀寫分流</a></p>
+<p>本日建立 proxy01／02、app02 與 client01，並沿用既有的 app01。Nginx 負責 Web Reverse Proxy；HAProxy 使用 Patroni REST API 判斷 Primary／Replica 角色。</p>
+<h2>本日操作順序</h2>
+<ol>
+<li>在 PVE Web UI 依序建立 proxy01、proxy02、app02、client01，既有 app01 不重建；逐台確認 Cloud-Init DNS 已進入 systemd-resolved。</li>
+<li>先完成 app01，再完成 app02。每台都要先確認 App 本機 Port 與資料庫連線。</li>
+<li>逐台在 proxy01、proxy02 安裝 Nginx 與 HAProxy。</li>
+<li>在 OPNsense 啟用預留的 Proxy → PostgreSQL 5432／Patroni 8008 規則，並從兩台 Proxy 實測。</li>
+<li>先完成 proxy01 的 Nginx 設定與測試，再把相同設定套到 proxy02。</li>
+<li>先完成 proxy01 的 HAProxy 設定與測試，再處理 proxy02。</li>
+<li>最後從 client01 發送 Web 與 Database Request，避免用 Proxy 自己測自己而漏掉網路規則。</li>
+</ol>
+<h2>1. 建立與確認 VM</h2>
+<p>操作位置：PVE Web UI。先完整建立 proxy01，再使用同一套步驟建立其他 VM。既有的 app01 只做確認，不重新 Clone。</p>
+<h3>1.1 建立 proxy01</h3>
+<ol>
+<li>在左側選既有的 Debian 13 Template。</li>
+<li>右上角按 <code>More</code> → <code>Clone</code>。</li>
+<li><code>Target Node</code> 選 <code>pve01</code>。</li>
+<li><code>VM ID</code> 填 <code>201</code>。</li>
+<li><code>Name</code> 填 <code>proxy01</code>。</li>
+<li><code>Mode</code> 選 <code>Full Clone</code>。</li>
+<li><code>Target Storage</code> 選 pve01 的 <code>local-lvm</code>。</li>
+<li>按 <code>Clone</code>，等待 Task 顯示 <code>OK</code>。</li>
+<li>選 VM 201 → <code>Hardware</code> → <code>Processors</code> → <code>Edit</code>。</li>
+<li>Sockets 填 <code>1</code>、Cores 填 <code>2</code>，CPU Type 使用目前已驗證可 Migration 的相容模式，按 <code>OK</code>。</li>
+<li>選 <code>Memory</code> → <code>Edit</code>，Memory 填 <code>1024 MiB</code>，取消 Ballooning，按 <code>OK</code>。</li>
+<li>選 System Disk → <code>Disk Action</code> → <code>Resize</code>。</li>
+<li>先看目前容量，再填「還要增加多少 GiB」，使最終容量為 16 GiB。例如目前是 3 GiB，Resize 填 <code>13</code>。</li>
+<li>選 <code>Network Device (net0)</code> → <code>Edit</code>。</li>
+<li>Bridge 選 <code>vmbr1</code>、VLAN Tag 填 <code>20</code>、Model 選 <code>VirtIO</code>、Firewall 勾選，按 <code>OK</code>。</li>
+<li>選 <code>Cloud-Init</code>。</li>
+<li>User 填 <code>labadmin</code>，Password 填本次 Lab 管理密碼。Public Key 可留空；正式環境建議改用個人 Public Key。</li>
+<li>點 <code>IP Config (net0)</code> → <code>Edit</code>，IPv4 選 <code>Static</code>。</li>
+<li>IPv4/CIDR 填 <code>10.77.20.21/24</code>，Gateway 填 <code>10.77.20.1</code>，按 <code>OK</code>。</li>
+<li>DNS Domain 填 <code>lab.home</code>，DNS Server 填 <code>10.77.20.1</code>。</li>
+<li>按 <code>Regenerate Image</code>。</li>
+<li>到 <code>Options</code> → <code>Start at boot</code> → <code>Edit</code>，勾選後按 <code>OK</code>。</li>
+<li>按 <code>Start</code>，再開啟 <code>Console</code>。</li>
+</ol>
+<p>Full Clone 視窗不能直接設定最終磁碟大小。<code>Resize</code> 填的是增加量，不是最終容量；磁碟已達目標時不要再擴大，PVE 也不支援在這裡縮小虛擬磁碟。</p>
+<p><img src="../../source/Day25/day25-main-fig01.png" alt="proxy01 的硬體、儲存與 VLAN 設定"></p>
+<p>圖（一）proxy01 使用 local-lvm、16 GiB 磁碟、vmbr1 與 VLAN Tag 20</p>
+<p><img src="../../source/Day25/day25-main-fig02.png" alt="proxy01 的 Cloud-Init 網路與 DNS 設定"></p>
+<p>圖（二）proxy01 設定為 10.77.20.21，Gateway 與 DNS 均指向 OPNsense</p>
+<h3>1.2 建立 proxy02</h3>
+<p>重複 1.1 的 23 個步驟，只替換以下值：</p>
+<ul>
+<li><code>Target Node</code>：<code>pve02</code>。</li>
+<li><code>VM ID</code>：<code>202</code>。</li>
+<li><code>Name</code>：<code>proxy02</code>。</li>
+<li><code>Target Storage</code>：pve02 的 <code>local-lvm</code>。</li>
+<li>IPv4/CIDR：<code>10.77.20.22/24</code>。</li>
+</ul>
+<p>其餘保持 2 vCPU、1024 MiB RAM、16 GiB System Disk、<code>vmbr1</code>、VLAN Tag 20、Gateway 與 DNS <code>10.77.20.1</code>。</p>
+<p><img src="../../source/Day25/day25-main-fig03.png" alt="proxy02 的硬體、儲存與 VLAN 設定"></p>
+<p>圖（三）proxy02 建立於 pve02，使用 local-lvm、16 GiB 磁碟與 VLAN Tag 20</p>
+<h3>1.3 建立 app02</h3>
+<p>再重複 1.1 的流程，改用以下值：</p>
+<ul>
+<li><code>Target Node</code>：<code>pve03</code>。</li>
+<li><code>VM ID</code>：<code>212</code>。</li>
+<li><code>Name</code>：<code>app02</code>。</li>
+<li><code>Target Storage</code>：<code>ceph-vm</code>。</li>
+<li>CPU：1 Socket、1 Core。</li>
+<li>Memory：1024 MiB，取消 Ballooning。</li>
+<li>System Disk 最終容量：12 GiB。</li>
+<li>IPv4/CIDR：<code>10.77.20.32/24</code>。</li>
+</ul>
+<p>app01 與 app02 使用 <code>ceph-vm</code>，用來示範 Ceph RBD、Live Migration 與 PVE HA 工作負載。Proxy 與 Client 則使用各節點 <code>local-lvm</code>，避免所有一般服務都消耗三副本 Ceph 容量。</p>
+<p><img src="../../source/Day25/day25-main-fig04.png" alt="app02 的 Cloud-Init 網路與 DNS 設定"></p>
+<p>圖（四）app02 設定為 10.77.20.32，Gateway 與 DNS 均為 10.77.20.1</p>
+<h3>1.4 建立 client01</h3>
+<p>再重複 1.1 的流程，改用以下值：</p>
+<ul>
+<li><code>Target Node</code>：<code>pve03</code>。</li>
+<li><code>VM ID</code>：<code>241</code>。</li>
+<li><code>Name</code>：<code>client01</code>。</li>
+<li><code>Target Storage</code>：pve03 的 <code>local-lvm</code>。</li>
+<li>CPU：1 Socket、1 Core。</li>
+<li>Memory：1024 MiB，取消 Ballooning。</li>
+<li>System Disk 最終容量：8 GiB。</li>
+<li>IPv4/CIDR：<code>10.77.20.41/24</code>。</li>
+</ul>
+<p><img src="../../source/Day25/day25-main-fig05.png" alt="client01 的 Cloud-Init 網路與 DNS 設定"></p>
+<p>圖（五）client01 設定為 10.77.20.41，作為本日服務路徑的用戶端</p>
+<h3>1.5 確認五台 VM</h3>
+<p>在 proxy01、proxy02、app02、client01 的 Console 各自執行：</p>
+<pre><code class="language-bash">hostnamectl --static
+ip -br address
+ip route
+cloud-init status --long
+curl -4I --connect-timeout 10 https://deb.debian.org/
+</code></pre>
+<p>Hostname 如果是 Template 名稱，在當前 VM 執行 <code>sudo hostnamectl set-hostname 當前主機名</code>，重新登入 Console 再確認。</p>
+<p>在既有 app01 只執行同一組確認指令，保留原本的 SSH 帳號與 Key。</p>
+<h3>1.6 確認 systemd-resolved 已取得內部 DNS</h3>
+<p><strong>操作節點：proxy01、proxy02、app01、app02、client01。逐台確認，不能只用外部網站可以連線來判斷 DNS 設定完成。</strong></p>
+<p>PVE Cloud-Init 畫面已設定 DNS Server <code>10.77.20.1</code> 與 DNS Domain <code>lab.home</code>，但 Debian 實際查詢名稱時會先交給 systemd-resolved 的本機 Stub Resolver <code>127.0.0.53</code>。因此還要確認 systemd-resolved 真正取得 OPNsense DNS：</p>
+<pre><code class="language-bash">cat /etc/resolv.conf
+resolvectl status
+resolvectl query deb.debian.org
+</code></pre>
+<p><code>/etc/resolv.conf</code> 顯示 <code>nameserver 127.0.0.53</code> 是正常的 Stub Resolver 架構，不代表實際上游 DNS 是本機。<code>resolvectl status</code> 的 Global 或網路介面區塊必須看到：</p>
+<pre><code class="language-text">DNS Servers: 10.77.20.1
+DNS Domain: lab.home
+</code></pre>
+<p>如果已看到這兩項，且 <code>resolvectl query deb.debian.org</code> 成功，不需建立額外設定檔。</p>
+<p>如果 Cloud-Init 已寫入 IP、預設閘道與 Search Domain，systemd-resolved 卻沒有取得 <code>10.77.20.1</code>，在當前主機建立持久化 drop-in：</p>
+<pre><code class="language-bash">sudo install -d -m 0755 /etc/systemd/resolved.conf.d
+
+printf &#39;%s\n&#39; \
+  &#39;[Resolve]&#39; \
+  &#39;DNS=10.77.20.1&#39; \
+  &#39;Domains=lab.home&#39; |
+  sudo tee /etc/systemd/resolved.conf.d/10-lab-dns.conf
+
+sudo systemctl restart systemd-resolved
+sudo resolvectl flush-caches
+</code></pre>
+<p>重新驗證：</p>
+<pre><code class="language-bash">resolvectl status
+resolvectl query deb.debian.org
+getent ahostsv4 deb.debian.org
+</code></pre>
+<p>指令成功後重開機一次，確認設定在重開後存在：</p>
+<pre><code class="language-bash">sudo reboot
+</code></pre>
+<p>重新登入後執行：</p>
+<pre><code class="language-bash">resolvectl status
+resolvectl query deb.debian.org
+</code></pre>
+<p>不要直接編輯 <code>/etc/resolv.conf</code>。本系統的該路徑連結到 <code>/run/systemd/resolve/stub-resolv.conf</code>，內容會由 systemd-resolved 重新產生；直接修改無法成為穩定的開機後設定。建立 <code>web.lab.home</code>、<code>db-rw.lab.home</code> 與 <code>db-ro.lab.home</code> 後，會再用這條內部 DNS 路徑驗證三組 VIP。</p>
+<p>如果已經完成固定入口，可再執行：</p>
+<pre><code class="language-bash">getent ahostsv4 web.lab.home
+getent ahostsv4 db-rw.lab.home
+getent ahostsv4 db-ro.lab.home
+</code></pre>
+<p>三個名稱應分別解析為 <code>10.77.20.10</code>、<code>10.77.20.11</code> 與 <code>10.77.20.12</code>。若直接查詢 <code>dig @10.77.20.1 &lt;名稱&gt; A</code> 有答案，<code>getent</code> 卻沒有輸出，表示 OPNsense 的 DNS Record 存在，問題位於該台 Debian 主機的 systemd-resolved 上游設定。</p>
+<h2>2. 建立 Application Database 與最小權限 Role</h2>
+<p><strong>操作位置：目前的 Patroni Leader。先用 <code>patronictl list</code> 找出 Leader，不要假設一定是 pg01。</strong></p>
+<p>在任一 PG Node 執行：</p>
+<pre><code class="language-bash">sudo -u postgres patronictl -c /etc/patroni/config.yml list
+</code></pre>
+<p>找到 Role 為 <code>Leader</code> 的節點後，進入該節點 Console：</p>
+<pre><code class="language-bash">sudo -u postgres psql
+</code></pre>
+<p>依序執行：</p>
+<pre><code class="language-sql">CREATE ROLE app_owner LOGIN;
+CREATE ROLE app_rw LOGIN;
+CREATE ROLE app_ro LOGIN;
+ALTER ROLE app_ro SET default_transaction_read_only = on;
+\password app_owner
+\password app_rw
+\password app_ro
+\c appdb
+CREATE SCHEMA IF NOT EXISTS app AUTHORIZATION app_owner;
+GRANT CONNECT ON DATABASE appdb TO app_rw, app_ro;
+GRANT USAGE ON SCHEMA app TO app_rw, app_ro;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_rw;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app
+  GRANT USAGE, SELECT ON SEQUENCES TO app_rw;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app
+  GRANT SELECT ON TABLES TO app_ro;
+\q
+</code></pre>
+<p>三次 <code>\password</code> 都使用互動輸入，不把密碼寫在 SQL File 或 Shell History。</p>
+<p>以 PostgreSQL Local Administrative Session 切換成 <code>app_owner</code> 建立 Application Table：</p>
+<pre><code class="language-bash">sudo -u postgres psql appdb -v ON_ERROR_STOP=1
+</code></pre>
+<pre><code class="language-sql">SET ROLE app_owner;
+CREATE TABLE IF NOT EXISTS app.failover_probe(
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  created_at timestamptz DEFAULT clock_timestamp(),
+  note text NOT NULL
+);
+RESET ROLE;
+\q
+</code></pre>
+<p>回到 PostgreSQL 管理 Session，確認既有 Table 也套用權限：</p>
+<pre><code class="language-bash">sudo -u postgres psql appdb
+</code></pre>
+<pre><code class="language-sql">GRANT SELECT, INSERT, UPDATE, DELETE ON app.failover_probe TO app_rw;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA app TO app_rw;
+GRANT SELECT ON app.failover_probe TO app_ro;
+\q
+</code></pre>
+<p><img src="../../source/Day25/day25-main-fig06.png" alt="建立測試資料表並套用應用程式角色權限"></p>
+<p>圖（六）app.failover_probe 建立完成，app_rw 與 app_ro 取得各自需要的權限</p>
+<p>帳號建立完成後先不要在本機測試密碼連線。此時 Patroni 管理的 <code>pg_hba</code> 還沒允許 Proxy 來源，先完成下一節再透過 HAProxy 測試，才能同時證明 Role、HBA 與實際連線路徑都正確。</p>
+<h3>2.1 將 Application 來源加入 Patroni 管理的 pg_hba</h3>
+<p>操作位置：任一可執行 <code>patronictl</code> 的 PG Node。</p>
+<pre><code class="language-bash">sudo -u postgres patronictl -c /etc/patroni/config.yml edit-config iron-pg
+</code></pre>
+<p>在目前 Dynamic Configuration 的 <code>postgresql</code> → <code>pg_hba</code> 清單中，把以下規則放在最終 <code>reject</code> 之前：</p>
+<pre><code class="language-yaml">- hostssl appdb app_rw 10.77.20.21/32 scram-sha-256
+- hostssl appdb app_rw 10.77.20.22/32 scram-sha-256
+- hostssl appdb app_ro 10.77.20.21/32 scram-sha-256
+- hostssl appdb app_ro 10.77.20.22/32 scram-sha-256
+</code></pre>
+<p>儲存並離開 Editor，確認差異後輸入 <code>y</code> 套用。接著執行：</p>
+<pre><code class="language-bash">sudo -u postgres patronictl -c /etc/patroni/config.yml reload iron-pg --force
+sudo -u postgres patronictl -c /etc/patroni/config.yml show-config iron-pg
+</code></pre>
+<p>接著依序登入 pg01、pg02、pg03，每台都執行：</p>
+<pre><code class="language-bash">sudo -u postgres psql -d postgres -P pager=off \
+  -c &quot;SELECT line_number,type,database,user_name,address,auth_method,error FROM pg_hba_file_rules WHERE address IN (&#39;10.77.20.21&#39;,&#39;10.77.20.22&#39;) ORDER BY line_number;&quot;
+</code></pre>
+<p>每台都應看到四條 <code>hostssl</code> 規則，<code>error</code> 必須為空。若某台尚未更新，先執行 <code>sudo systemctl reload patroni</code> 並重新檢查。不要直接只改目前 Leader 的 <code>pg_hba.conf</code>，否則切換後規則會不一致。</p>
+<h2>3. 建立兩個 Web Backend</h2>
+<p><strong>操作順序：先 app01，確認服務正常後再於 app02 重複。兩台設定相同，Host Name 與 IP 不同。</strong></p>
+<p>app01／app02 安裝：</p>
+<pre><code class="language-bash">sudo apt update
+sudo apt install -y python3-flask python3-psycopg2
+sudo install -d -m 0755 /opt/iron-app
+</code></pre>
+<p>開啟 Application File：</p>
+<pre><code class="language-bash">sudo nano /opt/iron-app/app.py
+</code></pre>
+<p>貼上以下內容：</p>
+<pre><code class="language-python">import os
+import socket
+import psycopg2
+from flask import Flask, jsonify
+
+app = Flask(__name__)
+
+def connect_db():
+    options = dict(
+        host=os.environ[&quot;DB_HOST&quot;],
+        port=5432,
+        dbname=&quot;appdb&quot;,
+        user=&quot;app_rw&quot;,
+        password=os.environ[&quot;DB_PASSWORD&quot;],
+        sslmode=os.environ.get(&quot;DB_SSLMODE&quot;, &quot;verify-full&quot;),
+    )
+    if os.environ.get(&quot;DB_SSLROOTCERT&quot;):
+        options[&quot;sslrootcert&quot;] = os.environ[&quot;DB_SSLROOTCERT&quot;]
+    return psycopg2.connect(**options)
+
+@app.get(&quot;/health&quot;)
+def health():
+    return jsonify(status=&quot;ok&quot;, backend=socket.gethostname())
+
+@app.get(&quot;/&quot;)
+def index():
+    return jsonify(message=&quot;iron-lab&quot;, backend=socket.gethostname())
+
+@app.post(&quot;/write&quot;)
+def write():
+    with connect_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(&quot;INSERT INTO app.failover_probe(note) VALUES (%s) RETURNING id&quot;, (socket.gethostname(),))
+            row_id = cur.fetchone()[0]
+    return jsonify(id=row_id, backend=socket.gethostname())
+
+app.run(host=&quot;0.0.0.0&quot;, port=8080)
+</code></pre>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code> 儲存離開。</p>
+<p>建立設定目錄，再開啟 Environment File：</p>
+<pre><code class="language-bash">sudo install -d -m 0755 /etc/iron-app
+sudo nano /etc/iron-app.env
+</code></pre>
+<p>在 Editor 貼上：</p>
+<pre><code class="language-text">DB_HOST=10.77.20.21
+DB_SSLMODE=require
+DB_PASSWORD=實際app_rw密碼
+</code></pre>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code> 儲存，再限制權限：</p>
+<pre><code class="language-bash">sudo chown root:root /etc/iron-app.env
+sudo chmod 600 /etc/iron-app.env
+</code></pre>
+<p>本次尚未建立 VIP，因此只在受控 Lab 內暫時透過 proxy01 並使用 <code>sslmode=require</code> 驗證功能。建立固定入口時會安裝 Root CA，並將 <code>DB_HOST</code> 改成 <code>db-rw.lab.home</code>、<code>DB_SSLMODE</code> 改為 <code>verify-full</code>、增加 <code>DB_SSLROOTCERT=/etc/iron-app/pg-ca.crt</code>。三台 PostgreSQL 憑證 SAN 必須包含這個服務名稱；正式流量應使用完整的憑證與名稱驗證。</p>
+<p>開啟 systemd Unit File：</p>
+<pre><code class="language-bash">sudo nano /etc/systemd/system/iron-app.service
+</code></pre>
+<p>貼上以下內容：</p>
+<pre><code class="language-ini">[Unit]
+Description=Iron Lab Web Backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/iron-app.env
+ExecStart=/usr/bin/python3 /opt/iron-app/app.py
+User=nobody
+Group=nogroup
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+</code></pre>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code> 儲存，再執行：</p>
+<pre><code class="language-bash">sudo systemctl daemon-reload
+sudo systemctl enable --now iron-app
+sudo systemctl status iron-app --no-pager
+curl http://127.0.0.1:8080/health
+</code></pre>
+<h2>4. 安裝 Nginx 與 HAProxy</h2>
+<p><strong>操作節點：proxy01、proxy02。逐台安裝並確認版本。</strong></p>
+<p>proxy01／02：</p>
+<pre><code class="language-bash">sudo apt update
+sudo apt install -y nginx haproxy curl socat
+nginx -v
+haproxy -vv | sed -n &#39;1,5p&#39;
+echo &#39;net.ipv4.ip_nonlocal_bind=1&#39; | sudo tee /etc/sysctl.d/90-vip.conf
+sudo sysctl --system
+sudo sysctl net.ipv4.ip_nonlocal_bind
+</code></pre>
+<p>最後一行必須顯示 <code>net.ipv4.ip_nonlocal_bind = 1</code>。啟動 Keepalived 前，Web／DB VIP 尚未掛在 Proxy NIC；HAProxy 要靠這項 Kernel Setting 預先 Bind <code>10.77.20.11</code> 與 <code>10.77.20.12</code>。</p>
+<p><img src="../../source/Day25/day25-main-fig07.png" alt="proxy02 啟用 ip_nonlocal_bind"></p>
+<p>圖（七）proxy02 套用設定後，net.ipv4.ip_nonlocal_bind 為 1</p>
+<h3>4.1 啟用 Proxy 到 PostgreSQL／Patroni 的 OPNsense 規則</h3>
+<p><strong>操作位置：OPNsense Web UI。先前只建立 Alias，現在 Proxy 與 PostgreSQL 都已存在，必須在啟動 HAProxy Health Check 前正式加入服務專屬規則。</strong></p>
+<p>進入 <code>Firewall</code> → <code>Rules</code>，在左上角選擇 <code>LAB_INTERNAL</code>。新增第一條規則：</p>
+<ol>
+<li><code>Action</code>：<code>Pass</code>。</li>
+<li><code>Quick</code>：保持勾選。</li>
+<li><code>Interface</code>：只選 Interface Group <code>LAB_INTERNAL</code>；</li>
+<li><code>Invert Interface</code>：不要勾選。</li>
+<li><code>Direction</code>：<code>in</code>。</li>
+<li><code>Version</code>：<code>IPv4</code>。</li>
+<li><code>Protocol</code>：<code>TCP</code>。</li>
+<li><code>Source</code>：Alias <code>PROXY_NODES</code>。</li>
+<li><code>Source Port</code>：<code>any</code>。</li>
+<li><code>Destination</code>：Alias <code>PG_NODES</code>。</li>
+<li><code>Destination Port</code>：Alias <code>PGSQL_PORT</code>。</li>
+<li><code>Description</code>：<code>Allow Proxy to PostgreSQL</code>。</li>
+<li>按 <code>Save</code>。</li>
+</ol>
+<p>再新增第二條規則，只有 Destination Port 與 Description 不同：</p>
+<ol>
+<li><code>Action</code>：<code>Pass</code>，<code>Quick</code> 保持勾選。</li>
+<li><code>Interface</code>：只選 Interface Group <code>LAB_INTERNAL</code>，</li>
+<li><code>Direction</code>：<code>in</code>，<code>Version</code>：<code>IPv4</code>，<code>Protocol</code>：<code>TCP</code>。</li>
+<li><code>Source</code>：Alias <code>PROXY_NODES</code>，Source Port：<code>any</code>。</li>
+<li><code>Destination</code>：Alias <code>PG_NODES</code>。</li>
+<li><code>Destination Port</code>：Alias <code>PATRONI_API</code>。</li>
+<li><code>Description</code>：<code>Allow Proxy to Patroni API</code>。</li>
+<li>按 <code>Save</code>。</li>
+</ol>
+<p>將兩條規則移到 <code>Block LAB_INTERNAL to internal networks</code> 上方，再按 <code>Apply</code>。正確順序至少要包含：</p>
+<pre><code class="language-text">Allow Proxy to PostgreSQL
+Allow Proxy to Patroni API
+Block LAB_INTERNAL to internal networks
+</code></pre>
+<p>規則要建立在流量進入 OPNsense 的 <code>LAB_INTERNAL</code> Group／SERVICE 成員路徑，不要建立在 DATABASE Interface；OPNsense Stateful Firewall 會自動允許回程封包，不需再建立 PG → Proxy 的反向規則。</p>
+<p>儲存後重新開啟兩條規則核對 <code>Interface</code>。在 Rules [new] 中，只指定 <code>LAB_INTERNAL</code> Group 應歸類為 Group Rule；若顯示 Floating Rule，通常代表選到了 <code>any</code>、多個 Interface 或 <code>Invert Interface</code>，修正後再 Apply。不要改成單獨的 SERVICE Interface Rule，因為既有的 <code>Block LAB_INTERNAL to internal networks</code> Group Rule 會比單一 Interface Rule 更早處理。</p>
+<p><img src="../../source/Day25/day25-main-fig08.png" alt="OPNsense 允許 Proxy 存取 PostgreSQL 與 Patroni 的規則"></p>
+<p>圖（八）兩條 Proxy 專屬規則位於內部網路阻擋規則之前</p>
+<p>套用後，先在 proxy01 執行以下整段：</p>
+<pre><code class="language-bash">for ip in 10.77.30.11 10.77.30.12 10.77.30.13; do
+  echo &quot;=== ${ip} ===&quot;
+
+  if timeout 3 bash -c &quot;&lt;/dev/tcp/${ip}/5432&quot;; then
+    echo &#39;PostgreSQL 5432: reachable&#39;
+  else
+    echo &#39;PostgreSQL 5432: FAILED&#39;
+  fi
+
+  curl -sS \
+    --connect-timeout 3 \
+    -o /dev/null \
+    -w &#39;Patroni 8008: HTTP %{http_code}\n&#39; \
+    &quot;http://${ip}:8008/&quot;
+done
+</code></pre>
+<p>三台都必須顯示 <code>PostgreSQL 5432: reachable</code>，Patroni 8008 必須回傳可連線的 HTTP Status。接著在 proxy02 重複同一段測試。若出現 Timeout，先到 <code>Firewall</code> → <code>Log Files</code> → <code>Live View</code> 以來源 <code>10.77.20.21</code>／<code>.22</code>、目的 <code>10.77.30.11</code>～<code>.13</code> 查 Block；不要先修改 HAProxy。</p>
+<p>只有兩台 Proxy 對三台 PG 的 5432 與 8008 都通過後，才繼續下一節。</p>
+<h2>5. Nginx Reverse Proxy</h2>
+<p><strong>操作順序：先在 proxy01 完成設定、<code>nginx -t</code> 與本機測試，再於 proxy02 重複。</strong></p>
+<p>在 proxy01 開啟 Nginx Site File：</p>
+<pre><code class="language-bash">sudo nano /etc/nginx/sites-available/iron-web
+</code></pre>
+<p>貼上以下內容：</p>
+<pre><code class="language-nginx">upstream iron_backends {
+    zone iron_backends 64k;
+    least_conn;
+    server 10.77.20.31:8080 max_fails=2 fail_timeout=5s;
+    server 10.77.20.32:8080 max_fails=2 fail_timeout=5s;
+}
+
+server {
+    listen 80;
+    server_name web.lab.home;
+
+    location = /health {
+        proxy_pass http://iron_backends/health;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 3s;
+    }
+
+    location / {
+        proxy_pass http://iron_backends;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 10s;
+    }
+}
+</code></pre>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code> 儲存，再執行：</p>
+<pre><code class="language-bash">sudo ln -sfn /etc/nginx/sites-available/iron-web /etc/nginx/sites-enabled/iron-web
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t
+sudo systemctl reload nginx
+sudo systemctl status nginx --no-pager
+curl -sS http://127.0.0.1/health
+</code></pre>
+<p>proxy01 完成後，在 proxy02 重複本節的所有步驟。</p>
+<p>在 proxy02 完成後，分別於兩台執行以下指令，確認 Own-IP 的 HTTP 入口都可使用：</p>
+<p>proxy01：</p>
+<pre><code class="language-bash">curl -sS http://10.77.20.21/health
+</code></pre>
+<p>proxy02：</p>
+<pre><code class="language-bash">curl -sS http://10.77.20.22/health
+</code></pre>
+<p>本日的 Web 入口使用內部 HTTP，先驗證 Nginx、Backend 與切換流程。正式網域、Cloudflare Origin Certificate、Nginx <code>listen 443 ssl</code> 與 WAN TCP 443 會在建立外部入口時一併完成。</p>
+<h2>6. HAProxy 設定</h2>
+<p><strong>操作順序：先在 proxy01 完整覆蓋設定、檢查並啟動，再到 proxy02 使用它自己的完整設定。不要把下列內容附加到 Debian 預設檔案後面。</strong></p>
+<p>HAProxy 的 PostgreSQL Client Traffic 使用 TCP 5432／5433，但 Backend Health Check 改連 Patroni HTTP 8008，藉此分辨 Primary 與 Replica。<code>defaults.mode</code> 必須是 <code>tcp</code>；只有本機 Stats Page 使用 <code>mode http</code>。</p>
+<h3>6.1 proxy01 完整設定</h3>
+<p><strong>操作節點：只在 proxy01。以下整段可直接複製貼上。</strong></p>
+<pre><code class="language-bash">sudo cp -an \
+  /etc/haproxy/haproxy.cfg \
+  /etc/haproxy/haproxy.cfg.day25.bak
+
+sudo tee /etc/haproxy/haproxy.cfg &gt;/dev/null &lt;&lt;&#39;HAPROXY&#39;
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    user haproxy
+    group haproxy
+    daemon
+    stats socket /run/haproxy/admin.sock mode 660 level admin
+    stats timeout 30s
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    option dontlognull
+    timeout connect 3s
+    timeout client 30s
+    timeout server 30s
+
+frontend pg_rw_node
+    bind 10.77.20.21:5432
+    default_backend pg_primary
+
+frontend pg_rw_vip
+    bind 10.77.20.11:5432
+    default_backend pg_primary
+
+frontend pg_ro_node
+    bind 10.77.20.21:5433
+    default_backend pg_replicas
+
+frontend pg_ro_vip
+    bind 10.77.20.12:5432
+    default_backend pg_replicas
+
+backend pg_primary
+    option httpchk GET /primary
+    http-check expect status 200
+    default-server inter 2s fall 2 rise 2 on-marked-down shutdown-sessions
+    server pg01 10.77.30.11:5432 check port 8008
+    server pg02 10.77.30.12:5432 check port 8008
+    server pg03 10.77.30.13:5432 check port 8008
+
+backend pg_replicas
+    balance roundrobin
+    option httpchk GET /replica?lag=64MB
+    http-check expect status 200
+    default-server inter 2s fall 2 rise 2
+    server pg01 10.77.30.11:5432 check port 8008
+    server pg02 10.77.30.12:5432 check port 8008
+    server pg03 10.77.30.13:5432 check port 8008
+
+listen local_stats
+    bind 127.0.0.1:8404
+    mode http
+    stats enable
+    stats uri /stats
+HAPROXY
+
+test &quot;$(sudo sysctl -n net.ipv4.ip_nonlocal_bind)&quot; = &#39;1&#39; &amp;&amp; \
+  echo &#39;ip_nonlocal_bind: OK&#39;
+
+sudo haproxy -c -f /etc/haproxy/haproxy.cfg
+sudo systemctl enable haproxy
+sudo systemctl restart haproxy
+sudo systemctl status haproxy -l --no-pager
+</code></pre>
+<p>結尾的 <code>HAPROXY</code> 必須從行首開始並單獨一行。<code>restart</code> 是必要步驟：<code>enable --now</code> 不會讓已在 Running 狀態的 HAProxy 重新載入剛寫入的設定。</p>
+<h3>6.2 proxy02 完整設定</h3>
+<p><strong>操作節點：只在 proxy02。以下內容已使用 proxy02 Own-IP <code>10.77.20.22</code>，不需手動替換。</strong></p>
+<pre><code class="language-bash">sudo cp -an \
+  /etc/haproxy/haproxy.cfg \
+  /etc/haproxy/haproxy.cfg.day25.bak
+
+sudo tee /etc/haproxy/haproxy.cfg &gt;/dev/null &lt;&lt;&#39;HAPROXY&#39;
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    user haproxy
+    group haproxy
+    daemon
+    stats socket /run/haproxy/admin.sock mode 660 level admin
+    stats timeout 30s
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    option dontlognull
+    timeout connect 3s
+    timeout client 30s
+    timeout server 30s
+
+frontend pg_rw_node
+    bind 10.77.20.22:5432
+    default_backend pg_primary
+
+frontend pg_rw_vip
+    bind 10.77.20.11:5432
+    default_backend pg_primary
+
+frontend pg_ro_node
+    bind 10.77.20.22:5433
+    default_backend pg_replicas
+
+frontend pg_ro_vip
+    bind 10.77.20.12:5432
+    default_backend pg_replicas
+
+backend pg_primary
+    option httpchk GET /primary
+    http-check expect status 200
+    default-server inter 2s fall 2 rise 2 on-marked-down shutdown-sessions
+    server pg01 10.77.30.11:5432 check port 8008
+    server pg02 10.77.30.12:5432 check port 8008
+    server pg03 10.77.30.13:5432 check port 8008
+
+backend pg_replicas
+    balance roundrobin
+    option httpchk GET /replica?lag=64MB
+    http-check expect status 200
+    default-server inter 2s fall 2 rise 2
+    server pg01 10.77.30.11:5432 check port 8008
+    server pg02 10.77.30.12:5432 check port 8008
+    server pg03 10.77.30.13:5432 check port 8008
+
+listen local_stats
+    bind 127.0.0.1:8404
+    mode http
+    stats enable
+    stats uri /stats
+HAPROXY
+
+test &quot;$(sudo sysctl -n net.ipv4.ip_nonlocal_bind)&quot; = &#39;1&#39; &amp;&amp; \
+  echo &#39;ip_nonlocal_bind: OK&#39;
+
+sudo haproxy -c -f /etc/haproxy/haproxy.cfg
+sudo systemctl enable haproxy
+sudo systemctl restart haproxy
+sudo systemctl status haproxy -l --no-pager
+</code></pre>
+<h3>6.3 逐台驗證 Listener 與 Backend</h3>
+<p>在 proxy01：</p>
+<pre><code class="language-bash">sudo ss -lntp | \
+  grep -E &#39;10\.77\.20\.(21|11|12):(5432|5433)&#39;
+
+echo &#39;show stat&#39; | \
+  sudo socat stdio /run/haproxy/admin.sock | \
+  awk -F, &#39;
+    BEGIN {
+      printf &quot;%-13s %-6s %-7s %-8s %s\n&quot;, &quot;BACKEND&quot;, &quot;NODE&quot;, &quot;STATUS&quot;, &quot;CHECK&quot;, &quot;HTTP&quot;
+    }
+    ($1 == &quot;pg_primary&quot; || $1 == &quot;pg_replicas&quot;) &amp;&amp; $2 != &quot;BACKEND&quot; {
+      printf &quot;%-13s %-6s %-7s %-8s %s\n&quot;, $1, $2, $18, $37, $38
+    }
+  &#39;
+</code></pre>
+<p>必須看到 <code>10.77.20.21:5432</code>、<code>10.77.20.21:5433</code>、<code>10.77.20.11:5432</code>、<code>10.77.20.12:5432</code>。</p>
+<p>在 proxy02：</p>
+<pre><code class="language-bash">sudo ss -lntp | \
+  grep -E &#39;10\.77\.20\.(22|11|12):(5432|5433)&#39;
+
+echo &#39;show stat&#39; | \
+  sudo socat stdio /run/haproxy/admin.sock | \
+  awk -F, &#39;
+    BEGIN {
+      printf &quot;%-13s %-6s %-7s %-8s %s\n&quot;, &quot;BACKEND&quot;, &quot;NODE&quot;, &quot;STATUS&quot;, &quot;CHECK&quot;, &quot;HTTP&quot;
+    }
+    ($1 == &quot;pg_primary&quot; || $1 == &quot;pg_replicas&quot;) &amp;&amp; $2 != &quot;BACKEND&quot; {
+      printf &quot;%-13s %-6s %-7s %-8s %s\n&quot;, $1, $2, $18, $37, $38
+    }
+  &#39;
+</code></pre>
+<p>必須看到 <code>10.77.20.22:5432</code>、<code>10.77.20.22:5433</code>、<code>10.77.20.11:5432</code>、<code>10.77.20.12:5432</code>。<code>pg_primary</code> 應只有目前 Patroni Leader 為 <code>UP / L7OK / 200</code>，<code>pg_replicas</code> 應有兩台 Replica 為 <code>UP / L7OK / 200</code>。同一節點在不符合其角色的 Backend 顯示 <code>DOWN / L7STS / 503</code>，代表角色篩選正常，節點本身可以保持在線。若 Listener 不完整或 Restart 失敗，執行 <code>sudo journalctl -u haproxy -b -n 100 -o cat --no-pager</code>，修正後再繼續 Client 測試。</p>
+<p><img src="../../source/Day25/day25-main-fig09.png" alt="proxy01 的代理服務與角色感知 Backend 狀態"></p>
+<p>圖（九）proxy01 的 Nginx、HAProxy 與角色感知 Backend 均正常</p>
+<p><img src="../../source/Day25/day25-main-fig10.png" alt="proxy02 的 Web 與角色感知 Backend 狀態"></p>
+<p>圖（十）proxy02 能回應 Web 請求，並取得相同的 PostgreSQL 角色結果</p>
+<h2>7. 基本功能測試</h2>
+<p><strong>操作節點：client01。必要時從 jump01 對照管理路徑，但主要測試結果以 client01 為準。</strong></p>
+<p>client01：</p>
+<pre><code class="language-bash">sudo apt update
+sudo apt install -y curl postgresql-client
+psql --version
+for i in $(seq 1 6); do curl -s http://10.77.20.21/; echo; done
+psql &#39;host=10.77.20.21 port=5432 dbname=appdb user=app_rw sslmode=require&#39;
+psql &#39;host=10.77.20.21 port=5433 dbname=appdb user=app_ro sslmode=require&#39;
+</code></pre>
+<p>第一個 <code>app_rw</code> 連線提示輸入密碼後，執行：</p>
+<pre><code class="language-sql">INSERT INTO app.failover_probe(note)
+VALUES (&#39;day25-app-rw-test&#39;)
+RETURNING id,created_at,note;
+\q
+</code></pre>
+<p>這筆 INSERT 必須成功。第二個 <code>app_ro</code> 連線提示輸入密碼後，先讀取資料，再嘗試寫入：</p>
+<pre><code class="language-sql">SELECT id,created_at,note
+FROM app.failover_probe
+ORDER BY id DESC
+LIMIT 5;
+
+INSERT INTO app.failover_probe(note)
+VALUES (&#39;day25-app-ro-must-fail&#39;);
+\q
+</code></pre>
+<p>SELECT 必須成功，INSERT 必須收到 Read-only Transaction 或 Permission Denied。若 app_rw、app_ro 都被 HBA 拒絕，先到目前 Leader 查看 PostgreSQL Log，並確認連線抵達資料庫時的 Source IP 是 proxy01 的 <code>10.77.20.21</code>。</p>
+<p>重複 Web Request 應看到 app01／app02；RW 連線落到 Primary，RO 連線落到 Replica。這裡使用 Proxy Node IP，Certificate SAN 未包含 <code>10.77.20.21</code>，因此暫時使用 <code>sslmode=require</code>。改用 <code>db-rw.lab.home</code>、<code>db-ro.lab.home</code> 後必須改為 <code>verify-full</code>。</p>
+<h2>8. Web Backend 故障測試</h2>
+<p><strong>操作位置：client01 持續送 Request，app01 執行停止與恢復。</strong></p>
+<p>在 client01 開啟第一個 Console：</p>
+<pre><code class="language-bash">while true; do
+  date -Is
+  curl -sS --connect-timeout 2 http://10.77.20.21/health || echo &#39;request failed&#39;
+  sleep 1
+done
+</code></pre>
+<p>在 <strong>app01</strong> 執行（這裡只停 Web Backend，不要在 app01 查 Nginx Log）：</p>
+<pre><code class="language-bash">sudo systemctl stop iron-app
+</code></pre>
+<p>回到 <strong>client01</strong>，確認新 Request 能由 app02 持續回應。接著登入 <strong>proxy01</strong> 檢查 Nginx Log（<code>/var/log/nginx/</code> 不在 app01）：</p>
+<pre><code class="language-bash">sudo tail -n 50 /var/log/nginx/error.log
+sudo tail -n 50 /var/log/nginx/access.log
+</code></pre>
+<p>最後回到 <strong>app01</strong> 恢復 Web Backend：</p>
+<pre><code class="language-bash">sudo systemctl start iron-app
+curl -s http://127.0.0.1:8080/health
+</code></pre>
+<p><img src="../../source/Day25/day25-main-fig11.png" alt="app01 停止並恢復 Web Backend"></p>
+<p>圖（十一）app01 的 Web Backend 完成停止、恢復與本機健康檢查</p>
+<p><img src="../../source/Day25/day25-main-fig12.png" alt="單一 Web Backend 停止期間的請求結果"></p>
+<p>圖（十二）app01 停止期間由 app02 持續回應，本次未觀察到失敗請求</p>
+<p>上述兩張畫面使用 0.2 秒探測腳本記錄；完整量測方法與結果判讀請接續 <a href="./DAY25_%E9%A1%8D%E5%A4%96%E5%AF%A6%E4%BD%9C_%E9%87%8F%E6%B8%AC%E4%BB%A3%E7%90%86%E8%88%87%E6%87%89%E7%94%A8%E7%A8%8B%E5%BC%8F%E4%B8%AD%E6%96%B7%E6%99%82%E9%96%93.md">額外實作：量測代理與應用程式中斷時間</a>。</p>
+<h2>9. PostgreSQL Role 切換測試</h2>
+<p><strong>操作位置：client01 持續寫入，目前 Leader 執行 Planned Switchover。今天只測 HAProxy Node IP，不測 VIP。</strong></p>
+<p>在 client01：</p>
+<pre><code class="language-bash">while true; do
+  date -Is
+  curl -sS -X POST --connect-timeout 3 http://10.77.20.21/write || echo &#39;write failed&#39;
+  sleep 1
+done
+</code></pre>
+<p>在任一 PG Node 先記錄目前 Leader，再執行：</p>
+<pre><code class="language-bash">sudo -u postgres patronictl -c /etc/patroni/config.yml list
+sudo -u postgres patronictl -c /etc/patroni/config.yml switchover
+</code></pre>
+<p>依提示選目前 Leader 與目標 Candidate，確認後觀察 Client。切換完成再執行：</p>
+<pre><code class="language-bash">sudo -u postgres patronictl -c /etc/patroni/config.yml list
+</code></pre>
+<p><img src="../../source/Day25/day25-main-fig13.png" alt="計畫性切換完成後的 PostgreSQL 叢集"></p>
+<p>圖（十三）pg02 接任 Leader 後，pg01 與 pg03 均恢復為 streaming Replica</p>
+<p>到 proxy01 確認 HAProxy 已把 RW Backend 指到新 Leader：</p>
+<pre><code class="language-bash">echo &#39;show stat&#39; | \
+  sudo socat stdio /run/haproxy/admin.sock | \
+  awk -F, &#39;
+    BEGIN {
+      printf &quot;%-13s %-6s %-7s %-8s %s\n&quot;, &quot;BACKEND&quot;, &quot;NODE&quot;, &quot;STATUS&quot;, &quot;CHECK&quot;, &quot;HTTP&quot;
+    }
+    ($1 == &quot;pg_primary&quot; || $1 == &quot;pg_replicas&quot;) &amp;&amp; $2 != &quot;BACKEND&quot; {
+      printf &quot;%-13s %-6s %-7s %-8s %s\n&quot;, $1, $2, $18, $37, $38
+    }
+  &#39;
+</code></pre>
+<p><img src="../../source/Day25/day25-main-fig14.png" alt="計畫性切換後的 HAProxy Backend"></p>
+<p>圖（十四）HAProxy 將 pg02 列為唯一可用的 Primary，並保留兩台 Replica</p>
+<p>回到 client01 重新建立 DB-RW 連線，確認新連線抵達 pg02 並完成寫入：</p>
+<pre><code class="language-bash">psql \
+  -W \
+  &#39;host=10.77.20.21 port=5432 dbname=appdb user=app_rw sslmode=require&#39; \
+  -P pager=off \
+  -v ON_ERROR_STOP=1 \
+  -c &quot;SELECT inet_server_addr() AS server_ip,
+             inet_server_port() AS server_port,
+             pg_is_in_recovery() AS in_recovery;&quot; \
+  -c &quot;INSERT INTO app.failover_probe(note)
+      VALUES (&#39;day25-after-switchover&#39;)
+      RETURNING id,created_at,note;&quot;
+</code></pre>
+<p><img src="../../source/Day25/day25-main-fig15.png" alt="計畫性切換後的 DB-RW 寫入結果"></p>
+<p>圖（十五）DB-RW 新連線抵達 pg02，測試資料寫入成功</p>
+<p>本日驗證 Nginx 與 HAProxy 各自在 <code>proxy01</code>、<code>proxy02</code> 的固定 IP 上可用；Proxy 節點故障與 VIP 移動由固定入口實作接續驗證。</p>
+</main></body>
+</html>

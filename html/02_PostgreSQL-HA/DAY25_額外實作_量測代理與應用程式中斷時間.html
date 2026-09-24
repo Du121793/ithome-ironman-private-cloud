@@ -1,0 +1,799 @@
+<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 25 額外實作｜量測代理與應用程式中斷時間</title><style>
+:root{--orange:#f47b20;--ink:#30343b;--line:#e6e8eb}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:#fff;font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}main{width:min(940px,calc(100% - 40px));margin:auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35}h2{margin-top:42px;padding-bottom:10px;border-bottom:1px solid var(--line)}h3{margin-top:30px}a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2}code{padding:.15em .35em;border-radius:4px;background:#f4f5f6;color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}table{width:100%;border-collapse:collapse;margin:22px 0}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+</style></head><body><main><h1>Day 25 額外實作｜量測代理與應用程式中斷時間</h1>
+<p>本文件接續 <a href="./DAY25_Nginx_HAProxy%E8%88%87WebBackend.md">Day 25 主實作</a>，量測兩個使用者實際會遇到的結果：</p>
+<ol>
+<li><code>app01</code> 停止服務時，經 Nginx 存取 Web 服務是否出現可見中斷。</li>
+<li>PostgreSQL 計畫性切換時，經 Nginx、應用程式與 HAProxy 寫入資料庫的服務恢復時間。</li>
+</ol>
+<p>本次尚未建立 Keepalived 與 VIP，因此兩項測試都固定使用 <code>proxy01</code> 的節點 IP <code>10.77.20.21</code>。這可以排除 VIP 漂移時間，只觀察代理與應用程式路徑。</p>
+<p>探測間隔為 0.2 秒。發生失敗後，以連續三次成功中的第一筆作為穩定恢復點。若整段樣本沒有捕捉到失敗，結果會顯示 <code>observed_failure=no</code> 與 <code>visible_interruption=not_observed</code>；正文會將它記錄為「本次未觀察到可見中斷」。</p>
+<h2>一、量測邊界與時間點</h2>
+<table>
+<thead>
+<tr>
+<th>量測</th>
+<th>起點</th>
+<th>終點</th>
+<th>結果用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Web 可見中斷</td>
+<td>client01 第一個 <code>/health</code> 失敗</td>
+<td>後續連續三次 <code>/health</code> 成功中的第一筆</td>
+<td>判斷移除一台 Web Backend 對使用者的影響</td>
+</tr>
+<tr>
+<td>應用程式可寫中斷</td>
+<td>client01 第一個 <code>/write</code> 失敗</td>
+<td>新 Primary 可用後，連續三次 <code>/write</code> 成功中的第一筆</td>
+<td>量化完整應用程式寫入路徑的恢復時間</td>
+</tr>
+<tr>
+<td>切換到穩定可寫</td>
+<td>送出 Planned Switchover 前記錄的時間</td>
+<td>連續三次 <code>/write</code> 成功中的第一筆</td>
+<td>觀察 Patroni、HAProxy 與應用程式共同完成切換的時間</td>
+</tr>
+</tbody></table>
+<p><code>第一個失敗到穩定恢復</code> 全部由 client01 記錄，可直接代表該觀察點看到的服務中斷。<code>切換指令到穩定恢復</code> 的起點與終點來自不同主機，只有時間同步正常時才採用。</p>
+<h2>二、確認健康基準與時間同步</h2>
+<h3>2.1 在 client01、app01、app02 與任一 PostgreSQL 節點確認時間同步</h3>
+<p>四台主機分別執行：</p>
+<pre><code class="language-bash">hostname
+date --iso-8601=ns
+timedatectl show -p NTPSynchronized --value
+</code></pre>
+<p><code>NTPSynchronized</code> 應全部為 <code>yes</code>。任一主機尚未同步時，先修正時間來源再開始量測。正文以 client01 單機記錄的可見中斷為主要結果，跨主機的切換指令到恢復時間只作參考。</p>
+<h3>2.2 在 proxy01 確認入口與服務</h3>
+<pre><code class="language-bash">hostname
+
+systemctl is-active nginx haproxy
+
+sudo ss -lntp | \
+  awk &#39;$4 ~ /:80$/ || $4 ~ /^10\.77\.20\.21:(5432|5433)$/&#39;
+
+echo &#39;show stat&#39; | \
+  sudo socat stdio /run/haproxy/admin.sock | \
+  awk -F, &#39;
+    BEGIN {
+      printf &quot;%-13s %-6s %-7s %-8s %s\n&quot;, \
+        &quot;BACKEND&quot;, &quot;NODE&quot;, &quot;STATUS&quot;, &quot;CHECK&quot;, &quot;HTTP&quot;
+    }
+    ($1 == &quot;pg_primary&quot; || $1 == &quot;pg_replicas&quot;) &amp;&amp; $2 != &quot;BACKEND&quot; {
+      printf &quot;%-13s %-6s %-7s %-8s %s\n&quot;, \
+        $1, $2, $18, $37, $38
+    }
+  &#39;
+</code></pre>
+<p>應看到 Nginx 與 HAProxy 為 <code>active</code>，proxy01 節點 IP 正在監聽 HTTP 80、DB-RW 5432 與 DB-RO 5433。<code>pg_primary</code> 應只有一台 PostgreSQL 節點符合 HTTP 200。</p>
+<h3>2.3 在任一 PostgreSQL 節點確認叢集</h3>
+<pre><code class="language-bash">hostname
+
+sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  list -e
+</code></pre>
+<p>開始前應只有一台 Leader，兩台 Replica 均為 <code>streaming</code>，Lag 為 0。</p>
+<h3>2.4 確認 app01、app02 使用 proxy01 節點 IP</h3>
+<p>若接續主實作執行，<code>/etc/iron-app.env</code> 已使用 <code>DB_HOST=10.77.20.21</code> 與 <code>DB_SSLMODE=require</code>，確認後可直接進入 2.5。若目前環境已改用固定 DB-RW 網域與 <code>verify-full</code>，再依本節建立暫時的 systemd Runtime Override。這項設定只寫入 <code>/run</code>，重新開機便會消失，持久設定維持原樣。</p>
+<p>先在 app01、app02 分別確認目前設定：</p>
+<pre><code class="language-bash">sudo sed -n -E \
+  &#39;/^DB_(HOST|SSLMODE|SSLROOTCERT)=/p&#39; \
+  /etc/iron-app.env
+</code></pre>
+<p>只有目前設定已改用固定 DB-RW 網域時，才在 app01 與 app02 分別執行以下步驟：</p>
+<pre><code class="language-bash">hostname
+
+sudo install -d -m 0755 \
+  /run/systemd/system/iron-app.service.d
+
+sudo nano \
+  /run/systemd/system/iron-app.service.d/day25-measurement.conf
+</code></pre>
+<p>完整貼入：</p>
+<pre><code class="language-ini">[Service]
+Environment=DB_HOST=10.77.20.21
+Environment=DB_SSLMODE=require
+Environment=DB_SSLROOTCERT=
+</code></pre>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code> 儲存，再執行：</p>
+<pre><code class="language-bash">sudo systemctl daemon-reload
+sudo systemctl restart iron-app
+
+systemctl is-active iron-app
+
+IRON_APP_PID=&quot;$(
+  systemctl show \
+    -p MainPID \
+    --value \
+    iron-app
+)&quot;
+
+sudo sh -c \
+  &quot;tr &#39;\\0&#39; &#39;\\n&#39; &lt; /proc/${IRON_APP_PID}/environ&quot; | \
+  grep -E &#39;^DB_(HOST|SSLMODE|SSLROOTCERT)=&#39;
+
+curl -fsS \
+  http://127.0.0.1:8080/health
+</code></pre>
+<p>畫面應顯示 <code>DB_HOST=10.77.20.21</code>、<code>DB_SSLMODE=require</code>，並成功取得本機 <code>/health</code> 回應。命令刻意不輸出 <code>DB_PASSWORD</code>。</p>
+<h3>2.5 從 client01 確認完整路徑</h3>
+<pre><code class="language-bash">hostname
+
+for request in 1 2 3 4 5 6
+do
+  curl -fsS \
+    --connect-timeout 1 \
+    --max-time 2 \
+    http://10.77.20.21/health
+  printf &#39;\n&#39;
+done
+
+curl -fsS \
+  --connect-timeout 1 \
+  --max-time 3 \
+  -X POST \
+  http://10.77.20.21/write
+printf &#39;\n&#39;
+</code></pre>
+<p>應看到 app01、app02 的健康回應，以及一筆含有 <code>id</code> 與 <code>backend</code> 的寫入結果。</p>
+<h2>三、在 client01 建立共用探測腳本</h2>
+<p>以下步驟全部在 client01 執行。長腳本使用 <code>nano</code>，避免終端機貼上 <code>tee</code> 或 Here Document 時被截斷。</p>
+<h3>3.1 建立目錄</h3>
+<pre><code class="language-bash">hostname
+
+DAY25_BASE=&#39;/home/labadmin/day25-measurement&#39;
+
+mkdir -p \
+  &quot;$DAY25_BASE/runs&quot;
+
+command -v bash
+command -v curl
+command -v awk
+</code></pre>
+<h3>3.2 建立 probe.sh</h3>
+<pre><code class="language-bash">nano \
+  /home/labadmin/day25-measurement/probe.sh
+</code></pre>
+<p>完整貼入：</p>
+<pre><code class="language-bash">#!/bin/bash
+set -u
+
+probe_type=&quot;${1:?usage: probe.sh web|write RUN_DIR}&quot;
+run_dir=&quot;${2:?usage: probe.sh web|write RUN_DIR}&quot;
+log_file=&quot;$run_dir/probe.log&quot;
+body_file=&quot;$run_dir/body.$$&quot;
+
+case &quot;$probe_type&quot; in
+  web)
+    request_url=&#39;http://10.77.20.21/health&#39;
+    ;;
+  write)
+    request_url=&#39;http://10.77.20.21/write&#39;
+    ;;
+  *)
+    echo &#39;usage: probe.sh web|write RUN_DIR&#39; &gt;&amp;2
+    exit 2
+    ;;
+esac
+
+cleanup() {
+  rm -f &quot;$body_file&quot;
+}
+trap cleanup EXIT
+trap &#39;exit 0&#39; INT TERM
+
+while true; do
+  request_epoch=&quot;$(date +%s.%N)&quot;
+  request_time=&quot;$(date --iso-8601=ns)&quot;
+  : &gt; &quot;$body_file&quot;
+
+  curl_args=(
+    -sS
+    --connect-timeout 1
+    --max-time 2
+    -o &quot;$body_file&quot;
+    -w &#39;%{http_code}&#39;
+  )
+
+  if [ &quot;$probe_type&quot; = &#39;write&#39; ]; then
+    curl_args+=(
+      -X POST
+    )
+  fi
+
+  http_code=&quot;$(
+    curl &quot;${curl_args[@]}&quot; \
+      &quot;$request_url&quot; \
+      2&gt;&quot;$run_dir/curl-error.$$&quot;
+  )&quot;
+  curl_rc=$?
+
+  body=&quot;$(
+    tr &#39;\n|&#39; &#39;  &#39; &lt; &quot;$body_file&quot; \
+      2&gt;/dev/null || true
+  )&quot;
+  curl_error=&quot;$(
+    tr &#39;\n|&#39; &#39;  &#39; &lt; &quot;$run_dir/curl-error.$$&quot; \
+      2&gt;/dev/null || true
+  )&quot;
+  rm -f &quot;$run_dir/curl-error.$$&quot;
+
+  backend=&quot;$(
+    printf &#39;%s\n&#39; &quot;$body&quot; | \
+      sed -n &#39;s/.*&quot;backend&quot;:&quot;\([^&quot;]*\)&quot;.*/\1/p&#39;
+  )&quot;
+  row_id=&quot;$(
+    printf &#39;%s\n&#39; &quot;$body&quot; | \
+      sed -n &#39;s/.*&quot;id&quot;:\([0-9][0-9]*\).*/\1/p&#39;
+  )&quot;
+
+  status=&#39;FAIL&#39;
+  if [ &quot;$curl_rc&quot; -eq 0 ] &amp;&amp; \
+     [ &quot;$http_code&quot; = &#39;200&#39; ]; then
+    case &quot;$probe_type&quot; in
+      web)
+        if printf &#39;%s\n&#39; &quot;$body&quot; | \
+             grep -Fq &#39;&quot;status&quot;:&quot;ok&quot;&#39;; then
+          status=&#39;OK&#39;
+        fi
+        ;;
+      write)
+        if [ -n &quot;$row_id&quot; ]; then
+          status=&#39;OK&#39;
+        fi
+        ;;
+    esac
+  fi
+
+  printf &#39;%s|%s|%s|%s|http=%s rc=%s backend=%s id=%s body=%s error=%s\n&#39; \
+    &quot;$request_epoch&quot; \
+    &quot;$request_time&quot; \
+    &quot;$probe_type&quot; \
+    &quot;$status&quot; \
+    &quot;${http_code:-000}&quot; \
+    &quot;$curl_rc&quot; \
+    &quot;${backend:-none}&quot; \
+    &quot;${row_id:-none}&quot; \
+    &quot;${body:-none}&quot; \
+    &quot;${curl_error:-none}&quot; | \
+    tee -a &quot;$log_file&quot;
+
+  sleep 0.2
+done
+</code></pre>
+<h3>3.3 建立 start-run.sh</h3>
+<pre><code class="language-bash">nano \
+  /home/labadmin/day25-measurement/start-run.sh
+</code></pre>
+<p>完整貼入：</p>
+<pre><code class="language-bash">#!/bin/bash
+set -eu
+
+run_name=&quot;${1:?usage: start-run.sh RUN_NAME web|write}&quot;
+probe_type=&quot;${2:?usage: start-run.sh RUN_NAME web|write}&quot;
+base_dir=&#39;/home/labadmin/day25-measurement&#39;
+
+case &quot;$probe_type&quot; in
+  web|write) ;;
+  *)
+    echo &#39;probe type must be web or write&#39; &gt;&amp;2
+    exit 2
+    ;;
+esac
+
+run_dir=&quot;$base_dir/runs/${run_name}-$(date +%Y%m%d-%H%M%S)&quot;
+mkdir -p &quot;$run_dir&quot;
+
+printf &#39;%s\n&#39; &quot;$probe_type&quot; &gt; &quot;$run_dir/probe.type&quot;
+date +%s.%N &gt; &quot;$run_dir/probe-start.epoch&quot;
+date --iso-8601=ns &gt; &quot;$run_dir/probe-start.iso&quot;
+
+nohup \
+  &quot;$base_dir/probe.sh&quot; \
+  &quot;$probe_type&quot; \
+  &quot;$run_dir&quot; \
+  &gt; &quot;$run_dir/probe.stdout&quot; \
+  2&gt;&amp;1 &amp;
+
+probe_pid=$!
+printf &#39;%s\n&#39; &quot;$probe_pid&quot; &gt; &quot;$run_dir/probe.pid&quot;
+printf &#39;%s\n&#39; &quot;$run_dir&quot; &gt; &quot;$base_dir/current-run&quot;
+
+printf &#39;run_dir=%s\n&#39; &quot;$run_dir&quot;
+printf &#39;probe_pid=%s\n&#39; &quot;$probe_pid&quot;
+printf &#39;probe_type=%s\n&#39; &quot;$probe_type&quot;
+</code></pre>
+<h3>3.4 建立 stop-run.sh</h3>
+<pre><code class="language-bash">nano \
+  /home/labadmin/day25-measurement/stop-run.sh
+</code></pre>
+<p>完整貼入：</p>
+<pre><code class="language-bash">#!/bin/bash
+set -eu
+
+run_dir=&quot;${1:-$(cat /home/labadmin/day25-measurement/current-run)}&quot;
+pid_file=&quot;$run_dir/probe.pid&quot;
+
+test -f &quot;$pid_file&quot;
+probe_pid=&quot;$(cat &quot;$pid_file&quot;)&quot;
+
+case &quot;$probe_pid&quot; in
+  &#39;&#39;|*[!0-9]*)
+    echo &quot;ERROR: invalid PID in $pid_file&quot; &gt;&amp;2
+    exit 1
+    ;;
+esac
+
+if kill -0 &quot;$probe_pid&quot; 2&gt;/dev/null; then
+  kill &quot;$probe_pid&quot;
+  for attempt in 1 2 3 4 5
+  do
+    if ! kill -0 &quot;$probe_pid&quot; 2&gt;/dev/null; then
+      break
+    fi
+    sleep 0.2
+  done
+fi
+
+date +%s.%N &gt; &quot;$run_dir/probe-stop.epoch&quot;
+date --iso-8601=ns &gt; &quot;$run_dir/probe-stop.iso&quot;
+
+printf &#39;run_dir=%s\n&#39; &quot;$run_dir&quot;
+printf &#39;log_lines=%s\n&#39; &quot;$(wc -l &lt; &quot;$run_dir/probe.log&quot;)&quot;
+tail -n 12 &quot;$run_dir/probe.log&quot;
+</code></pre>
+<h3>3.5 建立 analyze-run.sh</h3>
+<pre><code class="language-bash">nano \
+  /home/labadmin/day25-measurement/analyze-run.sh
+</code></pre>
+<p>完整貼入：</p>
+<pre><code class="language-bash">#!/bin/bash
+set -eu
+
+run_dir=&quot;${1:?usage: analyze-run.sh RUN_DIR EVENT_EPOCH}&quot;
+event_epoch=&quot;${2:?usage: analyze-run.sh RUN_DIR EVENT_EPOCH}&quot;
+log_file=&quot;$run_dir/probe.log&quot;
+
+test -s &quot;$log_file&quot;
+
+printf &#39;run_dir=%s\n&#39; &quot;$run_dir&quot;
+printf &#39;event_epoch=%s\n&#39; &quot;$event_epoch&quot;
+
+awk -F &#39;|&#39; -v event=&quot;$event_epoch&quot; &#39;
+  function metadata_value(text, key, parts, count, i, item) {
+    count=split(text, parts, &quot; &quot;)
+    for (i=1; i&lt;=count; i++) {
+      item=parts[i]
+      if (index(item, key &quot;=&quot;) == 1) {
+        sub(&quot;^&quot; key &quot;=&quot;, &quot;&quot;, item)
+        return item
+      }
+    }
+    return &quot;&quot;
+  }
+
+  ($1 + 0) &lt; (event + 0) {
+    next
+  }
+
+  {
+    samples++
+
+    if ($4 == &quot;OK&quot;) {
+      ok++
+      backend=metadata_value($5, &quot;backend&quot;)
+      row_id=metadata_value($5, &quot;id&quot;)
+
+      if (backend == &quot;app01&quot;) app01++
+      if (backend == &quot;app02&quot;) app02++
+
+      if (row_id ~ /^[0-9]+$/) {
+        if (first_id == &quot;&quot;) first_id=row_id
+        last_id=row_id
+      }
+
+      if (first_ok == &quot;&quot;) first_ok=$1
+
+      if (saw_failure &amp;&amp; stable == &quot;&quot;) {
+        if (consecutive_ok == 0) candidate=$1
+        consecutive_ok++
+        if (consecutive_ok &gt;= 3) stable=candidate
+      }
+    } else {
+      failed++
+      if (!saw_failure) {
+        saw_failure=1
+        first_failure=$1
+      }
+      consecutive_ok=0
+      candidate=&quot;&quot;
+    }
+  }
+
+  END {
+    printf &quot;samples_after_event=%d\n&quot;, samples
+    printf &quot;successes_after_event=%d\n&quot;, ok
+    printf &quot;failures_after_event=%d\n&quot;, failed
+    printf &quot;app01_successes=%d\n&quot;, app01
+    printf &quot;app02_successes=%d\n&quot;, app02
+
+    if (first_id != &quot;&quot;) {
+      printf &quot;first_successful_write_id=%s\n&quot;, first_id
+      printf &quot;last_successful_write_id=%s\n&quot;, last_id
+    }
+
+    if (!saw_failure) {
+      print &quot;observed_failure=no&quot;
+      print &quot;visible_interruption=not_observed&quot;
+      if (first_ok != &quot;&quot;) {
+        printf &quot;event_to_first_success=%.3f_seconds\n&quot;, first_ok-event
+      }
+      print &quot;measurement=COMPLETE_NO_VISIBLE_FAILURE&quot;
+      exit
+    }
+
+    print &quot;observed_failure=yes&quot;
+    printf &quot;first_failure_epoch=%.9f\n&quot;, first_failure
+
+    if (stable == &quot;&quot;) {
+      print &quot;stable_recovery=not_found&quot;
+      print &quot;visible_interruption=incomplete&quot;
+      print &quot;measurement=INCOMPLETE&quot;
+      exit
+    }
+
+    printf &quot;stable_recovery_epoch=%.9f\n&quot;, stable
+    printf &quot;event_to_stable_recovery=%.3f_seconds\n&quot;, stable-event
+    printf &quot;visible_interruption=%.3f_seconds\n&quot;, stable-first_failure
+    print &quot;measurement=COMPLETE&quot;
+  }
+&#39; &quot;$log_file&quot;
+</code></pre>
+<h3>3.6 檢查腳本語法與權限</h3>
+<pre><code class="language-bash">chmod 750 \
+  /home/labadmin/day25-measurement/probe.sh \
+  /home/labadmin/day25-measurement/start-run.sh \
+  /home/labadmin/day25-measurement/stop-run.sh \
+  /home/labadmin/day25-measurement/analyze-run.sh
+
+bash -n \
+  /home/labadmin/day25-measurement/probe.sh
+
+bash -n \
+  /home/labadmin/day25-measurement/start-run.sh
+
+bash -n \
+  /home/labadmin/day25-measurement/stop-run.sh
+
+bash -n \
+  /home/labadmin/day25-measurement/analyze-run.sh
+
+printf &#39;%s\n&#39; &#39;DAY25_MEASUREMENT_SCRIPTS_OK&#39;
+</code></pre>
+<p>四次 <code>bash -n</code> 都沒有輸出，最後顯示 <code>DAY25_MEASUREMENT_SCRIPTS_OK</code> 才繼續。</p>
+<h2>四、量測 Web Backend 停止期間的可見中斷</h2>
+<p>本節只停止 app01 的 <code>iron-app</code>，app02 保持運作。測試結束後立即恢復 app01，再進行資料庫切換測試。</p>
+<h3>4.1 在 client01 啟動 Web 探測</h3>
+<pre><code class="language-bash">DAY25_BASE=&#39;/home/labadmin/day25-measurement&#39;
+
+&quot;$DAY25_BASE/start-run.sh&quot; \
+  web-backend \
+  web
+
+DAY25_WEB_RUN=&quot;$(cat &quot;$DAY25_BASE/current-run&quot;)&quot;
+printf &#39;DAY25_WEB_RUN=%s\n&#39; &quot;$DAY25_WEB_RUN&quot;
+
+sleep 5
+tail -n 12 &quot;$DAY25_WEB_RUN/probe.log&quot;
+</code></pre>
+<p>確認基準期間已持續出現 <code>OK</code>，並能看到 app01、app02 回應後，再執行故障注入。</p>
+<h3>4.2 在 app01 記錄事件並停止服務</h3>
+<pre><code class="language-bash">hostname
+
+DAY25_WEB_EVENT_EPOCH=&quot;$(date +%s.%N)&quot;
+DAY25_WEB_EVENT_TIME=&quot;$(date --iso-8601=ns)&quot;
+
+printf &#39;web_event_epoch=%s\n&#39; \
+  &quot;$DAY25_WEB_EVENT_EPOCH&quot; | \
+  tee /tmp/day25-web-event.txt
+
+printf &#39;web_event_time=%s\n&#39; \
+  &quot;$DAY25_WEB_EVENT_TIME&quot; | \
+  tee -a /tmp/day25-web-event.txt
+
+sudo systemctl stop iron-app
+systemctl is-active iron-app || true
+
+sleep 10
+
+sudo systemctl start iron-app
+systemctl is-active iron-app
+curl -fsS http://127.0.0.1:8080/health
+printf &#39;\n&#39;
+
+cat /tmp/day25-web-event.txt
+</code></pre>
+<p>將最後顯示的 <code>web_event_epoch</code> 複製到下一步。此時間點在停止指令前記錄，用來輔助對照 Nginx 移除 Backend 的反應；Web 可見中斷由 client01 的第一個失敗開始計算。</p>
+<h3>4.3 在 client01 停止並分析 Web 探測</h3>
+<p>app01 恢復後繼續等待 10 秒，再執行：</p>
+<pre><code class="language-bash">DAY25_BASE=&#39;/home/labadmin/day25-measurement&#39;
+DAY25_WEB_RUN=&quot;$(cat &quot;$DAY25_BASE/current-run&quot;)&quot;
+
+sleep 10
+
+&quot;$DAY25_BASE/stop-run.sh&quot; \
+  &quot;$DAY25_WEB_RUN&quot;
+
+read -r -p &#39;貼上 app01 顯示的 web_event_epoch：&#39; \
+  DAY25_WEB_EVENT_EPOCH
+
+&quot;$DAY25_BASE/analyze-run.sh&quot; \
+  &quot;$DAY25_WEB_RUN&quot; \
+  &quot;$DAY25_WEB_EVENT_EPOCH&quot; | \
+  tee &quot;$DAY25_WEB_RUN/result.txt&quot;
+
+printf &#39;%s\n&#39; &#39;--- first failures after event ---&#39;
+awk -F &#39;|&#39; \
+  -v event=&quot;$DAY25_WEB_EVENT_EPOCH&quot; \
+  &#39;($1 + 0) &gt;= (event + 0) &amp;&amp; $4 == &quot;FAIL&quot; {print; count++; if (count == 8) exit}&#39; \
+  &quot;$DAY25_WEB_RUN/probe.log&quot;
+
+printf &#39;%s\n&#39; &#39;--- final samples ---&#39;
+tail -n 15 \
+  &quot;$DAY25_WEB_RUN/probe.log&quot;
+</code></pre>
+<p>判讀方式：</p>
+<ul>
+<li><code>measurement=COMPLETE</code>：探測捕捉到失敗，且後續已有連續三次成功。</li>
+<li><code>measurement=COMPLETE_NO_VISIBLE_FAILURE</code>：app01 停止期間由 app02 持續回應，本次沒有觀察到使用者可見中斷。</li>
+<li><code>measurement=INCOMPLETE</code>：曾出現失敗，但停止探測前尚未取得連續三次成功；延長觀察後重測。</li>
+</ul>
+<p><img src="../../source/Day25/day25-practical-fig01.png" alt="app01 停止後恢復服務並通過本機健康檢查"></p>
+<p>圖（一）app01 在記錄事件後停止並恢復 <code>iron-app</code>，最後由本機健康檢查確認服務可用</p>
+<p><img src="../../source/Day25/day25-practical-fig02.png" alt="client01 未觀察到 Web 可見中斷"></p>
+<p>圖（二）client01 共取得 287 筆成功樣本，app01 停止期間由 app02 持續回應</p>
+<h2>五、量測 PostgreSQL 計畫性切換期間的可寫中斷</h2>
+<p>本節持續呼叫 <code>POST /write</code>。每一次成功都代表請求已經通過 Nginx、其中一台應用程式、HAProxy Node IP，並由當下 Primary 完成交易。</p>
+<h3>5.1 在 client01 啟動 Write 探測</h3>
+<pre><code class="language-bash">DAY25_BASE=&#39;/home/labadmin/day25-measurement&#39;
+
+&quot;$DAY25_BASE/start-run.sh&quot; \
+  planned-switchover-write \
+  write
+
+DAY25_WRITE_RUN=&quot;$(cat &quot;$DAY25_BASE/current-run&quot;)&quot;
+printf &#39;DAY25_WRITE_RUN=%s\n&#39; &quot;$DAY25_WRITE_RUN&quot;
+
+sleep 5
+tail -n 12 &quot;$DAY25_WRITE_RUN/probe.log&quot;
+</code></pre>
+<p>基準期間必須持續出現 <code>OK</code>、HTTP 200 與遞增的 <code>id</code>。若已有失敗，先停止探測並修正服務健康狀態。</p>
+<h3>5.2 在任一 PostgreSQL 節點選擇 Leader 與 Candidate</h3>
+<pre><code class="language-bash">hostname
+
+sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  list -e
+</code></pre>
+<p>從輸出選擇目前 Leader 與一台 <code>streaming</code>、Lag 0 的 Replica。依當下角色修改下列兩個值：</p>
+<pre><code class="language-bash">DAY25_OLD_LEADER=&#39;pg02&#39;
+DAY25_NEW_LEADER=&#39;pg01&#39;
+
+printf &#39;old_leader=%s\n&#39; &quot;$DAY25_OLD_LEADER&quot;
+printf &#39;new_leader=%s\n&#39; &quot;$DAY25_NEW_LEADER&quot;
+</code></pre>
+<p>Leader 與 Candidate 不得相同；候選節點必須是當下狀態正常的 Replica。</p>
+<h3>5.3 記錄切換時間並執行 Planned Switchover</h3>
+<p>在同一台 PostgreSQL 節點執行：</p>
+<pre><code class="language-bash">DAY25_SWITCH_DIR=&#39;/tmp/day25-planned-switchover&#39;
+mkdir -p &quot;$DAY25_SWITCH_DIR&quot;
+
+DAY25_SWITCH_EPOCH=&quot;$(date +%s.%N)&quot;
+DAY25_SWITCH_TIME=&quot;$(date --iso-8601=ns)&quot;
+
+printf &#39;old_leader=%s\n&#39; \
+  &quot;$DAY25_OLD_LEADER&quot; | \
+  tee &quot;$DAY25_SWITCH_DIR/event.txt&quot;
+
+printf &#39;new_leader=%s\n&#39; \
+  &quot;$DAY25_NEW_LEADER&quot; | \
+  tee -a &quot;$DAY25_SWITCH_DIR/event.txt&quot;
+
+printf &#39;switch_epoch=%s\n&#39; \
+  &quot;$DAY25_SWITCH_EPOCH&quot; | \
+  tee -a &quot;$DAY25_SWITCH_DIR/event.txt&quot;
+
+printf &#39;switch_time=%s\n&#39; \
+  &quot;$DAY25_SWITCH_TIME&quot; | \
+  tee -a &quot;$DAY25_SWITCH_DIR/event.txt&quot;
+
+sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  switchover iron-pg \
+  --leader &quot;$DAY25_OLD_LEADER&quot; \
+  --candidate &quot;$DAY25_NEW_LEADER&quot; \
+  --force | \
+  tee &quot;$DAY25_SWITCH_DIR/switchover-output.txt&quot;
+
+sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  list -e | \
+  tee &quot;$DAY25_SWITCH_DIR/after-list.txt&quot;
+
+cat &quot;$DAY25_SWITCH_DIR/event.txt&quot;
+</code></pre>
+<p>切換完成後應看到指定 Candidate 成為 Leader，另外兩台為 Replica。指令失敗時不要改用強制故障切換；保留輸出、停止 client01 探測並先恢復叢集健康。</p>
+<h3>5.4 在 proxy01 確認 HAProxy 指向新 Primary</h3>
+<pre><code class="language-bash">hostname
+date --iso-8601=ns
+
+echo &#39;show stat&#39; | \
+  sudo socat stdio /run/haproxy/admin.sock | \
+  awk -F, &#39;
+    BEGIN {
+      printf &quot;%-13s %-6s %-7s %-8s %s\n&quot;, \
+        &quot;BACKEND&quot;, &quot;NODE&quot;, &quot;STATUS&quot;, &quot;CHECK&quot;, &quot;HTTP&quot;
+    }
+    ($1 == &quot;pg_primary&quot; || $1 == &quot;pg_replicas&quot;) &amp;&amp; $2 != &quot;BACKEND&quot; {
+      printf &quot;%-13s %-6s %-7s %-8s %s\n&quot;, \
+        $1, $2, $18, $37, $38
+    }
+  &#39;
+</code></pre>
+<p><code>pg_primary</code> 應只有新 Leader 為 <code>UP / L7OK / 200</code>。</p>
+<h3>5.5 在 client01 停止並分析 Write 探測</h3>
+<p>切換完成後繼續等待至少 20 秒，再執行：</p>
+<pre><code class="language-bash">DAY25_BASE=&#39;/home/labadmin/day25-measurement&#39;
+DAY25_WRITE_RUN=&quot;$(cat &quot;$DAY25_BASE/current-run&quot;)&quot;
+
+sleep 20
+
+&quot;$DAY25_BASE/stop-run.sh&quot; \
+  &quot;$DAY25_WRITE_RUN&quot;
+
+read -r -p &#39;貼上 PostgreSQL 節點顯示的 switch_epoch：&#39; \
+  DAY25_SWITCH_EPOCH
+
+&quot;$DAY25_BASE/analyze-run.sh&quot; \
+  &quot;$DAY25_WRITE_RUN&quot; \
+  &quot;$DAY25_SWITCH_EPOCH&quot; | \
+  tee &quot;$DAY25_WRITE_RUN/result.txt&quot;
+
+printf &#39;%s\n&#39; &#39;--- samples around the first failure ---&#39;
+awk -F &#39;|&#39; \
+  -v event=&quot;$DAY25_SWITCH_EPOCH&quot; \
+  &#39;($1 + 0) &gt;= (event + 0) {print; count++; if (count == 35) exit}&#39; \
+  &quot;$DAY25_WRITE_RUN/probe.log&quot;
+
+printf &#39;%s\n&#39; &#39;--- final successful samples ---&#39;
+tail -n 15 \
+  &quot;$DAY25_WRITE_RUN/probe.log&quot;
+</code></pre>
+<p>如果 <code>measurement=COMPLETE</code>，正文可以採用：</p>
+<ul>
+<li><code>visible_interruption</code>：client01 從第一個失敗到穩定可寫的時間。</li>
+<li><code>event_to_stable_recovery</code>：從送出切換指令前的記錄點到穩定可寫的時間；四台主機時間同步正常時才採用。</li>
+</ul>
+<p>如果 <code>measurement=COMPLETE_NO_VISIBLE_FAILURE</code>，正文記錄為「本次 0.2 秒間隔的樣本未觀察到失敗」，並保留連續成功的原始樣本。</p>
+<p><img src="../../source/Day25/day25-practical-fig03.png" alt="PostgreSQL 由 pg02 計畫性切換至 pg01"></p>
+<p>圖（三）切換前 pg02 是 Leader，<code>patronictl</code> 成功將 Primary 角色交給 pg01</p>
+<p><img src="../../source/Day25/day25-practical-fig04.png" alt="HAProxy 將 pg01 標記為唯一可用的 Primary"></p>
+<p>圖（四）角色切換後，HAProxy 的 <code>pg_primary</code> Backend 只有 pg01 為 <code>UP / L7OK / 200</code></p>
+<p><img src="../../source/Day25/day25-practical-fig05.png" alt="client01 的應用程式可寫中斷量測結果"></p>
+<p>圖（五）457 筆樣本中有 9 筆失敗，第一個失敗到穩定恢復為 6.154 秒</p>
+<p><img src="../../source/Day25/day25-practical-fig06.png" alt="切換期間從失敗到連續成功的寫入樣本"></p>
+<p>圖（六）<code>/write</code> 先出現 HTTP 500 與逾時，之後恢復為連續 HTTP 200 並產生遞增的資料列 ID</p>
+<h2>六、確認成功寫入已存在於叢集</h2>
+<p>在任一 PostgreSQL 節點先確認角色，再查詢最新紀錄：</p>
+<pre><code class="language-bash">hostname
+
+sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  list -e
+
+sudo -u postgres psql \
+  -d appdb \
+  -P pager=off \
+  -c &quot;SELECT id,
+             created_at,
+             note
+      FROM app.failover_probe
+      ORDER BY id DESC
+      LIMIT 20;&quot;
+</code></pre>
+<p>表格中的 <code>id</code> 應涵蓋 client01 最後幾筆成功回應，<code>note</code> 會顯示實際處理請求的 app01 或 app02。這項查詢用來核對成功回覆確實對應到已提交的資料，量測範圍止於成功寫入驗收。</p>
+<p><img src="../../source/Day25/day25-practical-fig07.png" alt="切換後的叢集狀態與最新成功寫入資料"></p>
+<p>圖（七）pg01 擔任新 Leader，兩台 Replica 恢復串流，最新資料列可對上 client01 的成功寫入 ID</p>
+<h2>七、移除暫時覆寫並恢復持久設定</h2>
+<p>只有 2.4 建立過 Runtime Override 時，才在 app01、app02 分別執行：</p>
+<pre><code class="language-bash">hostname
+
+sudo rm -f \
+  /run/systemd/system/iron-app.service.d/day25-measurement.conf
+
+sudo rmdir \
+  --ignore-fail-on-non-empty \
+  /run/systemd/system/iron-app.service.d
+
+sudo systemctl daemon-reload
+sudo systemctl restart iron-app
+
+systemctl is-active iron-app
+
+sudo sed -n -E \
+  &#39;/^DB_(HOST|SSLMODE|SSLROOTCERT)=/p&#39; \
+  /etc/iron-app.env
+
+IRON_APP_PID=&quot;$(
+  systemctl show \
+    -p MainPID \
+    --value \
+    iron-app
+)&quot;
+
+sudo sh -c \
+  &quot;tr &#39;\\0&#39; &#39;\\n&#39; &lt; /proc/${IRON_APP_PID}/environ&quot; | \
+  grep -E &#39;^DB_(HOST|SSLMODE|SSLROOTCERT)=&#39;
+
+curl -fsS \
+  http://127.0.0.1:8080/health
+printf &#39;\n&#39;
+</code></pre>
+<p>執行中的環境應恢復為 <code>/etc/iron-app.env</code> 內的持久設定。若固定 DB-RW 入口已完成，畫面會顯示 <code>DB_HOST=db-rw.lab.home</code>、<code>DB_SSLMODE=verify-full</code> 與 CA 路徑；命令不會輸出資料庫密碼。</p>
+<p>若環境已完成固定服務入口，再於 client01 驗證 <code>web.lab.home</code>；直接接續本日主實作時，以第 2.5 節使用 <code>10.77.20.21</code> 的驗證結果為準。</p>
+<p>固定服務入口已完成時執行：</p>
+<pre><code class="language-bash">hostname
+
+curl -fsS \
+  http://web.lab.home/health
+printf &#39;\n&#39;
+
+curl -fsS \
+  -X POST \
+  http://web.lab.home/write
+printf &#39;\n&#39;
+</code></pre>
+<p>兩個請求都應成功，並使用原本的持久設定。</p>
+<h2>八、結果表填寫方式</h2>
+<p>採用具有完整起點、終點與原始樣本的數值：</p>
+<table>
+<thead>
+<tr>
+<th>觀察項目</th>
+<th>起點</th>
+<th>終點</th>
+<th>本次結果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>HAProxy 角色更新</td>
+<td>舊 Primary 的 <code>/primary</code> 開始回傳 503</td>
+<td>HAProxy 將新 Primary 標記為可用</td>
+<td>保留既有完整樣本，或以相同觀察點重新量測</td>
+</tr>
+<tr>
+<td>Web Backend 可見中斷</td>
+<td>client01 第一個 <code>/health</code> 失敗</td>
+<td>連續三次 <code>/health</code> 成功中的第一筆</td>
+<td>依 Web 測試的 <code>result.txt</code> 填寫；未見失敗則寫未觀察到中斷</td>
+</tr>
+<tr>
+<td>應用程式可寫中斷</td>
+<td>client01 第一個 <code>/write</code> 失敗</td>
+<td>連續三次 <code>/write</code> 成功中的第一筆</td>
+<td>依 Write 測試的 <code>result.txt</code> 填寫</td>
+</tr>
+<tr>
+<td>切換到穩定可寫</td>
+<td><code>switch_epoch</code></td>
+<td>連續三次 <code>/write</code> 成功中的第一筆</td>
+<td>時間同步正常時才填寫</td>
+</tr>
+</tbody></table>
+<p>三項結果具有不同觀察點：HAProxy 更新時間描述代理控制面，Web 測試描述一台應用程式失效的影響，<code>/write</code> 測試則涵蓋使用者請求、Web 代理、應用程式、資料庫代理與 Primary 切換的完整路徑。</p>
+</main></body></html>

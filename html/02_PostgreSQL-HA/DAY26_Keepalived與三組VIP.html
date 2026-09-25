@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 26｜讓代理節點故障後自動接管：Keepalived、VRRP 與三組高可用 VIP</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 26｜讓代理節點故障後自動接管：Keepalived、VRRP 與三組高可用 VIP</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 26｜讓代理節點故障後自動接管：Keepalived、VRRP 與三組高可用 VIP</a></p>
+<p>本日由 proxy01／02 提供三組獨立 VIP：Web <code>10.77.20.10</code>、DB RW <code>10.77.20.11</code>、DB RO <code>10.77.20.12</code>。VIP 不配置在 OPNsense。</p>
+<h2>本日操作順序</h2>
+<ol>
+<li>先在 proxy01、proxy02 分別確認實際 Service NIC 名稱與 Nginx、HAProxy 健康狀態。</li>
+<li>逐台建立 Health Script，先手動執行並確認 Exit Code。</li>
+<li>先完成 proxy01 的 Keepalived Config，但先不要測試故障。</li>
+<li>再完成 proxy02 的 Config，確認 VRID、Priority 與 Peer Address 和 proxy01 相符。</li>
+<li>先啟動較高 Priority 的 proxy01，確認它成為 Master 後再啟動 proxy02，建立容易判讀的初始狀態；實際 HA 運作不依賴此啟動順序。</li>
+<li>從 client01 分別測試三組 VIP，最後才到 OPNsense 啟用正式需要的規則。</li>
+</ol>
+<h2>1. 前置確認</h2>
+<p><strong>操作節點：proxy01、proxy02。逐台確認，不要假設兩台 NIC 都叫 <code>eth0</code>。</strong></p>
+<p>先在 proxy01 執行並確認，再到 proxy02 重複：</p>
+<pre><code class="language-bash">sudo apt update
+sudo apt install -y keepalived
+ip -br address
+sudo sysctl net.ipv4.ip_nonlocal_bind
+sudo nginx -t
+sudo haproxy -c -f /etc/haproxy/haproxy.cfg
+</code></pre>
+<p>以下假設 Service NIC 是 <code>eth0</code>。若 <code>ip -br address</code> 顯示其他名稱，兩台 Keepalived Config 都要改成實際名稱。</p>
+<h2>2. 建立 Health Script</h2>
+<p><strong>操作節點：proxy01、proxy02。<code>check-haproxy</code> 兩台相同，但 <code>check-nginx</code> 必須檢查各自的 Node IP；不能兩台都指向 proxy01。</strong></p>
+<p>proxy01 的 <code>/usr/local/sbin/check-nginx</code>：</p>
+<pre><code class="language-bash">sudo nano /usr/local/sbin/check-nginx
+</code></pre>
+<pre><code class="language-bash">#!/bin/sh
+systemctl is-active --quiet nginx &amp;&amp; curl -fsS --max-time 2 http://10.77.20.21/health &gt;/dev/null
+</code></pre>
+<p>在 proxy01 按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code> 儲存。</p>
+<p>proxy02 的 <code>/usr/local/sbin/check-nginx</code> 使用以下完整內容：</p>
+<pre><code class="language-bash">sudo nano /usr/local/sbin/check-nginx
+</code></pre>
+<pre><code class="language-bash">#!/bin/sh
+systemctl is-active --quiet nginx &amp;&amp; curl -fsS --max-time 2 http://10.77.20.22/health &gt;/dev/null
+</code></pre>
+<p>在 proxy02 按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code> 儲存。特別確認 proxy01 是 <code>.21</code>，proxy02 是 <code>.22</code>。如果 proxy02 也檢查 <code>.21</code>，當 proxy01 Nginx 停止時，兩台的 <code>chk_nginx</code> 會一起失敗，Web VIP 就無法正確切換。</p>
+<p>接著在兩台開啟 <code>/usr/local/sbin/check-haproxy</code>：</p>
+<pre><code class="language-bash">sudo nano /usr/local/sbin/check-haproxy
+</code></pre>
+<pre><code class="language-bash">#!/bin/sh
+systemctl is-active --quiet haproxy &amp;&amp; \
+  printf &#39;show info\n&#39; | \
+  socat -T 2 stdio UNIX-CONNECT:/run/haproxy/admin.sock | \
+  grep -q &#39;^Stopping: 0&#39;
+</code></pre>
+<p>HAProxy 3.0 的 <code>show info</code> 輸出可能不包含 <code>Status: READY</code>；這裡改查實際存在的 <code>Stopping: 0</code>。因此此 Script 同時確認 systemd 服務為 Active、Runtime Socket 能回應，而且 HAProxy 程序未進入停止狀態；Listener、後端與資料庫角色由後續連線測試確認。</p>
+<p>兩台都按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code> 儲存，再執行：</p>
+<pre><code class="language-bash">sudo chown root:root /usr/local/sbin/check-nginx /usr/local/sbin/check-haproxy
+sudo chmod 750 /usr/local/sbin/check-nginx /usr/local/sbin/check-haproxy
+sudo /usr/local/sbin/check-nginx
+echo $?
+sudo /usr/local/sbin/check-haproxy
+echo $?
+sudo grep -n &#39;http://&#39; /usr/local/sbin/check-nginx
+</code></pre>
+<p>兩個 Script 的 Exit Code 都必須是 <code>0</code>。最後一個指令在 proxy01 必須顯示 <code>10.77.20.21</code>，在 proxy02 必須顯示 <code>10.77.20.22</code>。Exit Code 為非零時，先檢查 Nginx、HAProxy 與腳本內的 Own-IP，確認正常後再啟動 Keepalived。</p>
+<h2>3. proxy01 Keepalived Config</h2>
+<p><strong>操作節點：只在 proxy01。</strong></p>
+<p>建立 <code>/etc/keepalived/keepalived.conf</code>：</p>
+<pre><code class="language-bash">sudo cp -a /etc/keepalived/keepalived.conf \
+  /etc/keepalived/keepalived.conf.before-day26 2&gt;/dev/null || true
+sudo nano /etc/keepalived/keepalived.conf
+</code></pre>
+<pre><code class="language-conf">global_defs {
+    router_id PROXY01
+    enable_script_security
+    script_user root
+}
+
+vrrp_script chk_nginx {
+    script &quot;/usr/local/sbin/check-nginx&quot;
+    interval 2
+    timeout 2
+    fall 2
+    rise 2
+    weight -80
+}
+
+vrrp_script chk_haproxy {
+    script &quot;/usr/local/sbin/check-haproxy&quot;
+    interval 2
+    timeout 2
+    fall 2
+    rise 2
+    weight -80
+}
+
+vrrp_instance WEB_VIP {
+    state BACKUP
+    interface eth0
+    virtual_router_id 20
+    priority 150
+    advert_int 1
+    unicast_src_ip 10.77.20.21
+    unicast_peer { 10.77.20.22 }
+    authentication {
+        auth_type PASS
+        auth_pass IR0N2026
+    }
+    virtual_ipaddress { 10.77.20.10/24 dev eth0 }
+    track_script { chk_nginx }
+}
+
+vrrp_instance DB_RW_VIP {
+    state BACKUP
+    interface eth0
+    virtual_router_id 21
+    priority 150
+    advert_int 1
+    unicast_src_ip 10.77.20.21
+    unicast_peer { 10.77.20.22 }
+    authentication {
+        auth_type PASS
+        auth_pass IR0N2026
+    }
+    virtual_ipaddress { 10.77.20.11/24 dev eth0 }
+    track_script { chk_haproxy }
+}
+
+vrrp_instance DB_RO_VIP {
+    state BACKUP
+    interface eth0
+    virtual_router_id 22
+    priority 150
+    advert_int 1
+    unicast_src_ip 10.77.20.21
+    unicast_peer { 10.77.20.22 }
+    authentication {
+        auth_type PASS
+        auth_pass IR0N2026
+    }
+    virtual_ipaddress { 10.77.20.12/24 dev eth0 }
+    track_script { chk_haproxy }
+}
+</code></pre>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code> 儲存，但先不啟動 Keepalived。先驗證這份設定：</p>
+<pre><code class="language-bash">sudo keepalived --config-test \
+  --use-file=/etc/keepalived/keepalived.conf
+</code></pre>
+<p>Config Test 必須成功。若出現 NIC 不存在，回到第 1 節，把設定中的 <code>eth0</code> 全部改成 proxy01 的實際 Service NIC 名稱。</p>
+<p><code>auth_pass</code> 主要用來降低誤配置風險；正式環境要限制 VRRP Peer 與網路存取，建立完整的安全邊界。</p>
+<h2>4. proxy02 Config</h2>
+<p><strong>操作節點：只在 proxy02。完成後先做 Config Check。</strong></p>
+<p>先備份原始設定，再開啟 Config：</p>
+<pre><code class="language-bash">sudo cp -a /etc/keepalived/keepalived.conf \
+  /etc/keepalived/keepalived.conf.before-day26 2&gt;/dev/null || true
+sudo nano /etc/keepalived/keepalived.conf
+</code></pre>
+<p>將下列完整設定貼入：</p>
+<pre><code class="language-conf">global_defs {
+    router_id PROXY02
+    enable_script_security
+    script_user root
+}
+
+vrrp_script chk_nginx {
+    script &quot;/usr/local/sbin/check-nginx&quot;
+    interval 2
+    timeout 2
+    fall 2
+    rise 2
+    weight -80
+}
+
+vrrp_script chk_haproxy {
+    script &quot;/usr/local/sbin/check-haproxy&quot;
+    interval 2
+    timeout 2
+    fall 2
+    rise 2
+    weight -80
+}
+
+vrrp_instance WEB_VIP {
+    state BACKUP
+    interface eth0
+    virtual_router_id 20
+    priority 100
+    advert_int 1
+    unicast_src_ip 10.77.20.22
+    unicast_peer { 10.77.20.21 }
+    authentication {
+        auth_type PASS
+        auth_pass IR0N2026
+    }
+    virtual_ipaddress { 10.77.20.10/24 dev eth0 }
+    track_script { chk_nginx }
+}
+
+vrrp_instance DB_RW_VIP {
+    state BACKUP
+    interface eth0
+    virtual_router_id 21
+    priority 100
+    advert_int 1
+    unicast_src_ip 10.77.20.22
+    unicast_peer { 10.77.20.21 }
+    authentication {
+        auth_type PASS
+        auth_pass IR0N2026
+    }
+    virtual_ipaddress { 10.77.20.11/24 dev eth0 }
+    track_script { chk_haproxy }
+}
+
+vrrp_instance DB_RO_VIP {
+    state BACKUP
+    interface eth0
+    virtual_router_id 22
+    priority 100
+    advert_int 1
+    unicast_src_ip 10.77.20.22
+    unicast_peer { 10.77.20.21 }
+    authentication {
+        auth_type PASS
+        auth_pass IR0N2026
+    }
+    virtual_ipaddress { 10.77.20.12/24 dev eth0 }
+    track_script { chk_haproxy }
+}
+</code></pre>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code> 儲存，再檢查 proxy02 的節點專屬欄位並執行 Config Test：</p>
+<pre><code class="language-bash">sudo grep -nE &#39;router_id|priority|unicast_src_ip|unicast_peer&#39; \
+  /etc/keepalived/keepalived.conf
+sudo keepalived --config-test \
+  --use-file=/etc/keepalived/keepalived.conf
+</code></pre>
+<p>Config Test 必須成功。若出現 NIC 不存在，回到第 1 節，把 <code>eth0</code> 改成 proxy02 的實際 Service NIC 名稱。</p>
+<h2>5. 啟動與確認</h2>
+<p><strong>以下使用固定的驗證順序：先啟動 proxy01，等三組 VIP 都出現後，再啟動 proxy02。這個順序能避開初始選舉的短暫過渡；Keepalived 完成收斂後的角色由 VRRP 選舉結果決定。</strong></p>
+<p>先在 proxy01 執行：</p>
+<pre><code class="language-bash">sudo keepalived --config-test \
+  --use-file=/etc/keepalived/keepalived.conf
+sudo systemctl enable --now keepalived
+sleep 5
+systemctl is-active nginx haproxy keepalived
+ip -br address show eth0
+</code></pre>
+<p>確認 proxy01 已持有 <code>10.77.20.10</code>、<code>10.77.20.11</code>、<code>10.77.20.12</code> 三組 VIP，再到 proxy02 執行：</p>
+<pre><code class="language-bash">sudo keepalived --config-test \
+  --use-file=/etc/keepalived/keepalived.conf
+sudo systemctl enable --now keepalived
+sleep 5
+systemctl is-active nginx haproxy keepalived
+ip -br address show eth0
+</code></pre>
+<p><code>sleep 5</code> 是讓 VRRP 完成初始選舉與收斂；不要在服務剛啟動後立即判斷 VIP 所屬。若先啟動 proxy02，它在尚未收到 proxy01 Advertisement 時會暫時成為 Master；proxy01 上線後，proxy02 收到 Priority 150 的 Advertisement 就會自動退回 BACKUP。</p>
+<p>之後主機自動重啟不需要人工控制順序：</p>
+<ul>
+<li>只有 proxy02 重啟：proxy01 持續為 Master，proxy02 回來後留在 BACKUP。</li>
+<li>proxy01 重啟：proxy02 先接手 VIP；proxy01 回來後依 Priority 150 進行 Preempt，VIP 回到 proxy01。</li>
+<li>兩台同時重啟：VRRP 會自行選舉，最後由健康且 Priority 較高的節點持有 VIP。</li>
+</ul>
+<p>正常收斂後，proxy01 持有三組 VIP，proxy02 不持有。</p>
+<p>在 proxy01 執行：</p>
+<pre><code class="language-bash">systemctl is-active nginx haproxy keepalived
+ip -4 -o address show dev eth0 |
+  awk &#39;$4 ~ /^10\.77\.20\.(10|11|12)\/24$/&#39;
+</code></pre>
+<p>預期三個 Service 都是 <code>active</code>，並看到三組 VIP。在 proxy02 執行：</p>
+<pre><code class="language-bash">systemctl is-active nginx haproxy keepalived
+if ip -4 -o address show dev eth0 |
+  awk &#39;$4 ~ /^10\.77\.20\.(10|11|12)\/24$/&#39; |
+  grep -q .; then
+  echo &#39;ERROR: proxy02 still owns one or more VIPs&#39;
+else
+  echo &#39;OK: proxy02 does not own VIP&#39;
+fi
+</code></pre>
+<p>正常基準下 proxy02 不應出現三組 VIP。如果啟動或重啟後的短暫選舉期曾在兩台看到 VIP，先等待 5 至 10 秒並檢查 Keepalived Log。收斂後兩台同時持有同一組 VIP，表示發生持續性 split-brain；此時停止 proxy02 Keepalived，檢查 VRID、Unicast Peer、NIC 與兩台之間的 VRRP Protocol 112，修正後再繼續測試 Client。</p>
+<p><img src="../../source/Day26/day26-fig01-proxy01-baseline.png" alt="proxy01 持有三組 VIP"></p>
+<p>圖（一）正常收斂後，proxy01 的服務與健康腳本皆正常，並持有三組 VIP</p>
+<p><img src="../../source/Day26/day26-fig02-proxy02-baseline.png" alt="proxy02 處於備援狀態"></p>
+<p>圖（二）proxy02 的服務與健康腳本皆正常，穩定狀態下未持有 VIP</p>
+<p>client01：</p>
+<pre><code class="language-bash">sudo apt update
+sudo apt install -y curl netcat-openbsd postgresql-client tcpdump
+curl http://10.77.20.10/health
+nc -vz 10.77.20.11 5432
+nc -vz 10.77.20.12 5432
+</code></pre>
+<p>三個服務入口都應成功。接著確認 OPNsense Unbound 是否已建立 Host Override；尚未建立時依下列步驟新增：</p>
+<ol>
+<li><p>登入 OPNsense Web UI。</p>
+</li>
+<li><p>選 <code>Services</code> → <code>Unbound DNS</code> → <code>Overrides</code>。</p>
+</li>
+<li><p>在 <code>Host Overrides</code> 按 <code>Add</code>。</p>
+</li>
+<li><p>依下表逐筆建立，Type 都選 <code>A (IPv4 address)</code>：</p>
+<table>
+<thead>
+<tr>
+<th>Host</th>
+<th>Domain</th>
+<th>IP Address</th>
+<th>Description</th>
+<th>最終 FQDN</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>web</code></td>
+<td><code>lab.home</code></td>
+<td><code>10.77.20.10</code></td>
+<td><code>Web VIP</code></td>
+<td><code>web.lab.home</code></td>
+</tr>
+<tr>
+<td><code>db-rw</code></td>
+<td><code>lab.home</code></td>
+<td><code>10.77.20.11</code></td>
+<td><code>DB RW VIP</code></td>
+<td><code>db-rw.lab.home</code></td>
+</tr>
+<tr>
+<td><code>db-ro</code></td>
+<td><code>lab.home</code></td>
+<td><code>10.77.20.12</code></td>
+<td><code>DB RO VIP</code></td>
+<td><code>db-ro.lab.home</code></td>
+</tr>
+</tbody></table>
+</li>
+<li><p>每筆按 <code>Save</code>，三筆都完成後按頁面上方 <code>Apply</code>。</p>
+</li>
+<li><p>確認清單中的 Host 分別是 <code>web</code>、<code>db-rw</code>、<code>db-ro</code>，三筆 Domain 都是 <code>lab.home</code>。</p>
+</li>
+<li><p>回到 client01 重做三次 <code>getent ahostsv4</code>。</p>
+</li>
+</ol>
+<p>OPNsense 會將 <code>Host</code> 與 <code>Domain</code> 組合成 FQDN。不要把 <code>db-rw.lab.home</code> 或 <code>db-ro.lab.home</code> 整串填入 Domain，也不要在這兩筆繼續使用 Host <code>web</code>；否則會產生 <code>web.db-rw.lab.home</code> 或 <code>web.db-ro.lab.home</code> 這類錯誤名稱。</p>
+<p>確認 DNS 指向三組 VIP：</p>
+<pre><code class="language-bash">getent ahostsv4 web.lab.home
+getent ahostsv4 db-rw.lab.home
+getent ahostsv4 db-ro.lab.home
+</code></pre>
+<h2>6. 將 Root CA 安裝到測試節點</h2>
+<p>操作位置：先在 ca01 PVE Console 取得 Public Root Certificate，再到 app01、app02、client01 安裝。Root Certificate 可以公開，但 Private Key 絕對不能複製離開 ca01。</p>
+<p>在 ca01 顯示 Root Certificate 與 Fingerprint：</p>
+<pre><code class="language-bash">sudo cat /var/lib/step-ca/certs/root_ca.crt
+sudo openssl x509 -in /var/lib/step-ca/certs/root_ca.crt \
+  -noout -fingerprint -sha256
+</code></pre>
+<p>記錄完整 PEM 與 SHA256 Fingerprint。到 app01 執行：</p>
+<pre><code class="language-bash">sudo install -d -m 0755 /etc/iron-app
+sudo nano /etc/iron-app/pg-ca.crt
+</code></pre>
+<p>貼上從 <code>-----BEGIN CERTIFICATE-----</code> 到 <code>-----END CERTIFICATE-----</code> 的完整內容，按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code>。再執行：</p>
+<pre><code class="language-bash">sudo chown root:root /etc/iron-app/pg-ca.crt
+sudo chmod 644 /etc/iron-app/pg-ca.crt
+sudo openssl x509 -in /etc/iron-app/pg-ca.crt \
+  -noout -fingerprint -sha256
+</code></pre>
+<p>Fingerprint 必須與 ca01 相同。在 app02 重複相同操作。</p>
+<p>到 client01 建立相同路徑：</p>
+<pre><code class="language-bash">sudo install -d -m 0755 /etc/iron-app
+sudo nano /etc/iron-app/pg-ca.crt
+</code></pre>
+<p>貼上同一份 Public Root Certificate，儲存後執行：</p>
+<pre><code class="language-bash">sudo chown root:root /etc/iron-app/pg-ca.crt
+sudo chmod 644 /etc/iron-app/pg-ca.crt
+sudo openssl x509 -in /etc/iron-app/pg-ca.crt \
+  -noout -fingerprint -sha256
+</code></pre>
+<p>app01、app02、client01 顯示的 Fingerprint 都必須與 ca01 相同。</p>
+<p>持續探測需要在背景連線兩組資料庫入口，因此在 client01 建立僅供目前使用者讀取的密碼檔：</p>
+<pre><code class="language-bash">(
+  umask 077
+  nano /home/labadmin/.pgpass
+)
+</code></pre>
+<p>填入以下兩行，分別換成 <code>app_rw</code> 與 <code>app_ro</code> 的實際密碼：</p>
+<pre><code class="language-text">db-rw.lab.home:5432:appdb:app_rw:實際app_rw密碼
+db-ro.lab.home:5432:appdb:app_ro:實際app_ro密碼
+</code></pre>
+<p>密碼包含冒號 <code>:</code> 或反斜線 <code>\</code> 時，必須在該字元前加上反斜線進行跳脫。</p>
+<p>儲存後立即限制權限：</p>
+<pre><code class="language-bash">chmod 600 /home/labadmin/.pgpass
+stat -c &#39;%U %G %a %n&#39; /home/labadmin/.pgpass
+</code></pre>
+<p>結果必須顯示擁有者為 <code>labadmin</code>、權限為 <code>600</code>。密碼檔只保存在 client01，不顯示內容、不複製到其他節點，也不提交到 Git。</p>
+<p>最後在 client01 先各做一次 TLS 連線，確認進入持續 Probe 前沒有 DNS、憑證、密碼或 HBA 問題：</p>
+<pre><code class="language-bash">psql \
+  &#39;host=db-rw.lab.home port=5432 dbname=appdb user=app_rw sslmode=verify-full sslrootcert=/etc/iron-app/pg-ca.crt connect_timeout=3&#39; \
+  -w \
+  -Atqc &#39;SELECT pg_is_in_recovery(),inet_server_addr();&#39;
+
+psql \
+  &#39;host=db-ro.lab.home port=5432 dbname=appdb user=app_ro sslmode=verify-full sslrootcert=/etc/iron-app/pg-ca.crt connect_timeout=3&#39; \
+  -w \
+  -Atqc &#39;SELECT pg_is_in_recovery(),inet_server_addr();&#39;
+</code></pre>
+<p>RW 預期第一欄為 <code>f</code>，RO 預期為 <code>t</code>。</p>
+<p><img src="../../source/Day26/day26-fig03-tls-role-verification.png" alt="透過兩組資料庫 VIP 驗證 TLS 與角色"></p>
+<p>圖（三）DB-RW 抵達 Primary、DB-RO 抵達 Replica，兩條連線都通過完整 TLS 驗證</p>
+<h2>7. 分開測試三組 VIP</h2>
+<p><strong>操作節點：從 client01 發起測試。切換時只停止一項服務，驗證完立即恢復。</strong></p>
+<p>開始前在 client01 安裝 <code>tmux</code>，並在目前這一個 SSH／Console Connection 內建立名為 <code>day26</code> 的 Session：</p>
+<pre><code class="language-bash">sudo apt update
+sudo apt install -y tmux
+tmux new-session -s day26
+</code></pre>
+<p>進入 <code>tmux</code> 後，在目前 Pane 依序執行下列指令，將同一個 Window 分成左邊一個、右邊上下各一個，共三個 Pane：</p>
+<pre><code class="language-bash">tmux split-window -h
+tmux split-window -v
+</code></pre>
+<p>第一條指令建立右側 Pane，tmux 會自動將焦點移到新 Pane；第二條指令因此會將右側 Pane 分成上下兩個。之後按 <code>Ctrl+B</code>，放開後按方向鍵，即可在三個 Pane 間切換。</p>
+<p>在第一個 Pane 持續測 Web VIP：</p>
+<pre><code class="language-bash">while true; do
+  printf &#39;%s web &#39; &quot;$(date -Is)&quot;
+  curl -sS --connect-timeout 2 http://10.77.20.10/health || echo &#39;failed&#39;
+  sleep 1
+done
+</code></pre>
+<p>在第二個 Pane 持續測 DB RW VIP：</p>
+<pre><code class="language-bash">while true; do
+  printf &#39;%s rw &#39; &quot;$(date -Is)&quot;
+  psql \
+    &#39;host=db-rw.lab.home port=5432 dbname=appdb user=app_rw sslmode=verify-full sslrootcert=/etc/iron-app/pg-ca.crt connect_timeout=2&#39; \
+    -w \
+    -Atqc &#39;SELECT pg_is_in_recovery(),inet_server_addr();&#39; || echo &#39;failed&#39;
+  sleep 1
+done
+</code></pre>
+<p>在第三個 Pane 持續測 DB RO VIP：</p>
+<pre><code class="language-bash">while true; do
+  printf &#39;%s ro &#39; &quot;$(date -Is)&quot;
+  psql \
+    &#39;host=db-ro.lab.home port=5432 dbname=appdb user=app_ro sslmode=verify-full sslrootcert=/etc/iron-app/pg-ca.crt connect_timeout=2&#39; \
+    -w \
+    -Atqc &#39;SELECT pg_is_in_recovery(),inet_server_addr();&#39; || echo &#39;failed&#39;
+  sleep 1
+done
+</code></pre>
+<p>不要顯示或提交 <code>.pgpass</code>；正式環境應改由祕密儲存服務提供資料庫憑證。</p>
+<p><code>tmux</code> 的離開與結束方式不同：</p>
+<ul>
+<li>只是暫時離開、讓三個 Probe 繼續執行：按 <code>Ctrl+B</code>，放開後按 <code>d</code>。</li>
+<li>回到原本 Session：在 client01 執行 <code>tmux attach-session -t day26</code>。</li>
+<li>當日測試完成：先到三個 Pane 各按一次 <code>Ctrl+C</code> 停止 Probe，再按 <code>Ctrl+B</code>、放開後按 <code>d</code> 回到普通 Shell，最後執行：</li>
+</ul>
+<pre><code class="language-bash">tmux kill-session -t day26
+tmux list-sessions 2&gt;/dev/null || echo &#39;No tmux session remains&#39;
+</code></pre>
+<p>若 SSH Connection 意外中斷，<code>tmux</code> 內的 Probe 不會因此停止；重新連入 client01 後用上述 <code>attach-session</code> 取回畫面。</p>
+<h3>7.1 停止 proxy01 Nginx</h3>
+<p>在 proxy01：</p>
+<pre><code class="language-bash">date -Is
+sudo systemctl stop nginx
+</code></pre>
+<p>預期只有 Web VIP 移到 proxy02，DB RW／RO VIP 留在 proxy01。分別在 proxy01 與 proxy02 執行：</p>
+<pre><code class="language-bash">ip -br address show eth0
+sudo journalctl -u keepalived --since &#39;-2 min&#39; --no-pager
+</code></pre>
+<p><img src="../../source/Day26/day26-fig04-nginx-failover.png" alt="Nginx 故障後由 proxy02 接管 Web VIP"></p>
+<p>圖（四）proxy02 接管 Web VIP，DB-RW 與 DB-RO VIP 保持在 proxy01</p>
+<p>恢復：</p>
+<pre><code class="language-bash">sudo systemctl start nginx
+sudo nginx -t
+systemctl is-active nginx
+</code></pre>
+<p>在兩台重新執行 <code>ip -br address show eth0</code>。等待 Web VIP 回到 proxy01，且第一個 Client Probe 恢復正常後，才做下一項。</p>
+<h3>7.2 停止 proxy01 HAProxy</h3>
+<p>在 proxy01：</p>
+<pre><code class="language-bash">date -Is
+sudo systemctl stop haproxy
+</code></pre>
+<p>預期 DB RW 與 DB RO VIP 移到 proxy02，Web VIP 留在 proxy01。先確認接管結果：</p>
+<p><img src="../../source/Day26/day26-fig05-haproxy-failover.png" alt="HAProxy 故障後由 proxy02 接管兩組資料庫 VIP"></p>
+<p>圖（五）proxy02 接管 DB-RW 與 DB-RO VIP，Web VIP 保持在 proxy01</p>
+<p>確認後恢復：</p>
+<pre><code class="language-bash">sudo systemctl start haproxy
+sudo haproxy -c -f /etc/haproxy/haproxy.cfg
+systemctl is-active haproxy
+</code></pre>
+<p>在兩台重新執行 <code>ip -br address show eth0</code>。等待 DB RW／RO VIP 回到 proxy01，且兩個 DB Probe 恢復正常後，才做下一項。</p>
+<h3>7.3 關閉 proxy01 VM</h3>
+<p>操作位置：PVE Web UI。</p>
+<ol>
+<li>左側選 VM 201 <code>proxy01</code>。</li>
+<li>選 <code>Summary</code>，先確認 VM 202 <code>proxy02</code> 為 Running。</li>
+<li>按右上角 <code>Shutdown</code>，不要使用 <code>Stop</code>。</li>
+<li>等待 proxy01 顯示 Stopped。</li>
+<li>回 client01 觀察三個 Probe。</li>
+<li>到 proxy02 執行 <code>ip -br address show eth0</code>，確認三組 VIP 都在 proxy02。</li>
+</ol>
+<p><img src="../../source/Day26/day26-fig06-proxy-vm-failover.png" alt="proxy01 關機後由 proxy02 接管三組 VIP"></p>
+<p>圖（六）proxy01 關機後，proxy02 成為三組 VRRP 執行個體的 MASTER 並持有全部 VIP</p>
+<p>確認接管後恢復正常基準：</p>
+<ol>
+<li>在 PVE Web UI 選 VM 201 → <code>Start</code>。</li>
+<li>等待 Nginx、HAProxy、Keepalived 都為 Active，再確認 VIP 是否依 Priority Preempt 回 proxy01。</li>
+</ol>
+<p>每一項都要記錄：執行時間、第一次失敗、第一次恢復、VIP 所在節點與錯誤訊息。不要只記錄 <code>systemctl active</code>。</p>
+<h2>8. 完成今日可執行的最後設定</h2>
+<p><strong>操作位置：fw01 的 OPNsense Web UI。規則完成後回到 client01 驗證。</strong></p>
+<h3>8.1 確認 Web VIP 的目前服務邊界</h3>
+<p>目前 Web VIP 提供內部 HTTP 服務。外部 HTTPS 入口需要先部署 Web Server Certificate、Nginx <code>listen 443 ssl</code>、WAN TCP 443 Port Forward 與對應的 WAN Pass Rule，再開放網際網路連線。</p>
+<p>在 client01 確認目前的服務邊界：</p>
+<pre><code class="language-bash">curl -fsS http://web.lab.home/health
+nc -vz -w 3 web.lab.home 443
+</code></pre>
+<p>HTTP Health Check 應成功，TCP 443 應顯示目前沒有服務監聽，確認 Web VIP 的內部 HTTP 入口已可使用。</p>
+<h3>8.2 建立 OpenVPN 到 DB VIP 的規則</h3>
+<p>本系列使用 <code>OpenVPN</code> Interface Group 接收所有 OpenVPN Tunnel Traffic。以下規則的 Interface 都選 <code>OpenVPN</code>，不選 <code>WAN</code>、<code>LAB_INTERNAL</code> 或個別 <code>ovpns</code> Device。</p>
+<h4>8.2.1 建立 DB 使用者群組</h4>
+<p>既有的 <code>vpn-rw01</code>、<code>vpn-ro01</code> 帳號已具備個人 Client Certificate。現在建立對應的 DB 群組：</p>
+<ol>
+<li>進入 <code>System</code> → <code>Access</code> → <code>Groups</code>。</li>
+<li>按 <code>Add</code>，Group Name 填 <code>vpn-db-rw</code>，將 <code>vpn-rw01</code> 加入 Member，Description 填 <code>VPN DB read-write users</code>，按 <code>Save</code>。</li>
+<li>再按 <code>Add</code>，Group Name 填 <code>vpn-db-ro</code>，將 <code>vpn-ro01</code> 加入 Member，Description 填 <code>VPN DB read-only users</code>，按 <code>Save</code>。</li>
+<li>回到 Users 檢查：<code>vpn-rw01</code> 只屬於 <code>vpn-db-rw</code>，<code>vpn-ro01</code> 只屬於 <code>vpn-db-ro</code>，不要把兩者加入 <code>vpn-admin</code>。</li>
+</ol>
+<h4>8.2.2 建立 OpenVPN Group 動態 Alias</h4>
+<ol>
+<li>進入 <code>Firewall</code> → <code>Aliases</code>，按 <code>Add</code>。</li>
+<li>Name 填 <code>VPN_DB_RW_CLIENTS</code>。</li>
+<li>Type 選 <code>OpenVPN group</code>。</li>
+<li>Content 選／填 <code>vpn-db-rw</code>。</li>
+<li>Description 填 <code>Connected OpenVPN members of vpn-db-rw</code>，按 <code>Save</code>。</li>
+<li>再建立 <code>VPN_DB_RO_CLIENTS</code>，Type 同樣選 <code>OpenVPN group</code>，Content 選／填 <code>vpn-db-ro</code>，Description 填 <code>Connected OpenVPN members of vpn-db-ro</code>。</li>
+<li>按 <code>Apply</code>。</li>
+</ol>
+<p>沒有對應使用者連入 VPN 時，這兩個 Alias 可以是空的，屬於正常現象。</p>
+<h4>8.2.3 在 OpenVPN Interface 建立三條規則</h4>
+<p>進入 <code>Firewall</code> → <code>Rules</code>，左上角的 Interface 篩選明確選 <code>OpenVPN</code>。三條規則的 Direction 都選 <code>in</code>、Quick 保持勾選、TCP/IP Version 選 <code>IPv4</code>、Protocol 選 <code>TCP</code>。</p>
+<p>第一條是 RW 使用者連 RW VIP：</p>
+<ol>
+<li>Action：<code>Pass</code>。</li>
+<li>Interface：<code>OpenVPN</code>。</li>
+<li>Source：Alias <code>VPN_DB_RW_CLIENTS</code>。</li>
+<li>Destination：Alias <code>DB_RW_VIP</code>（<code>10.77.20.11</code>）。</li>
+<li>Destination Port：<code>5432</code>。</li>
+<li>勾選 Log，Description：<code>ALLOW_VPN_DB_RW_TO_DB_RW_VIP</code>。</li>
+<li>按 <code>Save</code>。</li>
+</ol>
+<p>第二條明確拒絕 RO 使用者連 RW VIP：</p>
+<ol>
+<li>Action：<code>Block</code>。</li>
+<li>Interface：<code>OpenVPN</code>。</li>
+<li>Source：Alias <code>VPN_DB_RO_CLIENTS</code>。</li>
+<li>Destination：Alias <code>DB_RW_VIP</code>（<code>10.77.20.11</code>）。</li>
+<li>Destination Port：<code>5432</code>。</li>
+<li>勾選 Log，Description：<code>BLOCK_VPN_DB_RO_TO_DB_RW_VIP</code>。</li>
+<li>按 <code>Save</code>。</li>
+</ol>
+<p>第三條是 RO 使用者連 RO VIP：</p>
+<ol>
+<li>Action：<code>Pass</code>。</li>
+<li>Interface：<code>OpenVPN</code>。</li>
+<li>Source：Alias <code>VPN_DB_RO_CLIENTS</code>。</li>
+<li>Destination：Alias <code>DB_RO_VIP</code>（<code>10.77.20.12</code>）。</li>
+<li>Destination Port：<code>5432</code>。</li>
+<li>勾選 Log，Description：<code>ALLOW_VPN_DB_RO_TO_DB_RO_VIP</code>。</li>
+<li>按 <code>Save</code>，先不按 <code>Apply</code>，先完成下一節的規則排序。</li>
+</ol>
+<h4>8.2.4 排列 OpenVPN 規則順序</h4>
+<p>OPNsense 會依規則順序比對 Traffic。在 <code>Firewall</code> → <code>Rules</code> 選 <code>OpenVPN</code>，使用規則左側的 Move／Anchor 功能調整順序，由上而下應為：</p>
+<pre><code class="language-text">ALLOW_OPENVPN_TO_FIREWALL_DNS
+ALLOW_VPN_ADMIN_TO_PVE_WEB
+BLOCK_OTHER_OPENVPN_TO_PVE_NODES
+ALLOW_VPN_DB_RW_TO_DB_RW_VIP
+BLOCK_VPN_DB_RO_TO_DB_RW_VIP
+ALLOW_VPN_DB_RO_TO_DB_RO_VIP
+BLOCK_OPENVPN_TO_PG_NODES
+其他未授權流量由 pf 隱含 Default Deny 拒絕
+</code></pre>
+<p><code>BLOCK_VPN_DB_RO_TO_DB_RW_VIP</code> 必須位於任何可能允許 RO 使用者存取較寬範圍的 Pass Rule 之上。本系列不建立 <code>OpenVPN network → any Pass</code>；若當前畫面存在自行新增的寬鬆 Pass Rule，先停用或移到所有精確 Block 之下，否則後面的拒絕測試沒有意義。</p>
+<p>排序完成後按 <code>Apply</code>，再重新進入 <code>OpenVPN</code> 規則清單，由上往下核對一次。</p>
+<p>確認 <code>BLOCK_VPN_DB_RO_TO_DB_RW_VIP</code> 存在，並保留既有的 <code>BLOCK_OPENVPN_TO_PG_NODES</code>。VIP 可用後也要繼續阻擋 PG Node 直連。</p>
+<p>DB VIP 不建立 WAN Port Forward。</p>
+<p>規則完成後，先使用 <code>vpn-rw01</code> Profile 連入 OpenVPN，在 Windows PowerShell 執行：</p>
+<pre><code class="language-powershell">Test-NetConnection db-rw.lab.home -Port 5432
+Test-NetConnection db-ro.lab.home -Port 5432
+Test-NetConnection 10.77.30.11 -Port 5432
+</code></pre>
+<p>RW VIP 應成功，RO VIP 與 PG Node 直連必須失敗。斷開後改用 <code>vpn-ro01</code> Profile 連入，執行：</p>
+<pre><code class="language-powershell">Test-NetConnection db-ro.lab.home -Port 5432
+Test-NetConnection db-rw.lab.home -Port 5432
+Test-NetConnection 10.77.30.11 -Port 5432
+</code></pre>
+<p>RO VIP 應成功；RW VIP 必須失敗並命中 <code>BLOCK_VPN_DB_RO_TO_DB_RW_VIP</code>；PG Node 直連也必須失敗。</p>
+<p>完成兩組測試後，進入 OPNsense <code>Firewall</code> → <code>Log Files</code> → <code>Live View</code>，依 Source Tunnel IP 與 Description 過濾，確認精確 Block Rule 或 Default Deny 留下對應紀錄。連線失敗與阻擋日誌要同時成立，才能判定流量由防火牆拒絕。若結果不符，不要把 Source 暫時放寬成 <code>any</code>，先檢查 VPN 路由、規則順序與命中的規則。</p>
+<h3>8.3 將 app01、app02 改用 DB RW VIP</h3>
+<p>操作位置：app01、app02。</p>
+<pre><code class="language-bash">sudo nano /etc/iron-app.env
+</code></pre>
+<p>將檔案內容確認為以下四行；<code>DB_PASSWORD</code> 填入為 <code>app_rw</code> 設定的實際密碼，不可刪除或保留範例文字：</p>
+<pre><code class="language-text">DB_HOST=db-rw.lab.home
+DB_SSLMODE=verify-full
+DB_SSLROOTCERT=/etc/iron-app/pg-ca.crt
+DB_PASSWORD=實際app_rw密碼
+</code></pre>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code>，再執行：</p>
+<pre><code class="language-bash">sudo systemctl restart iron-app
+sudo systemctl status iron-app --no-pager
+curl -sS http://127.0.0.1:8080/health
+</code></pre>
+<pre><code class="language-bash">curl -i -X POST --connect-timeout 3 \
+  http://127.0.0.1:8080/write
+</code></pre>
+<p><code>/write</code> 必須回傳 HTTP 200 與包含 <code>id</code>、<code>backend</code> 的 JSON。若回傳 HTTP 500，立即在同一台 App Node 執行：</p>
+<pre><code class="language-bash">sudo journalctl -u iron-app \
+  --since &#39;-5 min&#39; \
+  -o cat --no-pager
+</code></pre>
+<p>依最後一段 Python Traceback 修正問題；不要只看 <code>systemctl status</code>，因為它會省略錯誤內容。常見訊息可依下列方向判讀：</p>
+<p>在 app01、app02 都完成上述修改，而且兩台本機 <code>/write</code> 都成功後，才從 client01 連續寫入，確認兩個 Backend 經 DB RW VIP 都可使用：</p>
+<pre><code class="language-bash">for i in $(seq 1 6); do
+  curl -sS -X POST --connect-timeout 3 http://web.lab.home/write
+  echo
+done
+</code></pre>
+<p>可以在 app01、app02 做負向測試：</p>
+<pre><code class="language-bash">  for ip in 10.77.30.11 10.77.30.12 10.77.30.13; do
+    echo &quot;=== ${ip}:5432 ===&quot;
+    timeout 3 bash -c &quot;&lt;/dev/tcp/${ip}/5432&quot; &amp;&amp;
+      echo &#39;ERROR: direct connection unexpectedly reachable&#39; ||
+      echo &#39;OK: direct connection blocked&#39;
+  done
+</code></pre>
+<p>Service VLAN 的 App 與 DB VIP 位於同一 Layer 2 Network，這段流量不會經過 OPNsense；需由 Proxy Host Firewall、HAProxy Authentication Path 與 PostgreSQL Role 控制。</p>
+</main></body>
+</html>

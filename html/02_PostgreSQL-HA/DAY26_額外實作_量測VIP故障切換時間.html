@@ -1,0 +1,701 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 26 額外實作：量測三組 VIP 的故障切換時間</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 26 額外實作：量測三組 VIP 的故障切換時間</h1>
+<p>本篇接續 <a href="./DAY26_Keepalived%E8%88%87%E4%B8%89%E7%B5%84VIP.md">Day 26 Keepalived 與三組 VIP</a>。主實作先完成三組固定入口與接管驗證；這裡改用 0.2 秒探測保存每次請求結果，自動計算故障注入到穩定恢復，以及用戶端真正觀察到的中斷時間。</p>
+<p>本次補測三種情境：</p>
+<ol>
+<li>停止 proxy01 的 Nginx，量測 Web VIP。</li>
+<li>停止 proxy01 的 HAProxy，量測 DB-RW 與 DB-RO VIP。</li>
+<li>正常關閉 proxy01 VM，量測三組 VIP。</li>
+</ol>
+<p>探測間隔為 0.2 秒。切換後連續三次成功中的第一筆，視為穩定恢復時間。結果會自動列出：</p>
+<ul>
+<li>故障注入時間。</li>
+<li>第一次失敗時間。</li>
+<li>穩定恢復時間。</li>
+<li>故障注入到穩定恢復秒數。</li>
+<li>第一次失敗到穩定恢復的可見中斷秒數。</li>
+</ul>
+<p>如果探測沒有捕捉到失敗，結果會顯示 <code>observed_failure=no</code> 與 <code>visible_interruption=not_observed</code>，不可解讀為中斷時間 0 秒。</p>
+<h2>一、確認三端時間同步</h2>
+<p>分別在 <code>client01</code>、<code>proxy01</code> 與稍後操作 VM 的 PVE 節點執行：</p>
+<pre><code class="language-bash">hostname
+date --iso-8601=ns
+timedatectl show -p NTPSynchronized --value
+</code></pre>
+<p>最後一行都應為 <code>yes</code>。故障到恢復的起點與終點來自不同主機，因此時間未同步時不要開始量測。</p>
+<h3>1.1 proxy01、proxy02 或 client01 顯示 no</h3>
+<p>在顯示 <code>no</code> 的 Debian VM 執行下列完整命令。這三台位於 Service VLAN，使用 OPNsense 的 <code>10.77.20.1</code> 作為共同時間來源：</p>
+<pre><code class="language-bash">hostname
+
+sudo timedatectl set-timezone Asia/Taipei
+
+sudo apt update
+sudo apt install -y chrony
+
+echo &#39;server 10.77.20.1 iburst prefer&#39; | \
+  sudo tee /etc/chrony/sources.d/opnsense.sources
+
+sudo systemctl disable --now systemd-timesyncd 2&gt;/dev/null || true
+sudo systemctl enable --now chrony
+sudo systemctl restart chrony
+
+sudo chronyc makestep
+chronyc waitsync 30 0.1
+
+systemctl is-enabled chrony
+systemctl is-active chrony
+chronyc tracking
+chronyc sources -n -v
+date --iso-8601=ns
+timedatectl show \
+  -p Timezone \
+  -p NTPSynchronized
+</code></pre>
+<p>確認結果：</p>
+<ul>
+<li><code>chrony</code> 為 <code>enabled</code> 與 <code>active</code>。</li>
+<li><code>chronyc tracking</code> 的 <code>Leap status</code> 為 <code>Normal</code>。</li>
+<li><code>chronyc sources -n -v</code> 中至少有一個來源以 <code>^*</code> 開頭；本次預期為 <code>10.77.20.1</code>。</li>
+<li><code>NTPSynchronized=yes</code>。</li>
+</ul>
+<p>如果 <code>chronyc waitsync 30 0.1</code> 完成後顯示未同步，執行以下診斷並保留輸出，完成時間同步後再進行 RTO 測試：</p>
+<pre><code class="language-bash">hostname
+ip route
+systemctl status chrony --no-pager -l
+sudo chronyc online
+sudo chronyc burst 4/4
+sleep 5
+chronyc tracking
+chronyc sources -n -v
+sudo journalctl -u chrony -b -n 100 -o short-iso-precise --no-pager
+</code></pre>
+<p>此時要檢查 OPNsense 是否向 Service VLAN 提供 NTP，以及防火牆是否允許這些 VM 連往 <code>10.77.20.1</code> 的 UDP 123。</p>
+<h3>1.2 PVE 節點顯示 no</h3>
+<p>PVE 已使用 Chrony。先執行既有服務的重新同步，不要在這裡更換 NTP 套件：</p>
+<pre><code class="language-bash">hostname
+systemctl is-enabled chrony
+systemctl is-active chrony
+chronyc sources -n -v
+
+systemctl restart chrony
+chronyc makestep
+chronyc waitsync 30 0.1
+
+chronyc tracking
+chronyc sources -n -v
+date --iso-8601=ns
+timedatectl show \
+  -p Timezone \
+  -p NTPSynchronized
+</code></pre>
+<p>PVE 顯示 <code>no</code> 時，保留 <code>chronyc tracking</code>、<code>chronyc sources -n -v</code> 與 <code>journalctl -u chrony</code> 的輸出，先修正既有時間來源或 NTP 防火牆規則，再執行本次測試。</p>
+<h2>二、在 client01 建立量測腳本</h2>
+<p>以下步驟全部在 <code>client01</code> 執行。</p>
+<h3>2.1 建立目錄並確認依賴</h3>
+<pre><code class="language-bash">hostname
+
+mkdir -p \
+  /home/labadmin/day26-rto/runs
+
+command -v curl
+command -v psql
+
+ls -l \
+  /home/labadmin/.pgpass \
+  /etc/iron-app/pg-ca.crt
+</code></pre>
+<h3>2.2 建立 probe.sh</h3>
+<pre><code class="language-bash">nano \
+  /home/labadmin/day26-rto/probe.sh
+</code></pre>
+<p>完整貼入：</p>
+<pre><code class="language-bash">#!/bin/bash
+set -u
+
+export LC_ALL=C
+
+probe_type=&quot;${1:?usage: probe.sh web|rw|ro RUN_DIR}&quot;
+run_dir=&quot;${2:?usage: probe.sh web|rw|ro RUN_DIR}&quot;
+log_file=&quot;${run_dir}/${probe_type}.log&quot;
+
+while true; do
+  epoch=&quot;$(date +%s.%N)&quot;
+  iso_time=&quot;$(date --iso-8601=ns)&quot;
+
+  case &quot;$probe_type&quot; in
+    web)
+      output=&quot;$(
+        curl \
+          -fsS \
+          --connect-timeout 1 \
+          --max-time 1 \
+          http://web.lab.home/health \
+          2&gt;&amp;1
+      )&quot;
+      rc=$?
+
+      if [ &quot;$rc&quot; -eq 0 ]; then
+        if ! printf &#39;%s&#39; &quot;$output&quot; |
+          grep -Eq &#39;&quot;status&quot;[[:space:]]*:[[:space:]]*&quot;ok&quot;&#39;; then
+          output=&quot;unexpected_web_response ${output}&quot;
+          rc=4
+        fi
+      fi
+      ;;
+
+    rw)
+      output=&quot;$(
+        PGOPTIONS=&#39;-c statement_timeout=1000&#39; \
+        psql \
+          &#39;host=db-rw.lab.home port=5432 dbname=appdb user=app_rw sslmode=verify-full sslrootcert=/etc/iron-app/pg-ca.crt connect_timeout=1&#39; \
+          -w \
+          -Atqc \
+          &#39;SELECT pg_is_in_recovery(),inet_server_addr();&#39; \
+          2&gt;&amp;1
+      )&quot;
+      rc=$?
+
+      if [ &quot;$rc&quot; -eq 0 ]; then
+        case &quot;$output&quot; in
+          f&#39;|&#39;*) ;;
+          *)
+            output=&quot;unexpected_rw_role ${output}&quot;
+            rc=4
+            ;;
+        esac
+      fi
+      ;;
+
+    ro)
+      output=&quot;$(
+        PGOPTIONS=&#39;-c statement_timeout=1000&#39; \
+        psql \
+          &#39;host=db-ro.lab.home port=5432 dbname=appdb user=app_ro sslmode=verify-full sslrootcert=/etc/iron-app/pg-ca.crt connect_timeout=1&#39; \
+          -w \
+          -Atqc \
+          &#39;SELECT pg_is_in_recovery(),inet_server_addr();&#39; \
+          2&gt;&amp;1
+      )&quot;
+      rc=$?
+
+      if [ &quot;$rc&quot; -eq 0 ]; then
+        case &quot;$output&quot; in
+          t&#39;|&#39;*) ;;
+          *)
+            output=&quot;unexpected_ro_role ${output}&quot;
+            rc=4
+            ;;
+        esac
+      fi
+      ;;
+
+    *)
+      echo &#39;usage: probe.sh web|rw|ro RUN_DIR&#39; &gt;&amp;2
+      exit 2
+      ;;
+  esac
+
+  output=&quot;$(printf &#39;%s&#39; &quot;$output&quot; | tr &#39;\n|&#39; &#39;  &#39;)&quot;
+
+  if [ &quot;$rc&quot; -eq 0 ]; then
+    status=&#39;OK&#39;
+  else
+    status=&#39;FAIL&#39;
+  fi
+
+  printf &#39;%s|%s|%s|%s|rc=%s %s\n&#39; \
+    &quot;$epoch&quot; \
+    &quot;$iso_time&quot; \
+    &quot;$probe_type&quot; \
+    &quot;$status&quot; \
+    &quot;$rc&quot; \
+    &quot;$output&quot; \
+    &gt;&gt; &quot;$log_file&quot;
+
+  sleep 0.2
+done
+</code></pre>
+<p>按 <code>Ctrl+O</code>、<code>Enter</code> 儲存，再按 <code>Ctrl+X</code> 離開：</p>
+<pre><code class="language-bash">chmod 750 \
+  /home/labadmin/day26-rto/probe.sh
+
+bash -n \
+  /home/labadmin/day26-rto/probe.sh
+</code></pre>
+<p>腳本只有在 Web 回應包含 <code>&quot;status&quot;:&quot;ok&quot;</code>、DB-RW 回傳 <code>f</code>、DB-RO 回傳 <code>t</code> 時記為 <code>OK</code>；內容或資料庫角色不符時，會以 <code>rc=4</code> 記錄。</p>
+<h3>2.3 建立 start-run.sh</h3>
+<pre><code class="language-bash">nano \
+  /home/labadmin/day26-rto/start-run.sh
+</code></pre>
+<p>完整貼入：</p>
+<pre><code class="language-bash">#!/bin/bash
+set -eu
+
+base_dir=&#39;/home/labadmin/day26-rto&#39;
+scenario=&quot;${1:?usage: start-run.sh nginx|haproxy|vm}&quot;
+stamp=&quot;$(date +%Y%m%d-%H%M%S)&quot;
+run_dir=&quot;${base_dir}/runs/${scenario}-${stamp}&quot;
+
+case &quot;$scenario&quot; in
+  nginx)
+    probe_types=&#39;web&#39;
+    ;;
+  haproxy)
+    probe_types=&#39;rw ro&#39;
+    ;;
+  vm)
+    probe_types=&#39;web rw ro&#39;
+    ;;
+  *)
+    echo &#39;usage: start-run.sh nginx|haproxy|vm&#39; &gt;&amp;2
+    exit 2
+    ;;
+esac
+
+mkdir -p &quot;$run_dir&quot;
+
+for probe_type in $probe_types; do
+  nohup \
+    &quot;$base_dir/probe.sh&quot; \
+    &quot;$probe_type&quot; \
+    &quot;$run_dir&quot; \
+    &gt;/dev/null 2&gt;&amp;1 &amp;
+
+  printf &#39;%s\n&#39; &quot;$!&quot; \
+    &gt; &quot;${run_dir}/${probe_type}.pid&quot;
+done
+
+printf &#39;%s\n&#39; &quot;$run_dir&quot;
+</code></pre>
+<p>儲存後執行：</p>
+<pre><code class="language-bash">chmod 750 \
+  /home/labadmin/day26-rto/start-run.sh
+
+bash -n \
+  /home/labadmin/day26-rto/start-run.sh
+</code></pre>
+<h3>2.4 建立 stop-run.sh</h3>
+<pre><code class="language-bash">nano \
+  /home/labadmin/day26-rto/stop-run.sh
+</code></pre>
+<p>完整貼入：</p>
+<pre><code class="language-bash">#!/bin/bash
+set -eu
+
+run_dir=&quot;${1:?usage: stop-run.sh RUN_DIR}&quot;
+
+for pid_file in &quot;$run_dir&quot;/*.pid; do
+  [ -e &quot;$pid_file&quot; ] || continue
+
+  pid=&quot;$(cat &quot;$pid_file&quot;)&quot;
+  kill &quot;$pid&quot; 2&gt;/dev/null || true
+done
+
+sleep 1
+
+printf &#39;stopped_run=%s\n&#39; &quot;$run_dir&quot;
+</code></pre>
+<p>儲存後執行：</p>
+<pre><code class="language-bash">chmod 750 \
+  /home/labadmin/day26-rto/stop-run.sh
+
+bash -n \
+  /home/labadmin/day26-rto/stop-run.sh
+</code></pre>
+<h3>2.5 建立 analyze-run.sh</h3>
+<pre><code class="language-bash">nano \
+  /home/labadmin/day26-rto/analyze-run.sh
+</code></pre>
+<p>完整貼入：</p>
+<pre><code class="language-bash">#!/bin/bash
+set -eu
+
+run_dir=&quot;${1:?usage: analyze-run.sh RUN_DIR FAULT_EPOCH}&quot;
+fault_epoch=&quot;${2:?usage: analyze-run.sh RUN_DIR FAULT_EPOCH}&quot;
+
+printf &#39;run_dir=%s\n&#39; &quot;$run_dir&quot;
+printf &#39;fault_epoch=%s\n&#39; &quot;$fault_epoch&quot;
+
+for log_file in &quot;$run_dir&quot;/*.log; do
+  [ -e &quot;$log_file&quot; ] || continue
+
+  endpoint=&quot;$(basename &quot;$log_file&quot; .log)&quot;
+
+  awk \
+    -F &#39;|&#39; \
+    -v fault=&quot;$fault_epoch&quot; \
+    -v endpoint=&quot;$endpoint&quot; &#39;
+      ($1 + 0) &lt; (fault + 0) {
+        next
+      }
+
+      $4 == &quot;FAIL&quot; {
+        if (!saw_failure) {
+          saw_failure=1
+          first_failure_epoch=$1
+          first_failure_iso=$2
+        }
+
+        consecutive_ok=0
+        candidate_epoch=&quot;&quot;
+        candidate_iso=&quot;&quot;
+        next
+      }
+
+      $4 == &quot;OK&quot; &amp;&amp; !saw_failure {
+        if (pre_failure_ok == 0) {
+          first_three_ok_epoch=$1
+          first_three_ok_iso=$2
+        }
+
+        pre_failure_ok++
+
+        if (pre_failure_ok &gt;= 3 &amp;&amp; confirmed_three_ok_epoch == &quot;&quot;) {
+          confirmed_three_ok_epoch=first_three_ok_epoch
+          confirmed_three_ok_iso=first_three_ok_iso
+        }
+
+        next
+      }
+
+      $4 == &quot;OK&quot; &amp;&amp; saw_failure &amp;&amp; stable_recovery_epoch == &quot;&quot; {
+        if (consecutive_ok == 0) {
+          candidate_epoch=$1
+          candidate_iso=$2
+        }
+
+        consecutive_ok++
+
+        if (consecutive_ok &gt;= 3) {
+          stable_recovery_epoch=candidate_epoch
+          stable_recovery_iso=candidate_iso
+        }
+      }
+
+      END {
+        printf &quot;endpoint=%s\n&quot;, endpoint
+
+        if (!saw_failure) {
+          print &quot;observed_failure=no&quot;
+
+          if (confirmed_three_ok_epoch != &quot;&quot;) {
+            printf &quot;first_three_ok_after_fault=%s\n&quot;, confirmed_three_ok_iso
+            printf &quot;fault_to_first_three_ok=%.3f_seconds\n&quot;, \
+              confirmed_three_ok_epoch-fault
+          } else {
+            print &quot;first_three_ok_after_fault=not_found&quot;
+          }
+
+          print &quot;visible_interruption=not_observed&quot;
+        } else {
+          print &quot;observed_failure=yes&quot;
+          printf &quot;first_failure=%s\n&quot;, first_failure_iso
+
+          if (stable_recovery_epoch == &quot;&quot;) {
+            print &quot;stable_recovery=not_found&quot;
+          } else {
+            printf &quot;stable_recovery=%s\n&quot;, stable_recovery_iso
+            printf &quot;fault_to_stable_recovery=%.3f_seconds\n&quot;, \
+              stable_recovery_epoch-fault
+            printf &quot;visible_interruption=%.3f_seconds\n&quot;, \
+              stable_recovery_epoch-first_failure_epoch
+          }
+        }
+
+        print &quot;---&quot;
+      }
+    &#39; \
+    &quot;$log_file&quot;
+done
+</code></pre>
+<p>儲存後執行：</p>
+<pre><code class="language-bash">chmod 750 \
+  /home/labadmin/day26-rto/analyze-run.sh
+
+bash -n \
+  /home/labadmin/day26-rto/analyze-run.sh
+</code></pre>
+<p>四個 <code>bash -n</code> 都沒有輸出才繼續。</p>
+<h2>三、量測 Nginx 故障</h2>
+<h3>3.1 在 proxy01 恢復正常基準</h3>
+<pre><code class="language-bash">hostname
+
+sudo systemctl start \
+  nginx \
+  haproxy \
+  keepalived
+
+sleep 10
+
+systemctl is-active \
+  nginx \
+  haproxy \
+  keepalived
+
+ip -br address show dev eth0
+</code></pre>
+<p>proxy01 應持有 <code>10.77.20.10</code>、<code>10.77.20.11</code>、<code>10.77.20.12</code>。</p>
+<h3>3.2 在 client01 啟動 Web 探測</h3>
+<pre><code class="language-bash">RUN_DIR=&quot;$(
+  /home/labadmin/day26-rto/start-run.sh nginx
+)&quot;
+
+printf &#39;RUN_DIR=%s\n&#39; &quot;$RUN_DIR&quot;
+
+sleep 5
+
+tail -n 5 \
+  &quot;$RUN_DIR/web.log&quot;
+</code></pre>
+<p>最後五行應為 <code>web|OK</code>。</p>
+<h3>3.3 在 proxy01 停止 Nginx</h3>
+<pre><code class="language-bash">FAULT_EPOCH=&quot;$(date +%s.%N)&quot;
+
+printf &#39;FAULT_EPOCH=%s\n&#39; &quot;$FAULT_EPOCH&quot;
+date --iso-8601=ns
+
+sudo systemctl stop nginx
+
+systemctl is-active nginx || true
+</code></pre>
+<p>複製完整 <code>FAULT_EPOCH</code>。</p>
+<h3>3.4 在 client01 分析結果</h3>
+<p>等待至少 20 秒，再執行：</p>
+<pre><code class="language-bash">/home/labadmin/day26-rto/stop-run.sh \
+  &quot;$RUN_DIR&quot;
+</code></pre>
+<p>把下一行換成本次 Nginx 故障的數值：</p>
+<pre><code class="language-bash">FAULT_EPOCH=&#39;請貼上本次 Nginx 停止時的完整數值&#39;
+
+/home/labadmin/day26-rto/analyze-run.sh \
+  &quot;$RUN_DIR&quot; \
+  &quot;$FAULT_EPOCH&quot; |
+  tee &quot;$RUN_DIR/result.txt&quot;
+</code></pre>
+<p>📷 截圖完整結果。若顯示 <code>observed_failure=no</code>，這是有效結果，不必重做到出現失敗。</p>
+<p>完成後在 proxy01 恢復：</p>
+<pre><code class="language-bash">sudo systemctl start nginx
+sleep 10
+systemctl is-active nginx
+ip -br address show dev eth0
+</code></pre>
+<h2>四、量測 HAProxy 故障</h2>
+<h3>4.1 在 client01 啟動 RW 與 RO 探測</h3>
+<pre><code class="language-bash">RUN_DIR=&quot;$(
+  /home/labadmin/day26-rto/start-run.sh haproxy
+)&quot;
+
+printf &#39;RUN_DIR=%s\n&#39; &quot;$RUN_DIR&quot;
+
+sleep 5
+
+tail -n 3 &quot;$RUN_DIR/rw.log&quot;
+tail -n 3 &quot;$RUN_DIR/ro.log&quot;
+</code></pre>
+<p>RW 應為 <code>OK</code> 且內容包含 <code>f</code>；RO 應為 <code>OK</code> 且內容包含 <code>t</code>。</p>
+<h3>4.2 在 proxy01 停止 HAProxy</h3>
+<pre><code class="language-bash">FAULT_EPOCH=&quot;$(date +%s.%N)&quot;
+
+printf &#39;FAULT_EPOCH=%s\n&#39; &quot;$FAULT_EPOCH&quot;
+date --iso-8601=ns
+
+sudo systemctl stop haproxy
+
+systemctl is-active haproxy || true
+</code></pre>
+<p>複製完整 <code>FAULT_EPOCH</code>。</p>
+<h3>4.3 在 client01 分析結果</h3>
+<p>等待至少 25 秒，再執行：</p>
+<pre><code class="language-bash">/home/labadmin/day26-rto/stop-run.sh \
+  &quot;$RUN_DIR&quot;
+</code></pre>
+<p>把下一行換成本次 HAProxy 故障的數值：</p>
+<pre><code class="language-bash">FAULT_EPOCH=&#39;請貼上本次 HAProxy 停止時的完整數值&#39;
+
+/home/labadmin/day26-rto/analyze-run.sh \
+  &quot;$RUN_DIR&quot; \
+  &quot;$FAULT_EPOCH&quot; |
+  tee &quot;$RUN_DIR/result.txt&quot;
+</code></pre>
+<p>📷 截圖需包含 <code>endpoint=ro</code> 與 <code>endpoint=rw</code> 的完整結果。</p>
+<p>完成後在 proxy01 恢復：</p>
+<pre><code class="language-bash">sudo systemctl start haproxy
+sleep 10
+systemctl is-active haproxy
+ip -br address show dev eth0
+</code></pre>
+<h2>五、量測 proxy01 VM 正常關機</h2>
+<h3>5.1 在 client01 啟動三組探測</h3>
+<pre><code class="language-bash">RUN_DIR=&quot;$(
+  /home/labadmin/day26-rto/start-run.sh vm
+)&quot;
+
+printf &#39;RUN_DIR=%s\n&#39; &quot;$RUN_DIR&quot;
+
+sleep 5
+
+tail -n 3 &quot;$RUN_DIR/web.log&quot;
+tail -n 3 &quot;$RUN_DIR/rw.log&quot;
+tail -n 3 &quot;$RUN_DIR/ro.log&quot;
+</code></pre>
+<p>三組都應為 <code>OK</code>。</p>
+<h3>5.2 在任一 PVE 節點找出 VM 201 所在節點</h3>
+<pre><code class="language-bash">PROXY01_NODE=&quot;$(
+  pvesh get \
+    /cluster/resources \
+    --type vm \
+    --output-format json |
+  perl -MJSON::PP -0777 -ne &#39;
+    $resources = decode_json($_);
+
+    for $resource (@$resources) {
+      if (($resource-&gt;{type} // &quot;&quot;) eq &quot;qemu&quot; &amp;&amp;
+          ($resource-&gt;{vmid} // 0) == 201) {
+        print $resource-&gt;{node};
+        last;
+      }
+    }
+  &#39;
+)&quot;
+
+printf &#39;PROXY01_NODE=%s\n&#39; &quot;$PROXY01_NODE&quot;
+
+if [ -z &quot;$PROXY01_NODE&quot; ]; then
+  echo &#39;ERROR: VM 201 was not found in cluster resources&#39; &gt;&amp;2
+else
+  pvesh get \
+    &quot;/nodes/${PROXY01_NODE}/qemu/201/status/current&quot;
+fi
+</code></pre>
+<p>結果應顯示 <code>PROXY01_NODE=實際節點名稱</code>，並列出 VM 201 的目前狀態。若顯示 <code>ERROR</code>，先不要執行關機步驟。</p>
+<h3>5.3 在同一台 PVE 正常關閉 VM 201</h3>
+<pre><code class="language-bash">FAULT_EPOCH=&quot;$(date +%s.%N)&quot;
+
+printf &#39;FAULT_EPOCH=%s\n&#39; &quot;$FAULT_EPOCH&quot;
+date --iso-8601=ns
+
+pvesh create \
+  &quot;/nodes/${PROXY01_NODE}/qemu/201/status/shutdown&quot; \
+  --timeout 60
+
+pvesh get \
+  &quot;/nodes/${PROXY01_NODE}/qemu/201/status/current&quot;
+</code></pre>
+<p>複製完整 <code>FAULT_EPOCH</code>。</p>
+<h3>5.4 在 client01 分析結果</h3>
+<p>等待至少 30 秒，再執行：</p>
+<pre><code class="language-bash">/home/labadmin/day26-rto/stop-run.sh \
+  &quot;$RUN_DIR&quot;
+</code></pre>
+<p>把下一行換成本次 VM 關機的數值：</p>
+<pre><code class="language-bash">FAULT_EPOCH=&#39;請貼上本次 VM 關機時的完整數值&#39;
+
+/home/labadmin/day26-rto/analyze-run.sh \
+  &quot;$RUN_DIR&quot; \
+  &quot;$FAULT_EPOCH&quot; |
+  tee &quot;$RUN_DIR/result.txt&quot;
+</code></pre>
+<p>📷 截圖需包含 <code>endpoint=ro</code>、<code>endpoint=rw</code> 與 <code>endpoint=web</code> 的完整結果。</p>
+<h3>5.5 重新啟動 proxy01</h3>
+<p>在 PVE 執行：</p>
+<pre><code class="language-bash">pvesh create \
+  &quot;/nodes/${PROXY01_NODE}/qemu/201/status/start&quot;
+
+pvesh get \
+  &quot;/nodes/${PROXY01_NODE}/qemu/201/status/current&quot;
+</code></pre>
+<p>等待 proxy01 開機，再於 proxy01 執行：</p>
+<pre><code class="language-bash">hostname
+
+systemctl is-active \
+  nginx \
+  haproxy \
+  keepalived
+
+sleep 10
+
+ip -br address show dev eth0
+</code></pre>
+<h2>六、彙整測試結果</h2>
+<p>在 client01 執行：</p>
+<pre><code class="language-bash">find \
+  /home/labadmin/day26-rto/runs \
+  -name result.txt \
+  -type f \
+  -print \
+  -exec cat {} \;
+</code></pre>
+<p>將輸出與 <code>/home/labadmin/day26-rto/runs/</code> 下的原始 Log 一起保存，才能回頭核對自動分析結果。</p>
+<h3>本次實測結果</h3>
+<table>
+<thead>
+<tr>
+<th>故障情境</th>
+<th>入口</th>
+<th align="right">故障到穩定恢復</th>
+<th align="right">可見中斷</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>停止 proxy01 Nginx</td>
+<td>Web</td>
+<td align="right">7.398 秒</td>
+<td align="right">7.206 秒</td>
+</tr>
+<tr>
+<td>停止 proxy01 HAProxy</td>
+<td>DB-RO</td>
+<td align="right">7.246 秒</td>
+<td align="right">7.086 秒</td>
+</tr>
+<tr>
+<td>停止 proxy01 HAProxy</td>
+<td>DB-RW</td>
+<td align="right">7.246 秒</td>
+<td align="right">7.080 秒</td>
+</tr>
+<tr>
+<td>正常關閉 proxy01 VM</td>
+<td>DB-RO</td>
+<td align="right">4.959 秒</td>
+<td align="right">1.247 秒</td>
+</tr>
+<tr>
+<td>正常關閉 proxy01 VM</td>
+<td>DB-RW</td>
+<td align="right">5.185 秒</td>
+<td align="right">1.512 秒</td>
+</tr>
+<tr>
+<td>正常關閉 proxy01 VM</td>
+<td>Web</td>
+<td align="right">5.028 秒</td>
+<td align="right">1.216 秒</td>
+</tr>
+</tbody></table>
+<p><img src="../../source/Day26/day26-extra-nginx-rto.png" alt="停止 Nginx 後 Web VIP 的故障切換時間"></p>
+<p>圖（一）停止 proxy01 的 Nginx 後，腳本量出 Web 入口的第一次失敗與穩定恢復時間</p>
+<p><img src="../../source/Day26/day26-extra-haproxy-rto.png" alt="停止 HAProxy 後兩組資料庫 VIP 的故障切換時間"></p>
+<p>圖（二）停止 proxy01 的 HAProxy 後，DB-RW 與 DB-RO 一起接管並維持正確角色</p>
+<p><img src="../../source/Day26/day26-extra-vm-shutdown-rto.png" alt="正常關閉 proxy01 後三組 VIP 的故障切換時間"></p>
+<p>圖（三）PVE 正常關閉 proxy01 後，三組入口都由 proxy02 接管</p>
+<p><img src="../../source/Day26/day26-extra-results.png" alt="三次故障切換測試的分析結果彙整"></p>
+<p>圖（四）三次 <code>result.txt</code> 的完整彙整結果</p>
+<p>故障注入發生在 proxy01 或 PVE，穩定恢復時間由 client01 記錄，因此「故障到穩定恢復」以測試前各端已完成時間同步為前提。「可見中斷」的起點與終點都來自 client01，同一主機內的時間差不受跨主機時鐘偏差影響。</p>
+<p>Nginx 與 HAProxy 停止後幾乎立即出現探測失敗，因此故障到穩定恢復與可見中斷相差約 0.2 秒。VM 正常關機時，停止命令送出後會有一段可服務時間；故障注入到穩定恢復約為 5 秒，用戶端真正觀察到的中斷則介於 1.216 至 1.512 秒。</p>
+<p>這些數值只代表本次硬體、VRRP 計時器、健康檢查、網路與 0.2 秒探測條件。突然斷電、網路分割、較高負載或不同重試策略都可能得到不同結果。若要與 RTO 比較，應先定義目標值，再以相同方法重複量測多次。</p>
+</main></body>
+</html>

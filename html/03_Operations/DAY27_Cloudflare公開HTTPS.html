@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 27｜將私有雲服務安全發布至網際網路：Cloudflare DNS、CDN、WAF 與 Full (strict)</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 27｜將私有雲服務安全發布至網際網路：Cloudflare DNS、CDN、WAF 與 Full (strict)</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 27｜將私有雲服務安全發布至網際網路：Cloudflare DNS、CDN、WAF 與 Full (strict)</a></p>
+<p>完成建置後，可接著執行 <a href="./DAY27_%E9%A1%8D%E5%A4%96%E5%AF%A6%E4%BD%9C_%E5%85%AC%E9%96%8BHTTPS%E9%A9%97%E8%AD%89%E8%88%87%E6%95%85%E9%9A%9C%E6%81%A2%E5%BE%A9%E9%87%8F%E6%B8%AC.md">Day 27 額外實作｜公開 HTTPS 驗證與故障恢復量測</a>，補齊完整證據鏈與恢復時間。</p>
+<p>本日沿用既有的 Nginx／Web Backend 與 Web VIP <code>10.77.20.10</code>，新增公開 DNS、Cloudflare Proxy、Origin TLS、WAN TCP 443 與外部驗證。</p>
+<h2>本日操作順序</h2>
+<ol>
+<li>在 GoDaddy 搜尋並購買根網域，完成帳號與聯絡資料驗證。</li>
+<li>記錄正式網域、Origin 公網 IPv4、DDNS Hostname 與目前狀態。</li>
+<li>將網域的權威 DNS 從 GoDaddy 委派給 Cloudflare。</li>
+<li>依公網位址的維護方式建立橘雲 A 或 CNAME Record，但先不宣告完成。</li>
+<li>建立 Cloudflare Origin Certificate，安全部署到 proxy01、proxy02。</li>
+<li>讓兩台 Nginx 同時提供正式 Hostname 的 TCP 443。</li>
+<li>在 OPNsense 只允許 Cloudflare IPv4 網段進入 Origin TCP 443。</li>
+<li>啟用 Full (strict)，並讓 Nginx 安全還原 Client IP。</li>
+<li>從真正外部網路測試公開 HTTPS、Origin Bypass 與 Proxy 接管。</li>
+</ol>
+<h2>0. 前置條件與參數</h2>
+<p>本日需要以下條件：</p>
+<ul>
+<li>已有 GoDaddy 帳號與可收信的聯絡電子郵件；已持有網域者可略過第 1 節。</li>
+<li>上網路徑具有可從網際網路連入的公網 IPv4。</li>
+<li><code>web.lab.home</code> 已解析到 <code>10.77.20.10</code>，內部 HTTP Health Check 正常。</li>
+<li>proxy01 為 <code>10.77.20.21</code>，proxy02 為 <code>10.77.20.22</code>。</li>
+<li>兩台 Nginx、Keepalived 與 Web Backend 都為 Active。</li>
+</ul>
+<p>實作前先決定公開 Hostname。下文使用 <code>app.example.com</code>，請在貼上指令或設定前改成自己的真實網域。不要把 <code>example.com</code> 原樣保留在實機設定。本日只需購買 <code>example.com</code> 這類根網域；<code>app.example.com</code> 是後續由 DNS Record 建立的子網域，不需另行購買。</p>
+<p>記錄下列參數，但不要把真實公網 IPv4、憑證私鑰或 Cloudflare Token 提交到 Git：</p>
+<pre><code class="language-text">公開 Hostname：app.example.com
+Origin 公網 IPv4：實際公網 IPv4
+公網位址由固定 A Record 或 DDNS 維護：A／DDNS
+DDNS Hostname（未使用則留空）：例如 origin-ddns.example.net
+OPNsense WAN 是否直接持有公網 IPv4：是／否
+上游路由器是否另做 Port Forward：是／否
+</code></pre>
+<p>在 client01 確認當前內部服務：</p>
+<pre><code class="language-bash">sudo apt update
+sudo apt install -y curl dnsutils
+getent hosts web.lab.home
+curl -fsS http://web.lab.home/health
+</code></pre>
+<p>在 proxy01、proxy02 各自確認：</p>
+<pre><code class="language-bash">sudo nginx -t
+systemctl is-active nginx keepalived
+ip -br address show eth0
+</code></pre>
+<p>先在 OPNsense 進入 <code>System</code> → <code>Configuration</code> → <code>Backups</code>，下載當前 <code>config.xml</code>。再記錄 GoDaddy 原 Nameserver、DNSSEC 狀態與現有 DNS Record，這些是委派失敗時的回復依據。</p>
+<h2>1. 在 GoDaddy 購買網域</h2>
+<p>已持有可修改 Nameserver 的網域時，直接進入第 2 節。本節只購買網域註冊服務，不購買 GoDaddy 網站主機、網站建置工具、企業信箱或 SSL 憑證。後續會由 Cloudflare 提供公開 Edge TLS，並使用 Cloudflare Origin Certificate 保護 Cloudflare 到 Nginx 的連線。</p>
+<h3>1.1 登入帳號並搜尋根網域</h3>
+<ol>
+<li>開啟 <a href="https://www.godaddy.com/domains">GoDaddy 網域搜尋</a>，登入已有帳號，或建立一個新帳號。</li>
+<li>帳號使用可長期接收續約、驗證與安全通知的電子郵件，並啟用兩步驗證。</li>
+<li>在搜尋欄輸入想註冊的根網域，例如 <code>ironlab-example.com</code>。不要輸入 <code>https://</code>、路徑或 <code>app.</code> 子網域。</li>
+<li>搜尋結果顯示可註冊後，再次檢查拼字與頂級網域（例如 <code>.com</code>），然後按 <code>Add to Cart</code>、<code>Make It Yours</code> 或當前畫面上的同義按鈕。</li>
+<li>不要因為搜尋結果顯示相似名稱，就把多個不需要的網域一起加入購物車。</li>
+</ol>
+<p>GoDaddy 的頁面文字會因地區、語言、帳號與促銷活動而不同。以「選擇正確根網域並加入購物車」為判斷依據，不要依賴某個促銷按鈕的固定名稱。</p>
+<h3>1.2 檢查註冊期間、續約價格與加購項目</h3>
+<p>進入購物車後，先不要直接付款，逐項檢查：</p>
+<ol>
+<li>網域名稱與頂級網域完全正確。網域註冊完成後，不能像一般商品一樣直接改名。</li>
+<li>註冊年限符合需求。部分首年促銷需要一次購買多年，不能只看首年顯示價格。</li>
+<li>同時檢查「今日應付總額」與「後續每年續約價格」，並確認幣別、稅額與折扣條件。</li>
+<li>根據自己的續約政策決定是否啟用自動續約。若關閉，必須自行維護到期提醒；若啟用，必須維護有效的付款方式。</li>
+<li>移除本 Lab 不需要的網站主機、網站建置工具、企業信箱、付費 SSL 憑證與其他加購項目。</li>
+<li>區分 Domain Privacy 與 Domain Protection。符合資格的 GoDaddy 網域會有基本 Domain Privacy，用來隱藏公開 WHOIS 中的註冊人聯絡資料；額外的 Domain Protection 是可選付費保護，會對更換 Nameserver 等高風險操作加上身分驗證。</li>
+</ol>
+<p>本日需要改用 Cloudflare Nameserver；若購買 Domain Protection，第 3 節修改 Nameserver 時會多一次一次性密碼或兩步驗證，這是預期行為，不需關閉保護。</p>
+<h3>1.3 完成付款</h3>
+<ol>
+<li>進入 <code>Checkout</code>，填寫或選擇付款方式與帳單資料。</li>
+<li>付款前最後核對網域拼字、註冊期間、自動續約、加購項目與應付總額。</li>
+<li>送出訂單後等待付款完成頁面，保留收據與訂單編號。付款卡號、帳單地址、電話、電子郵件與訂單編號均不得加入文件或提交至 Git。</li>
+</ol>
+<h3>1.4 驗證網域已進入帳號</h3>
+<ol>
+<li>進入 GoDaddy <code>Domain Portfolio</code>，確認剛購買的根網域已出現。</li>
+<li>開啟該網域的 <code>Domain Settings</code>，核對到期日、自動續約狀態、聯絡資料、Domain Privacy 與 Domain Protection 狀態。</li>
+<li>若帳號顯示聯絡資料驗證提示，在 <code>Domain Portfolio</code> 重新傳送確認信，再到註冊人信箱按下驗證連結。新註冊資料未經驗證時，網域可能顯示等待驗證狀態。</li>
+<li>進入 <code>DNS</code> 或 Nameservers 管理畫面，確認自己對該網域具有變更 Nameserver 的權限。這一步不建立 GoDaddy 網站，也不需要先設定 GoDaddy 主機空間。</li>
+</ol>
+<p>完成條件是：根網域出現在 <code>Domain Portfolio</code>、聯絡資料已驗證，並可以進入 Nameserver 管理畫面。接下來才把這個網域加入 Cloudflare。</p>
+<h2>2. 將既有網域連接到 Cloudflare</h2>
+<p>本節將 Cloudflare 設為這個網域的權威 DNS 與 Reverse Proxy；GoDaddy 繼續管理網域註冊、續約與付款。</p>
+<h3>2.1 進入新增站點並選擇連接網域</h3>
+<ol>
+<li>登入 Cloudflare Dashboard，先選擇要使用的 Account。</li>
+<li>在左側進入 <code>Domains</code>／<code>網域</code>。</li>
+<li>按 <code>Add a site</code>／<code>新增站點</code>。</li>
+</ol>
+<p>進入「新增站點」後，Cloudflare 會顯示三個不同操作：</p>
+<pre><code class="language-text">連接網域
+讓您的網站更快、更安全、更可靠
+
+轉移網域
+將您的網域註冊搬遷至 Cloudflare，並節省續約費用
+
+購買網域
+以零加價費用註冊新網域
+</code></pre>
+<p>接著選取免費方案
+本日選擇 <code>連接網域</code>。這個選項會把既有的 GoDaddy 網域加入 Cloudflare，建立 Cloudflare Zone，並在後續提供要設定到 GoDaddy 的權威 Nameserver。</p>
+<p>不要選擇 <code>轉移網域</code>。該選項會把網域註冊、續約與付款關係從 GoDaddy 搬到 Cloudflare Registrar，需要網域解鎖與 Authorization Code，不屬於本日實作。也不要選擇 <code>購買網域</code>，因為第 1 節已經在 GoDaddy 完成購買。</p>
+<h3>2.2 輸入根網域與匯入選項</h3>
+<ol>
+<li>在 <code>Domain name</code>／<code>網域名稱</code> 輸入已購買的根網域，例如 <code>example.com</code> 或實際使用的 <code>xianmantang.shop</code>。</li>
+<li>不要輸入 <code>https://</code>、URL Path，也不要只輸入 <code>app.example.com</code> 這類子網域。</li>
+<li><code>Import DNS records</code>／<code>匯入 DNS 記錄</code> 選 <code>Automatic</code>／<code>自動</code>，讓 Cloudflare 先掃描現有 DNS Record。</li>
+<li><code>AI training and search policy</code>／<code>AI 訓練與搜尋政策</code> 不影響 DNS 委派、Cloudflare Proxy 或 Origin TLS。本 Lab 可以保留畫面目前值，之後再依網站內容政策調整 Search、AI Proxy 與 Training Crawler。</li>
+<li>畫面若詢問網域是否購自 Shopify、Wix 或 Block，因本系列使用 GoDaddy，選擇否或繼續一般 Domain Onboarding 流程。</li>
+<li>按 <code>Continue</code>／<code>繼續</code>，選擇要使用的 Plan；本 Lab 可使用 Free Plan。</li>
+</ol>
+<p><img src="../../source/Day27/day27-practical-fig01.png" alt="在 Cloudflare 輸入既有根網域並保留匯入選項"></p>
+<p>圖（一）在 Cloudflare 連接既有根網域；畫面中的搜尋與 AI 訓練政策不影響本次 DNS、Proxy 與 Origin TLS 設定</p>
+<p>進入下一頁後，Cloudflare 會顯示掃描到的 A、AAAA、CNAME、MX 與 TXT Record。逐筆核對，Quick Scan 不保證找到所有既有 Record。缺少的 Record 要先補齊，尤其不要在尚未確認 Mail、驗證 TXT 與其他既有服務時就更換 Nameserver。</p>
+<p><img src="../../source/Day27/day27-practical-fig02.png" alt="Cloudflare 顯示掃描後的 DNS 記錄清單"></p>
+<p>圖（二）新購網域沒有既有 DNS Record 時，清單可以是空白；已有服務的網域必須先補齊郵件與驗證記錄</p>
+<p>核對完成後繼續，記錄 Cloudflare 指派的兩個 Nameserver，例如 <code>name1.ns.cloudflare.com</code> 與 <code>name2.ns.cloudflare.com</code>。實際值以目前 Dashboard 顯示為準。</p>
+<p><img src="../../source/Day27/day27-practical-fig03.png" alt="Cloudflare 顯示需要填入註冊商的兩台名稱伺服器"></p>
+<p>圖（三）Cloudflare 為本次網域指派兩台權威名稱伺服器，兩個值都要完整複製到 GoDaddy</p>
+<p>完成本節時，Cloudflare Zone 可以先顯示 <code>Pending Nameserver Update</code> 或相近狀態。這表示 Zone 已建立，正在等待 GoDaddy 更換 Nameserver。</p>
+<p>如果 GoDaddy 目前已對這個網域啟用 DNSSEC，先依 Cloudflare 畫面指示移除註冊層的舊 DS Record，等待原 DS TTL 到期，並以 <code>dig DS example.com +short</code> 確認查無結果後，再更換 Nameserver。Zone 變成 Active 後，由 Cloudflare 啟用新 DNSSEC，並將 Cloudflare 提供的新 DS Record 加回註冊商。</p>
+<h2>3. 在 GoDaddy 變更 Nameserver</h2>
+<ol>
+<li>登入 GoDaddy，開啟 <code>Domain Portfolio</code>。</li>
+<li>選擇實際網域，進入 <code>DNS</code>。</li>
+<li>在 <code>Nameservers</code> 選擇使用自定 Nameserver。</li>
+<li>移除原 Nameserver，填入 Cloudflare 指派的兩個值。</li>
+<li>儲存後回 Cloudflare 按 <code>Check nameservers now</code>。</li>
+</ol>
+<p><img src="../../source/Day27/day27-practical-fig04.png" alt="在 GoDaddy 將名稱伺服器改為 Cloudflare 指派值"></p>
+<p>圖（四）GoDaddy 使用自訂名稱伺服器，內容與 Cloudflare 指派的兩個值一致</p>
+<p>Nameserver 委派不一定立即在所有 Resolver 生效。本次實作約等待一小時後，Cloudflare Zone 才顯示 <code>Active</code>；實際時間會受註冊商處理與 DNS 快取影響。Zone 顯示 <code>Active</code> 前，不要刪除舊 DNS 記錄或將舊服務當成已切換。</p>
+<p>從任一可使用 <code>dig</code> 的主機檢查委派：</p>
+<pre><code class="language-bash">dig NS example.com +short
+dig +trace NS example.com
+</code></pre>
+<p>輸出必須是 Cloudflare 指派的 Nameserver，而且 Cloudflare Dashboard 必須顯示 Zone <code>Active</code>。</p>
+<p><img src="../../source/Day27/day27-practical-fig05.png" alt="Cloudflare 顯示網域已啟用並受到保護"></p>
+<p>圖（五）名稱伺服器委派生效後，Cloudflare Zone 進入 Active 狀態</p>
+<h2>4. 建立橘雲公開 Record</h2>
+<p>在 Cloudflare 進入 <code>DNS</code> → <code>Records</code>。固定公網 IPv4 可建立 A Record：</p>
+<ol>
+<li>Type：<code>A</code>。</li>
+<li>Name：<code>app</code>。</li>
+<li>IPv4 address：Origin 的實際公網 IPv4。</li>
+<li>Proxy status：<code>Proxied</code>（橘雲）。</li>
+<li>TTL：<code>Auto</code>。</li>
+</ol>
+<p>本次環境的公網 IPv4 由 DDNS Hostname 維護，因此示範改用 CNAME Record：</p>
+<ol>
+<li>Type：<code>CNAME</code>。</li>
+<li>Name：<code>app</code>。</li>
+<li>Target：實際 DDNS Hostname。</li>
+<li>Proxy status：<code>Proxied</code>（橘雲）。</li>
+<li>TTL：<code>Auto</code>。</li>
+</ol>
+<p><img src="../../source/Day27/day27-practical-fig06.png" alt="在 Cloudflare 建立指向 DDNS Hostname 的橘雲 CNAME"></p>
+<p>圖（六）本次以橘雲 CNAME 指向既有 DDNS Hostname，由 DDNS 負責追蹤異動的公網 IPv4</p>
+<p>兩種方式只選一種。固定公網 IPv4 使用 A Record；會變動的公網 IPv4 先由 DDNS 更新目標 Hostname，再讓 <code>app</code> 的 CNAME 指向該名稱。Cloudflare 會預設展平 Proxied CNAME，公開查詢回覆 Cloudflare Anycast IP。DDNS Hostname 必須持續解析到目前的 Origin 公網 IPv4，避免 Cloudflare 回源到舊位址。</p>
+<p>本 Lab 的 Cloudflare 回源與 OPNsense WAN 路徑都使用 IPv4。Cloudflare IPv6 Compatibility 預設會讓橘雲主機名稱同時提供 Edge IPv6，因此外部查詢仍可能取得 Cloudflare 的 AAAA；這不表示 Origin 已具備 IPv6。日後若讓 Origin 使用 IPv6，必須一起建立 Cloudflare IPv6 Alias、OPNsense IPv6 Rule 與 Origin IPv6 Listener。</p>
+<p>在外部 Resolver 查詢：</p>
+<pre><code class="language-bash">dig app.example.com A +short
+</code></pre>
+<p>橘雲生效後，查詢結果應是 Cloudflare Anycast IPv4，不應直接顯示 Origin 公網 IPv4。這項結果只證明 DNS 與 Proxy Status；Origin HTTPS 需由後續 TLS 測試驗證。</p>
+<p><img src="../../source/Day27/day27-practical-fig07.png" alt="公開 A 查詢回覆 Cloudflare Anycast IPv4"></p>
+<p>圖（七）Proxied CNAME 經 Cloudflare 展平後，公開 A 查詢回覆 Cloudflare Anycast IPv4</p>
+<h2>5. 建立 Cloudflare Origin Certificate</h2>
+<p>在 Cloudflare 進入 <code>SSL/TLS</code> → <code>Origin Server</code>，按 <code>Create Certificate</code>：</p>
+<ol>
+<li>選擇由 Cloudflare 產生 Private Key 與 CSR。</li>
+<li>Private Key Type 使用 <code>RSA (2048)</code>，便於與常見 Nginx 環境相容。</li>
+<li>Hostnames 至少包含真實公開 Hostname，例如 <code>app.example.com</code>。</li>
+<li>選擇符合維運政策的有效期，並另外建立到期監控。</li>
+<li>按 <code>Create</code>，複製 Origin Certificate 與 Private Key。</li>
+</ol>
+<p><img src="../../source/Day27/day27-practical-fig08.png" alt="建立涵蓋根網域與萬用字元名稱的 Cloudflare Origin Certificate"></p>
+<p>圖（八）建立 RSA Origin Certificate，主機名稱涵蓋根網域與第一層子網域</p>
+<p>Private Key 只會在建立時顯示，請立即保存到受保護的位置。私鑰不得加入文件或提交至 Git。</p>
+<p>在 proxy01 建立目錄與檔案：</p>
+<pre><code class="language-bash">sudo install -d -o root -g root -m 0750 /etc/nginx/tls
+sudo nano /etc/nginx/tls/iron-origin.crt
+sudo nano /etc/nginx/tls/iron-origin.key
+</code></pre>
+<p>將 Certificate 貼入 <code>iron-origin.crt</code>，Private Key 貼入 <code>iron-origin.key</code>。按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code> 儲存後執行：</p>
+<pre><code class="language-bash">sudo chown root:root /etc/nginx/tls/iron-origin.crt /etc/nginx/tls/iron-origin.key
+sudo chmod 0644 /etc/nginx/tls/iron-origin.crt
+sudo chmod 0600 /etc/nginx/tls/iron-origin.key
+sudo openssl x509 -in /etc/nginx/tls/iron-origin.crt \
+  -noout -subject -issuer -dates -ext subjectAltName
+sudo openssl pkey -in /etc/nginx/tls/iron-origin.key -check -noout
+</code></pre>
+<p><img src="../../source/Day27/day27-practical-fig09.png" alt="驗證 Origin Certificate 的簽發者有效期名稱與私鑰"></p>
+<p>圖（九）Origin Certificate 涵蓋實際網域，私鑰檢查同時回傳 <code>Key is valid</code></p>
+<p>憑證的 Subject Alternative Name 必須包含真實公開 Hostname。接著在 proxy02 重複同一節，安裝同一張 Certificate 與對應 Private Key，檔案路徑與權限也必須一致。</p>
+<h2>6. 讓兩台 Nginx 提供 Origin HTTPS</h2>
+<h3>6.1 建立 Cloudflare Real IP 信任清單</h3>
+<p>先在 proxy01 確認 Nginx 含 Real IP Module：</p>
+<pre><code class="language-bash">sudo nginx -V 2&gt;&amp;1 | grep -- &#39;--with-http_realip_module&#39;
+</code></pre>
+<p>用 Cloudflare 官方公布的清單產生 Nginx <code>set_real_ip_from</code> 設定：</p>
+<pre><code class="language-bash">cf_realip_tmp=&quot;$(mktemp)&quot;
+{
+  curl -fsS https://www.cloudflare.com/ips-v4 |
+    sed &#39;s/^/set_real_ip_from /; s/$/;/&#39;
+  curl -fsS https://www.cloudflare.com/ips-v6 |
+    sed &#39;s/^/set_real_ip_from /; s/$/;/&#39;
+  printf &#39;%s\n&#39; \
+    &#39;real_ip_header CF-Connecting-IP;&#39; \
+    &#39;real_ip_recursive on;&#39; \
+    &quot;log_format iron_cloudflare &#39;\$remote_addr peer=\$realip_remote_addr host=\$host status=\$status request_id=\$request_id \&quot;\$request\&quot;&#39;;&quot;
+} &gt; &quot;$cf_realip_tmp&quot;
+
+sudo install -o root -g root -m 0644 \
+  &quot;$cf_realip_tmp&quot; /etc/nginx/conf.d/cloudflare-realip.conf
+rm -f &quot;$cf_realip_tmp&quot;
+
+sudo sed -n &#39;1,8p&#39; /etc/nginx/conf.d/cloudflare-realip.conf
+sudo tail -n 5 /etc/nginx/conf.d/cloudflare-realip.conf
+</code></pre>
+<p><code>real_ip_header</code> 不能單獨使用。只有 <code>set_real_ip_from</code> 列出的 Cloudflare Proxy 網段才能改寫 Client IP，否則來源可以自行偽造 <code>CF-Connecting-IP</code>。</p>
+<h3>6.2 更新 Nginx Site</h3>
+<p>在 proxy01 備份當前 Site，再開啟編輯：</p>
+<pre><code class="language-bash">sudo cp -a /etc/nginx/sites-available/iron-web \
+  /etc/nginx/sites-available/iron-web.before-day27
+sudo nano /etc/nginx/sites-available/iron-web
+</code></pre>
+<p>將檔案完整內容替換為以下設定，並把兩處 <code>app.example.com</code> 改成真實公開 Hostname：</p>
+<pre><code class="language-nginx">upstream iron_backends {
+    zone iron_backends 64k;
+    least_conn;
+    server 10.77.20.31:8080 max_fails=2 fail_timeout=5s;
+    server 10.77.20.32:8080 max_fails=2 fail_timeout=5s;
+    keepalive 16;
+}
+
+server {
+    listen 80 default_server;
+    server_name _;
+    return 444;
+}
+
+server {
+    listen 80;
+    server_name web.lab.home;
+
+    location = /health {
+        proxy_pass http://iron_backends/health;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 3s;
+    }
+
+    location / {
+        proxy_pass http://iron_backends;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 10s;
+    }
+}
+
+server {
+    listen 443 ssl default_server;
+    server_name _;
+
+    ssl_certificate     /etc/nginx/tls/iron-origin.crt;
+    ssl_certificate_key /etc/nginx/tls/iron-origin.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    return 444;
+}
+
+server {
+    listen 443 ssl;
+    server_name app.example.com;
+
+    ssl_certificate     /etc/nginx/tls/iron-origin.crt;
+    ssl_certificate_key /etc/nginx/tls/iron-origin.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    access_log /var/log/nginx/iron-web-access.log iron_cloudflare;
+
+    location = /health {
+        proxy_pass http://iron_backends/health;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Request-ID $request_id;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 3s;
+    }
+
+    location / {
+        proxy_pass http://iron_backends;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Request-ID $request_id;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 10s;
+    }
+}
+</code></pre>
+<p>驗證設定，再 Reload：</p>
+<pre><code class="language-bash">sudo nginx -t
+sudo systemctl reload nginx
+sudo systemctl status nginx --no-pager
+sudo ss -lntp | grep -E &#39;:(80|443)\s&#39;
+</code></pre>
+<p>先檢查 Nginx 回傳的憑證名稱與有效期：</p>
+<pre><code class="language-bash">openssl s_client \
+  -connect 127.0.0.1:443 \
+  -servername app.example.com \
+  &lt;/dev/null 2&gt;/dev/null |
+  openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+</code></pre>
+<p>再測試 HTTPS Listener 與 Backend。Cloudflare Origin CA 供 Cloudflare 驗證 Origin 身分，因此本機傳輸測試明確使用 <code>-k</code>；後面的 Full (strict) 會由 Cloudflare 驗證 Origin Certificate：</p>
+<pre><code class="language-bash">curl -kfsS \
+  --resolve app.example.com:443:127.0.0.1 \
+  https://app.example.com/health
+</code></pre>
+<p><img src="../../source/Day27/day27-practical-fig10.png" alt="從 Proxy 本機直接驗證 HTTPS Listener 與後端健康狀態"></p>
+<p>圖（十）以 <code>--resolve</code> 將正式 Hostname 指向本機 TCP 443，成功取得 Web Backend 健康回應</p>
+<p>在 proxy02 重複 6.1 與 6.2。兩台的 Hostname、Certificate Path、Nginx Site 與 Real IP 設定必須一致。</p>
+<h3>6.3 讓 Keepalived 檢查 HTTPS</h3>
+<p>目前的 <code>check-nginx</code> 只檢查 HTTP。加入公開 HTTPS 後，Web VIP 應該同時反映 Nginx TCP 443 與 HTTPS Health Check。</p>
+<p>proxy01 開啟：</p>
+<pre><code class="language-bash">sudo nano /usr/local/sbin/check-nginx
+</code></pre>
+<p>完整內容改為：</p>
+<pre><code class="language-bash">#!/bin/sh
+systemctl is-active --quiet nginx &amp;&amp; \
+  curl -kfsS --max-time 2 \
+    --resolve app.example.com:443:10.77.20.21 \
+    https://app.example.com/health &gt;/dev/null
+</code></pre>
+<p>proxy02 使用同一內容，但 <code>--resolve</code> 的 IP 必須是它自己的 <code>10.77.20.22</code>。兩台都要把 <code>app.example.com</code> 改成真實 Hostname。</p>
+<p>兩台各自驗證：</p>
+<pre><code class="language-bash">sudo chown root:root /usr/local/sbin/check-nginx
+sudo chmod 0750 /usr/local/sbin/check-nginx
+sudo /usr/local/sbin/check-nginx
+echo $?
+</code></pre>
+<p><img src="../../source/Day27/day27-practical-fig11.png" alt="執行 Keepalived 的 Nginx 健康檢查並取得成功狀態"></p>
+<p>圖（十一）<code>check-nginx</code> 執行後 Exit Code 為 <code>0</code>，代表本機 Nginx 與 HTTPS Health Check 通過</p>
+<p>確認 Exit Code 為 <code>0</code> 後，再繼續開放 WAN 443。</p>
+<h2>7. 在 OPNsense 建立 Cloudflare IPv4 Alias</h2>
+<p>進入 <code>Firewall</code> → <code>Aliases</code>，按 <code>Add</code>：</p>
+<ol>
+<li>Enabled：勾選。</li>
+<li>Name：<code>CLOUDFLARE_IPV4</code>。</li>
+<li>Type：<code>URL Table (IPs)</code>。</li>
+<li>Refresh Frequency：<code>1</code> Day。</li>
+<li>Content：<code>https://www.cloudflare.com/ips-v4</code>。</li>
+<li>Description：<code>Cloudflare published IPv4 proxy ranges</code>。</li>
+<li>按 <code>Save</code>，再按 <code>Apply</code>。</li>
+</ol>
+<p><img src="../../source/Day27/day27-practical-fig12.png" alt="建立自動載入 Cloudflare IPv4 網段的 OPNsense Alias"></p>
+<p>圖（十二）<code>CLOUDFLARE_IPV4</code> 使用 <code>URL Table (IPs)</code>，每日從 Cloudflare 官方網址更新 IPv4 網段</p>
+<p>此時先在 <code>Firewall</code> → <code>Aliases</code> 確認 <code>CLOUDFLARE_IPV4</code> 已啟用、Type 與 Content 正確。<code>Firewall</code> → <code>Diagnostics</code> → <code>Aliases</code> 顯示的是已載入 pf 的執行階段 Table；新建 Alias 尚未被規則引用時，左上角選單不一定會出現它。完成下一節的 NAT 與 WAN Rule 並按下 <code>Apply</code> 後，再檢查實際載入內容。</p>
+<p>本日的 DDNS Hostname 最終解析至 Origin 公網 IPv4，並建立 IPv4 WAN Rule。Nginx 保留 Cloudflare IPv6 Trusted Proxy 清單，供未來建立完整 IPv6 Origin 路徑時使用。</p>
+<h2>8. 建立 WAN TCP 443 轉送與過濾規則</h2>
+<h3>8.1 建立 Port Forward</h3>
+<p>進入 <code>Firewall</code> → <code>NAT</code> → <code>Destination NAT (Port Forward)</code>，按 <code>Add</code>：</p>
+<ol>
+<li>Interface：<code>WAN</code>。</li>
+<li>TCP/IP Version：<code>IPv4</code>。</li>
+<li>Protocol：<code>TCP</code>。</li>
+<li>Source：Alias <code>CLOUDFLARE_IPV4</code>。</li>
+<li>Source Port：<code>any</code>。</li>
+<li>Destination：<code>WAN address</code>。</li>
+<li>Destination Port：<code>443 (HTTPS)</code>。</li>
+<li>Redirect Target IP：Alias <code>WEB_VIP</code>（<code>10.77.20.10</code>）。</li>
+<li>Redirect Target Port：<code>443</code>。</li>
+<li>Log：勾選。</li>
+<li>Description：<code>DNAT_CF_HTTPS_TO_WEB_VIP</code>。</li>
+<li>按 <code>Save</code>，先不按 <code>Apply</code>。</li>
+</ol>
+<p><img src="../../source/Day27/day27-practical-fig13.png" alt="OPNsense 將 Cloudflare HTTPS 流量轉送至 Web VIP"></p>
+<p>圖（十三）Destination NAT 只接受 <code>CLOUDFLARE_IPV4</code> 來源，並將 WAN TCP 443 轉送到 <code>WEB_VIP</code></p>
+<p>新版 <code>Destination NAT</code> 將原本的 <code>Filter Rule Association</code> 改為 <code>Firewall rule</code>。本次選擇手動建立 WAN Pass Rule，由 NAT 負責目的位址轉換，WAN Rule 負責允許連線。</p>
+<h3>8.2 建立 WAN Pass Rule</h3>
+<p>進入 <code>Firewall</code> → <code>Rules</code>，介面明確選 <code>WAN</code>，按 <code>Add</code>：</p>
+<ol>
+<li>Action：<code>Pass</code>。</li>
+<li>Interface：<code>WAN</code>。</li>
+<li>Direction：<code>in</code>。</li>
+<li>TCP/IP Version：<code>IPv4</code>。</li>
+<li>Protocol：<code>TCP</code>。</li>
+<li>Source：Alias <code>CLOUDFLARE_IPV4</code>。</li>
+<li>Destination：Alias <code>WEB_VIP</code>（<code>10.77.20.10</code>）。</li>
+<li>Destination Port：<code>443 (HTTPS)</code>。</li>
+<li>Log：勾選。</li>
+<li>Description：<code>ALLOW_CF_TO_WEB_VIP_HTTPS</code>。</li>
+<li>按 <code>Save</code>。</li>
+</ol>
+<p><img src="../../source/Day27/day27-practical-fig14.png" alt="OPNsense WAN 規則只允許 Cloudflare 連向 Web VIP HTTPS"></p>
+<p>圖（十四）WAN Pass Rule 的來源為 <code>CLOUDFLARE_IPV4</code>，目的地為 <code>WEB_VIP</code> 的 HTTPS</p>
+<p>OPNsense 先做 NAT，再用轉換後的 Destination 檢查 Filter Rule，因此這條手動 WAN Rule 的 Destination 填入 <code>10.77.20.10:443</code>。</p>
+<p>將 <code>ALLOW_CF_TO_WEB_VIP_HTTPS</code> 放在 WAN 上任何可能先命中的寬鬆 Block／Pass Rule 之前，但不要把來源放寬成 <code>any</code>。本 Lab 依 pf 的隱含 Default Deny 拒絕其他來源，不需要另建一條 <code>any → 443 Block</code> 才會生效。</p>
+<p>按 <code>Apply</code>，再重新打開 WAN Rule List，確認規則位於 <code>WAN</code>。本日的 NAT 只選一個 WAN Interface，Pass Rule 也明確建立在 WAN。</p>
+<h3>8.3 確認 Cloudflare IPv4 Alias 已載入</h3>
+<p>進入 <code>Firewall</code> → <code>Diagnostics</code> → <code>Aliases</code>。部分 OPNsense 版本會將這個頁面或頁籤標示為 <code>pfTables</code>。在頁面左上角的 Alias 選單選擇 <code>CLOUDFLARE_IPV4</code>，確認下方顯示多個 Cloudflare IPv4 CIDR。</p>
+<p><img src="../../source/Day27/day27-practical-fig15.png" alt="OPNsense 執行階段已載入 Cloudflare IPv4 網段"></p>
+<p>圖（十五）Diagnostics 頁面列出 <code>CLOUDFLARE_IPV4</code> 的多個 CIDR，表示 pf Table 已載入</p>
+<p>如果左上角找不到 <code>CLOUDFLARE_IPV4</code>，先回到 <code>Firewall</code> → <code>Aliases</code> 確認下列設定，再按 <code>Save</code> 與 <code>Apply</code>：</p>
+<ul>
+<li>Enabled 已勾選。</li>
+<li>Type 是 <code>URL Table (IPs)</code>。</li>
+<li>Content 完整填入 <code>https://www.cloudflare.com/ips-v4</code>。</li>
+<li>NAT 與 WAN Rule 都已引用 <code>CLOUDFLARE_IPV4</code>。</li>
+</ul>
+<p>套用後依然沒有出現時，在 OPNsense Console 或 SSH Shell 執行：</p>
+<pre><code class="language-sh">configctl filter refresh_aliases
+pfctl -t CLOUDFLARE_IPV4 -T show
+</code></pre>
+<p>第二個命令應列出多個 CIDR。若顯示 Table 不存在，表示 Filter Rule 尚未套用或規則沒有引用此 Alias；若 Table 存在但沒有內容，則檢查 OPNsense 的 DNS、對外 HTTPS 連線，以及 URL 是否輸入正確。</p>
+<h3>8.4 公網 IPv4 位於上游路由器時</h3>
+<p>如果 OPNsense WAN 取得的是私有 IPv4，公網 IPv4 實際位於上游路由器，還要在上游路由器新增第一段 Port Forward：</p>
+<pre><code class="language-text">上游路由器公網 IPv4:443
+  → OPNsense WAN IPv4:443
+  → OPNsense DNAT
+  → Web VIP 10.77.20.10:443
+</code></pre>
+<p>上游路由器若支援來源網段條件，也限定為 Cloudflare IPv4 清單；若不支援，至少要由 OPNsense 的 <code>CLOUDFLARE_IPV4</code> Rule 做最終拒絕。如果 OPNsense WAN 直接持有公網 IPv4，不要再建立這段上游 Port Forward。</p>
+<h2>9. 啟用 Cloudflare Full (strict)</h2>
+<p>回 Cloudflare Dashboard，進入 <code>SSL/TLS</code> → <code>Overview</code>，將 Encryption Mode 設為 <code>Full (strict)</code>。</p>
+<p><img src="../../source/Day27/day27-practical-fig16.png" alt="Cloudflare 顯示目前加密模式為 Full strict"></p>
+<p>圖（十六）Cloudflare 的目前加密模式為 Full (strict)，Edge 到 Origin 會驗證 Origin 憑證</p>
+<p>不使用 <code>Flexible</code>。Flexible 只加密 Client 到 Cloudflare，Cloudflare 到 Origin 仍可能使用 HTTP，不符合本日的雙層 TLS 要求。</p>
+<p>使用行動電話行動網路或其他真正外部網路測試：</p>
+<pre><code class="language-bash">curl -I --connect-timeout 10 https://app.example.com/
+curl -fsS --connect-timeout 10 https://app.example.com/health
+</code></pre>
+<p><img src="../../source/Day27/day27-practical-fig17.png" alt="外部用戶端經 Cloudflare 取得公開 HTTPS 回應"></p>
+<p>圖（十七）外部請求取得 HTTP 200、<code>server: cloudflare</code> 與 <code>cf-ray</code>，健康檢查同時回傳後端身分</p>
+<p>預期 HTTPS 成功，<code>/health</code> 回傳 app01 或 app02。如果 Cloudflare 回傳 526，檢查兩台 Origin Certificate 的有效期、Hostname、憑證鏈與 Nginx <code>server_name</code>；不要改成 Flexible 規避錯誤。</p>
+<h2>10. 驗證 Origin 只接受 Cloudflare 路徑</h2>
+<p>這個測試必須從真正外部網路執行。將公開 Hostname 強制指向 Origin 公網 IPv4，保留正確 Host Header 與 TLS SNI：</p>
+<pre><code class="language-bash">curl -vk --connect-timeout 5 \
+  --resolve app.example.com:443:實際Origin公網IPv4 \
+  https://app.example.com/health
+</code></pre>
+<p>預期結果是 Timeout 或連線被拒，不能取得 HTTP 200。若直連 Origin 成功：</p>
+<ol>
+<li>檢查 OPNsense NAT 與 WAN Pass Rule 的 Source 是否都是 <code>CLOUDFLARE_IPV4</code>。</li>
+<li>檢查 WAN 上是否存在較前面的 <code>any → 443 Pass</code>。</li>
+<li>如果有上游路由器，確認所有公開 TCP 443 封包都會進入 OPNsense。</li>
+<li>在 <code>Firewall</code> → <code>Log Files</code> → <code>Live View</code> 以 Destination Port <code>443</code> 與 Description 過濾。</li>
+</ol>
+<p>內部 Hairpin NAT 成功或失敗都不能取代這個 WAN 負向測試。</p>
+<h2>11. 驗證 Real Client IP</h2>
+<p>從外部網路連續發出數個 Request：</p>
+<pre><code class="language-bash">for i in $(seq 1 4); do
+  curl -fsS https://app.example.com/health
+  echo
+done
+</code></pre>
+<p><img src="../../source/Day27/day27-practical-fig18.png" alt="外部用戶端連續取得兩台 Web Backend 的健康回應"></p>
+<p>圖（十八）連續公開 HTTPS 請求皆成功，回應中的 <code>backend</code> 顯示 Nginx 將請求分配給 app01 與 app02</p>
+<p>在目前持有 Web VIP 的 Proxy 查看 Access Log：</p>
+<pre><code class="language-bash">sudo tail -n 20 /var/log/nginx/iron-web-access.log
+</code></pre>
+<p>Log 中的第一個位址應是外部 Client IP，<code>peer=</code> 應是實際與 Nginx 建立 TCP 連線的 Cloudflare Proxy IP。如果兩者都是 Cloudflare IP，檢查 <code>cloudflare-realip.conf</code>；如果直連 Origin 也能任意修改 Client IP，檢查 <code>set_real_ip_from</code> 是否被放寬成任意來源。</p>
+<h2>12. 驗證 Web VIP 接管後恢復公開連線</h2>
+<p>先確認 Web VIP 當前在 proxy01：</p>
+<pre><code class="language-bash">ip -4 -o address show dev eth0 |
+  grep &#39;10.77.20.10/24&#39;
+</code></pre>
+<p><img src="../../source/Day27/day27-practical-fig19.png" alt="proxy01 目前持有 Web VIP"></p>
+<p>圖（十九）停止服務前先確認 Web VIP <code>10.77.20.10</code> 由 proxy01 持有</p>
+<p>在 proxy01 停止 Nginx：</p>
+<pre><code class="language-bash">sudo systemctl stop nginx
+</code></pre>
+<p>在 proxy02 確認 Web VIP 已移入：</p>
+<pre><code class="language-bash">ip -4 -o address show dev eth0 |
+  grep &#39;10.77.20.10/24&#39;
+sudo /usr/local/sbin/check-nginx
+echo $?
+</code></pre>
+<p>再從外部網路連續測試：</p>
+<pre><code class="language-bash">for i in $(seq 1 6); do
+  date -Is
+  curl -fsS --connect-timeout 10 https://app.example.com/health
+  sleep 1
+done
+</code></pre>
+<p>預期 Web VIP 移到 proxy02 後 HTTPS 恢復，憑證名稱與 Full (strict) 不因接管而變化。測試結束後在 proxy01 恢復：</p>
+<pre><code class="language-bash">sudo systemctl start nginx
+sudo /usr/local/sbin/check-nginx
+echo $?
+</code></pre>
+<p>等待 Keepalived 狀態穩定後，在兩台確認只有一台持有 <code>10.77.20.10</code>。</p>
+<h2>13. 回復與停止條件</h2>
+<p>遇到以下任一情況就停止擴大變更：</p>
+<ul>
+<li>Cloudflare Zone 長時間未變成 Active。</li>
+<li>原有 Mail、TXT 或其他公開 DNS Record 遺失。</li>
+<li>任一台 Nginx <code>nginx -t</code> 失敗或 HTTPS Health Check 不是 <code>0</code>。</li>
+<li>Cloudflare IP Alias 為空或無法更新。</li>
+<li>Origin Bypass 負向測試取得 HTTP 200。</li>
+</ul>
+<p>若 Nginx 設定失敗，在各 Proxy 回復變更前的 Site：</p>
+<pre><code class="language-bash">sudo cp -a /etc/nginx/sites-available/iron-web.before-day27 \
+  /etc/nginx/sites-available/iron-web
+sudo nginx -t
+sudo systemctl reload nginx
+</code></pre>
+<p>接著在 OPNsense 停用 <code>DNAT_CF_HTTPS_TO_WEB_VIP</code> 與 <code>ALLOW_CF_TO_WEB_VIP_HTTPS</code>。只有在決定放棄 Cloudflare DNS 委派，而且舊 DNS 區域已完整恢復後，才將 GoDaddy Nameserver 改回原值。不要在 DNS 記錄未恢復時只切回 Nameserver。</p>
+<h2>參考資料</h2>
+<ul>
+<li><a href="https://www.godaddy.com/domains">GoDaddy｜Search and buy available domain names</a></li>
+<li><a href="https://www.godaddy.com/help/verifying-contact-information-for-icann-validation-8948">GoDaddy｜Verifying contact information for ICANN Validation</a></li>
+<li><a href="https://www.godaddy.com/help/what-shows-in-the-whois-directory-330">GoDaddy｜What shows in the WHOIS directory?</a></li>
+<li><a href="https://www.godaddy.com/help/what-is-domain-protection-32311">GoDaddy｜What is Domain Protection?</a></li>
+<li><a href="https://www.godaddy.com/help/turn-my-domain-auto-renew-on-or-off-41085">GoDaddy｜Turn my domain auto-renew on or off</a></li>
+<li><a href="https://www.godaddy.com/en-uk/help/change-my-domain-nameservers-664">GoDaddy｜Change my domain nameservers</a></li>
+<li><a href="https://developers.cloudflare.com/dns/zone-setups/full-setup/">Cloudflare｜Set up a full DNS zone</a></li>
+<li><a href="https://developers.cloudflare.com/dns/proxy-status/">Cloudflare｜Proxy status</a></li>
+<li><a href="https://developers.cloudflare.com/dns/cname-flattening/">Cloudflare｜CNAME flattening</a></li>
+<li><a href="https://developers.cloudflare.com/network/ipv6-compatibility/">Cloudflare｜IPv6 compatibility</a></li>
+<li><a href="https://developers.cloudflare.com/ssl/origin-configuration/origin-ca/">Cloudflare｜Origin CA certificates</a></li>
+<li><a href="https://developers.cloudflare.com/ssl/origin-configuration/ssl-modes/full-strict/">Cloudflare｜Full (strict) encryption mode</a></li>
+<li><a href="https://developers.cloudflare.com/fundamentals/security/protect-your-origin-server/">Cloudflare｜Protect your origin server</a></li>
+<li><a href="https://www.cloudflare.com/ips/">Cloudflare｜IP ranges</a></li>
+<li><a href="https://docs.opnsense.org/manual/aliases.html">OPNsense｜Aliases</a></li>
+<li><a href="https://docs.opnsense.org/manual/nat.html">OPNsense｜Network Address Translation</a></li>
+<li><a href="https://docs.opnsense.org/manual/firewall.html">OPNsense｜Firewall rules</a></li>
+<li><a href="https://nginx.org/en/docs/http/ngx_http_ssl_module.html">NGINX｜SSL module</a></li>
+<li><a href="https://nginx.org/en/docs/http/ngx_http_realip_module.html">NGINX｜Real IP module</a></li>
+</ul>
+</main></body>
+</html>

@@ -35,7 +35,7 @@ app01 使用 VMID `211`，放在 pve02。
 9. 選取 `Hard Disk (scsi0)`，先記下目前容量，再按 `Disk Action` → `Resize`。
 10. app01 的目標容量為 12 GiB。GUI 的 `Size Increment (GiB)` 填的是「增加量」：若目前是 3 GiB 就填 `9`；若目前是 8 GiB 就填 `4`；若已經是 12 GiB 或更大則不要 Resize。
 11. Network Device 使用 `vmbr1`，VLAN Tag 填 `20`。
-12. 到 `Cloud-Init`，User 保留 Template 的 `labadmin`。本次 Lab 沿用你目前設定的管理密碼，`SSH public key` 不強制填寫；密碼不要寫入文件或截圖。
+12. 到 `Cloud-Init`，User 保留 Template 的 `labadmin`。本次 Lab 沿用你目前設定的管理密碼，`SSH public key` 不強制填寫；密碼不得寫入文件或提交至 Git。
 13. IP 設 `10.77.20.31/24`，Gateway 設 `10.77.20.1`。
 14. DNS 設 `10.77.20.1`，Search Domain 設 `lab.home`。
 15. 按 `Regenerate Image`，再啟動 VM。

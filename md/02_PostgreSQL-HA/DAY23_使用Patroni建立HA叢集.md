@@ -160,7 +160,7 @@ tags:
   nosync: false
 ```
 
-將三個 `password` 值換成本次 Lab 實際使用的複寫、postgres 與 Rewind 密碼。密碼不得出現在 Git、文件或公開畫面；正式環境應由設定管理系統（Configuration Management）或祕密儲存服務（Secret Store）產生設定檔。
+將三個 `password` 值換成本次 Lab 實際使用的複寫、postgres 與 Rewind 密碼。密碼不得寫入文件或提交至 Git；正式環境應由設定管理系統（Configuration Management）或祕密儲存服務（Secret Store）產生設定檔。
 
 儲存後先設定權限並驗證 pg01：
 

@@ -1,0 +1,638 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 27 額外實作｜公開 HTTPS 驗證與故障恢復量測</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 27 額外實作｜公開 HTTPS 驗證與故障恢復量測</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 27｜將私有雲服務安全發布至網際網路：Cloudflare DNS、CDN、WAF 與 Full (strict)</a></p>
+<p>本文件接續 Day 27 主實作，驗證公開 DNS、Cloudflare 代理、兩段 TLS、Origin 保護、真實用戶端 IP、Web VIP 故障接管與 WAF。主實作負責完成建置；本文件負責留下可重現的正向、負向與故障恢復證據。</p>
+<h2>0. 先準備三個實際值</h2>
+<p>下列值請換成實際環境資料：</p>
+<pre><code class="language-text">PUBLIC_ZONE：根網域，例如 example.com
+PUBLIC_HOST：公開完整主機名稱，例如 app.example.com
+ORIGIN_IPV4：OPNsense WAN 或上游轉送至 OPNsense 的公網 IPv4
+</code></pre>
+<p>外部測試必須使用 Lab 之外的網路，例如手機分享網路上的 Linux／WSL、Cloud Shell 或外部 VPS。不要在 client01、PVE 節點或內部 VLAN 執行圖（八）、圖（十）、圖（十二）、圖（十三）與圖（十四）的外部測試。</p>
+<hr>
+<h2>1. 驗證公開網域已委派給 Cloudflare</h2>
+<h3>1.1 核對 Cloudflare 與註冊商設定</h3>
+<p>不需終端命令，依序核對：</p>
+<ol>
+<li>Cloudflare Dashboard → 選擇網域 → <strong>Overview</strong>，確認狀態為 <code>Active</code>，並記下 Cloudflare 指派的兩台 Nameserver。</li>
+<li>GoDaddy → Domain Portfolio → 選擇網域 → DNS → Nameservers，確認兩台 Nameserver 與 Cloudflare 完全相同。</li>
+</ol>
+<h3>1.2 從外部解析器確認委派</h3>
+<p>執行位置：外部 Linux 測試主機。</p>
+<p>先填入實際根網域，再整段執行：</p>
+<pre><code class="language-bash">PUBLIC_ZONE=&#39;xianmantang.shop&#39;
+
+clear
+hostname
+date --iso-8601=ns
+printf &#39;public_zone=%s\n&#39; &quot;$PUBLIC_ZONE&quot;
+printf &#39;%s\n&#39; &#39;--- authoritative nameservers observed externally ---&#39;
+dig +short NS &quot;$PUBLIC_ZONE&quot; | sort
+</code></pre>
+<p>Cloudflare、註冊商與外部查詢應顯示相同的兩台名稱伺服器。</p>
+<p><img src="../../source/Day27/day27-extra-fig01.png" alt="Cloudflare 顯示網域為 Active 並指派兩台名稱伺服器"></p>
+<p><img src="../../source/Day27/day27-extra-fig02.png" alt="GoDaddy 保存 Cloudflare 指派的兩台名稱伺服器"></p>
+<p><img src="../../source/Day27/day27-extra-fig03.png" alt="外部解析器查詢到相同的名稱伺服器"></p>
+<p>圖（一）Cloudflare、GoDaddy 與外部解析器顯示一致的網域委派</p>
+<hr>
+<h2>2. 驗證橘雲改變公開 DNS 回覆與連線目的</h2>
+<p>執行位置：外部 Linux 測試主機。</p>
+<p>先填入實際值，再整段執行：</p>
+<pre><code class="language-bash">PUBLIC_ZONE=&#39;請填入實際根網域&#39;
+PUBLIC_HOST=&#39;請填入實際公開完整主機名稱&#39;
+
+DAY27_TMP_DIR=&quot;$(mktemp -d)&quot;
+
+clear
+hostname
+date --iso-8601=ns
+printf &#39;public_zone=%s\n&#39; &quot;$PUBLIC_ZONE&quot;
+printf &#39;public_host=%s\n&#39; &quot;$PUBLIC_HOST&quot;
+
+printf &#39;%s\n&#39; &#39;--- NS records ---&#39;
+dig +short NS &quot;$PUBLIC_ZONE&quot; | sort
+
+printf &#39;%s\n&#39; &#39;--- proxied A records returned to the public client ---&#39;
+dig +short A &quot;$PUBLIC_HOST&quot; | sort
+
+printf &#39;%s\n&#39; &#39;--- public HTTPS response ---&#39;
+curl -sS \
+  --connect-timeout 10 \
+  --max-time 15 \
+  -H &#39;Cache-Control: no-cache, no-store&#39; \
+  -D &quot;$DAY27_TMP_DIR/headers&quot; \
+  -o &quot;$DAY27_TMP_DIR/body&quot; \
+  -w &#39;http_code=%{http_code}\nremote_ip=%{remote_ip}\n&#39; \
+  &quot;https://${PUBLIC_HOST}/health?proof=day27-dns-$(date +%s%N)&quot;
+
+grep -Ei &#39;^(HTTP/|server:|cf-ray:|cf-cache-status:)&#39; \
+  &quot;$DAY27_TMP_DIR/headers&quot;
+printf &#39;%s\n&#39; &#39;--- response body ---&#39;
+cat &quot;$DAY27_TMP_DIR/body&quot;
+printf &#39;\n&#39;
+
+rm -rf -- &quot;$DAY27_TMP_DIR&quot;
+</code></pre>
+<p>結果應包含 NS、公開 A Record、<code>HTTP 200</code>、<code>server: cloudflare</code>、<code>cf-ray</code>、Cloudflare Remote IP，以及 <code>/health</code> 回傳的後端身分。A Record 不需與某一個固定 Cloudflare IP 完全相同；重點是它不等於 Origin 公網 IPv4。</p>
+<p><img src="../../source/Day27/day27-extra-fig04.png" alt="外部用戶端取得 Cloudflare Anycast IP 與公開 HTTPS 回應"></p>
+<p>圖（二）橘雲 DNS 回覆、Cloudflare 回應標頭與後端身分</p>
+<hr>
+<h2>3. 驗證兩台 Nginx 提供合格的 Origin HTTPS</h2>
+<p>以下命令要在 proxy01、proxy02 各執行一次。先填入同一個實際公開 Hostname。</p>
+<h3>3.1 驗證 proxy01</h3>
+<p>執行位置：proxy01。</p>
+<pre><code class="language-bash">PUBLIC_HOST=&#39;app.xianmantang.shop&#39;
+
+clear
+hostname
+date --iso-8601=ns
+
+printf &#39;%s\n&#39; &#39;--- certificate actually served by local Nginx ---&#39;
+openssl s_client \
+  -connect 127.0.0.1:443 \
+  -servername &quot;$PUBLIC_HOST&quot; \
+  &lt;/dev/null 2&gt;/dev/null |
+openssl x509 \
+  -noout \
+  -subject \
+  -issuer \
+  -dates \
+  -ext subjectAltName
+
+printf &#39;%s\n&#39; &#39;--- Nginx configuration and services ---&#39;
+sudo nginx -t 2&gt;&amp;1
+systemctl is-active nginx keepalived
+
+printf &#39;%s\n&#39; &#39;--- TCP listeners ---&#39;
+sudo ss -lntp | grep -E &#39;:(80|443)\s&#39;
+
+printf &#39;%s\n&#39; &#39;--- Keepalived Nginx health script ---&#39;
+sudo /usr/local/sbin/check-nginx
+CHECK_NGINX_RC=&quot;$?&quot;
+printf &#39;check_nginx_rc=%s\n&#39; &quot;$CHECK_NGINX_RC&quot;
+</code></pre>
+<p>結果應包含 <code>proxy01</code>、憑證 Subject／Issuer／有效期間／SAN、<code>nginx -t</code> 成功、兩個服務為 active、TCP 443 Listener 與 <code>check_nginx_rc=0</code>。</p>
+<h3>3.2 驗證 proxy02</h3>
+<p>執行位置：proxy02。完整執行與 3.1 相同的命令，確認 <code>hostname</code> 回傳 <code>proxy02</code>。</p>
+<p><img src="../../source/Day27/day27-extra-fig05.png" alt="proxy01 提供合格的 Origin Certificate 並通過 Nginx 檢查"></p>
+<p>圖（三）Origin 憑證、TCP 443 Listener 與 Nginx 健康狀態</p>
+<hr>
+<h2>4. 驗證 Full (strict) 完成兩段 TLS</h2>
+<h3>4.1 確認 Cloudflare 回源模式</h3>
+<p>Cloudflare Dashboard → 選擇網域 → SSL/TLS → Overview，確認 Encryption Mode 為 <code>Full (strict)</code>。</p>
+<h3>4.2 從外部用戶端驗證 Edge Certificate</h3>
+<p>執行位置：外部 Linux 測試主機。</p>
+<pre><code class="language-bash">PUBLIC_HOST=&#39;請填入實際公開完整主機名稱&#39;
+
+DAY27_TMP_DIR=&quot;$(mktemp -d)&quot;
+
+clear
+hostname
+date --iso-8601=ns
+printf &#39;public_host=%s\n&#39; &quot;$PUBLIC_HOST&quot;
+
+printf &#39;%s\n&#39; &#39;--- certificate served to the public client ---&#39;
+openssl s_client \
+  -connect &quot;${PUBLIC_HOST}:443&quot; \
+  -servername &quot;$PUBLIC_HOST&quot; \
+  &lt;/dev/null 2&gt;/dev/null |
+openssl x509 \
+  -noout \
+  -subject \
+  -issuer \
+  -dates \
+  -ext subjectAltName
+
+printf &#39;%s\n&#39; &#39;--- public HTTPS response ---&#39;
+curl -sS \
+  --connect-timeout 10 \
+  --max-time 15 \
+  -H &#39;Cache-Control: no-cache, no-store&#39; \
+  -D &quot;$DAY27_TMP_DIR/headers&quot; \
+  -o &quot;$DAY27_TMP_DIR/body&quot; \
+  -w &#39;http_code=%{http_code}\nremote_ip=%{remote_ip}\nssl_verify_result=%{ssl_verify_result}\n&#39; \
+  &quot;https://${PUBLIC_HOST}/health?proof=day27-edge-tls-$(date +%s%N)&quot;
+
+grep -Ei &#39;^(HTTP/|server:|cf-ray:|cf-cache-status:)&#39; \
+  &quot;$DAY27_TMP_DIR/headers&quot;
+cat &quot;$DAY27_TMP_DIR/body&quot;
+printf &#39;\n&#39;
+
+rm -rf -- &quot;$DAY27_TMP_DIR&quot;
+</code></pre>
+<p>結果應包含 Edge Certificate 的 Subject／Issuer／SAN、<code>http_code=200</code> 與 <code>ssl_verify_result=0</code>。外部測試驗證用戶端到 Cloudflare；Full (strict) Dashboard 畫面則確認 Cloudflare 到 Origin 的模式。</p>
+<p><img src="../../source/Day27/day27-extra-fig06.png" alt="Cloudflare 回源加密模式設為 Full strict"></p>
+<p><img src="../../source/Day27/day27-extra-fig07.png" alt="外部用戶端驗證 Edge Certificate 並取得 HTTP 200"></p>
+<p>圖（四）Cloudflare 回源模式與公開 Edge TLS 驗證結果</p>
+<hr>
+<h2>5. 驗證 OPNsense 只轉送 Cloudflare 來源</h2>
+<h3>5.1 核對 Alias 定義與執行階段內容</h3>
+<p>OPNsense GUI：</p>
+<ol>
+<li>Firewall → Aliases → 找到並編輯 <code>CLOUDFLARE_IPV4</code>。</li>
+<li>確認 Alias 名稱、Type、Cloudflare 官方 IPv4 清單 URL 與 Enabled 狀態。</li>
+<li>Firewall → Diagnostics → Aliases；部分版本顯示為 pfTables。</li>
+<li>選擇 <code>CLOUDFLARE_IPV4</code>，確認已載入多筆 CIDR。</li>
+</ol>
+<p>也可以從 OPNsense Console 選擇 Shell，執行下列唯讀命令補強證據：</p>
+<pre><code class="language-sh">hostname
+date
+echo &#39;--- first 20 loaded Cloudflare IPv4 CIDRs ---&#39;
+pfctl -t CLOUDFLARE_IPV4 -T show | sed -n &#39;1,20p&#39;
+echo &#39;--- loaded CIDR count ---&#39;
+pfctl -t CLOUDFLARE_IPV4 -T show | wc -l
+</code></pre>
+<h3>5.2 核對 WAN Rule 與 Port Forward</h3>
+<p>OPNsense GUI：</p>
+<ol>
+<li>Firewall → Rules → WAN。</li>
+<li>確認 <code>ALLOW_CF_TO_WEB_VIP_HTTPS</code> 的規則順序；Source 應為 <code>CLOUDFLARE_IPV4</code>、Destination 應為 <code>WEB_VIP</code>、Destination Port 應為 TCP 443。</li>
+<li>Firewall → NAT → Destination NAT／Port Forward。</li>
+<li>確認 <code>DNAT_CF_HTTPS_TO_WEB_VIP</code> 的 Source、Destination Port 443、Redirect Target <code>10.77.20.10</code> 與 Redirect Port 443。</li>
+</ol>
+<p>可在 OPNsense Shell 追加以下唯讀檢查：</p>
+<pre><code class="language-sh">hostname
+date
+echo &#39;--- WAN filter rule label ---&#39;
+pfctl -sr -v | grep -B 2 -A 3 &#39;ALLOW_CF_TO_WEB_VIP_HTTPS&#39;
+echo &#39;--- HTTPS NAT targeting the Web VIP ---&#39;
+pfctl -sn | grep -E &#39;10\.77\.20\.10.*443|443.*10\.77\.20\.10&#39;
+</code></pre>
+<p>GUI 用來核對設定，Shell 輸出補充執行階段狀態。</p>
+<p><img src="../../source/Day27/day27-extra-fig08.png" alt="OPNsense 以 Cloudflare 官方 IPv4 清單建立 Alias"></p>
+<p><img src="../../source/Day27/day27-extra-fig09.png" alt="OPNsense 已將 Cloudflare IPv4 CIDR 載入執行階段"></p>
+<p><img src="../../source/Day27/day27-extra-fig10.png" alt="WAN Rule 只允許 Cloudflare IPv4 前往 Web VIP TCP 443"></p>
+<p><img src="../../source/Day27/day27-extra-fig11.png" alt="Destination NAT 將 Cloudflare HTTPS 轉向 Web VIP"></p>
+<p>圖（五）Cloudflare Alias、WAN Rule 與 Destination NAT 共同保護 Origin</p>
+<hr>
+<h2>6. 驗證 Origin 只接受 Cloudflare 路徑</h2>
+<p>執行位置：同一台外部 Linux 測試主機。</p>
+<p>先填入實際主機名稱與 Origin 公網 IPv4。指令會在輸出前執行 <code>clear</code>，避免測試結果顯示完整 Origin IPv4。</p>
+<pre><code class="language-bash">PUBLIC_HOST=&#39;請填入實際公開完整主機名稱&#39;
+ORIGIN_IPV4=&#39;請填入實際Origin公網IPv4&#39;
+
+DAY27_TMP_DIR=&quot;$(mktemp -d)&quot;
+
+clear
+hostname
+date --iso-8601=ns
+printf &#39;public_host=%s\n&#39; &quot;$PUBLIC_HOST&quot;
+
+printf &#39;%s\n&#39; &#39;--- normal public path through Cloudflare ---&#39;
+curl -sS \
+  --connect-timeout 10 \
+  --max-time 15 \
+  -H &#39;Cache-Control: no-cache, no-store&#39; \
+  -o &quot;$DAY27_TMP_DIR/public-body&quot; \
+  -w &#39;public_http_code=%{http_code}\npublic_remote_ip=%{remote_ip}\n&#39; \
+  &quot;https://${PUBLIC_HOST}/health?proof=day27-public-$(date +%s%N)&quot;
+PUBLIC_RC=&quot;$?&quot;
+cat &quot;$DAY27_TMP_DIR/public-body&quot;
+printf &#39;\npublic_curl_rc=%s\n&#39; &quot;$PUBLIC_RC&quot;
+
+printf &#39;%s\n&#39; &#39;--- forced direct connection to Origin ---&#39;
+curl -ksS \
+  --connect-timeout 5 \
+  --max-time 8 \
+  --resolve &quot;${PUBLIC_HOST}:443:${ORIGIN_IPV4}&quot; \
+  -o &quot;$DAY27_TMP_DIR/origin-body&quot; \
+  -w &#39;origin_http_code=%{http_code}\n&#39; \
+  &quot;https://${PUBLIC_HOST}/health?proof=day27-origin-bypass-$(date +%s%N)&quot;
+ORIGIN_RC=&quot;$?&quot;
+printf &#39;origin_curl_rc=%s\n&#39; &quot;$ORIGIN_RC&quot;
+
+if [ -s &quot;$DAY27_TMP_DIR/origin-body&quot; ]; then
+  printf &#39;%s\n&#39; &#39;WARNING: Origin returned a response:&#39;
+  cat &quot;$DAY27_TMP_DIR/origin-body&quot;
+  printf &#39;\n&#39;
+else
+  printf &#39;%s\n&#39; &#39;origin_response_body=empty&#39;
+fi
+
+rm -rf -- &quot;$DAY27_TMP_DIR&quot;
+</code></pre>
+<p>預期結果：公開路徑為 <code>public_http_code=200</code>、<code>public_curl_rc=0</code>；直連 Origin 通常為 <code>origin_http_code=000</code>，並因逾時得到 <code>origin_curl_rc=28</code>，或因拒絕連線得到其他非 0 值。若 Origin 回傳 HTTP 內容，應回頭檢查上游 Port Forward、OPNsense NAT 與 WAN Rule。</p>
+<p><img src="../../source/Day27/day27-extra-fig12.png" alt="公開路徑成功且強制直連 Origin 逾時"></p>
+<p>圖（六）同一台外部主機完成公開路徑正向測試與 Origin 繞過負向測試</p>
+<hr>
+<h2>7. 驗證 Nginx 同時保存真實用戶端與 Cloudflare Peer</h2>
+<p>這項驗證以相同的 <code>proof_id</code> 對應外部請求與 Nginx Access Log。</p>
+<h3>7.1 從外部送出唯一請求</h3>
+<p>執行位置：外部 Linux 測試主機。</p>
+<pre><code class="language-bash">PUBLIC_HOST=&#39;請填入實際公開完整主機名稱&#39;
+PROOF_ID=&quot;day27-realip-$(date +%s%N)&quot;
+
+clear
+hostname
+date --iso-8601=ns
+printf &#39;public_host=%s\n&#39; &quot;$PUBLIC_HOST&quot;
+printf &#39;proof_id=%s\n&#39; &quot;$PROOF_ID&quot;
+
+printf &#39;%s\n&#39; &#39;--- client address observed by Cloudflare ---&#39;
+curl -fsS &quot;https://${PUBLIC_HOST}/cdn-cgi/trace&quot; |
+  grep -E &#39;^(ip|colo|http)=&#39;
+
+printf &#39;%s\n&#39; &#39;--- unique request sent to the Origin path ---&#39;
+curl -sS \
+  --connect-timeout 10 \
+  --max-time 15 \
+  -H &#39;Cache-Control: no-cache, no-store&#39; \
+  -D - \
+  -o /dev/null \
+  -w &#39;http_code=%{http_code}\nremote_ip=%{remote_ip}\n&#39; \
+  &quot;https://${PUBLIC_HOST}/health?proof=${PROOF_ID}&quot; |
+  grep -Ei &#39;^(HTTP/|server:|cf-ray:|cf-cache-status:|http_code=|remote_ip=)&#39;
+
+printf &#39;PROOF_ID=%s\n&#39; &quot;$PROOF_ID&quot;
+</code></pre>
+<h3>7.2 從目前 Web VIP 持有者找到同一筆 Log</h3>
+<p>先在 proxy01 與 proxy02 任一台執行以下命令，找出目前持有者：</p>
+<pre><code class="language-bash">hostname
+ip -4 address show dev eth0 | grep -F &#39;10.77.20.10/24&#39; || \
+  echo &#39;web_vip_not_on_this_node&#39;
+</code></pre>
+<p>登入持有 <code>10.77.20.10/24</code> 的 Proxy，填入相同的 <code>PROOF_ID</code> 後執行：</p>
+<pre><code class="language-bash">PROOF_ID=&#39;day27-realip-1790162539670339034&#39;
+
+clear
+hostname
+date --iso-8601=ns
+printf &#39;proof_id=%s\n&#39; &quot;$PROOF_ID&quot;
+printf &#39;%s\n&#39; &#39;--- matching Nginx access log entry ---&#39;
+sudo grep -F &quot;$PROOF_ID&quot; /var/log/nginx/iron-web-access.log | tail -n 3
+</code></pre>
+<p>同一個 <code>proof_id</code> 應能對上兩端。Nginx Log 應同時顯示真實用戶端 IP、<code>peer=</code> 的 Cloudflare 來源、Host 與 HTTP Status。</p>
+<p><img src="../../source/Day27/day27-extra-fig13.png" alt="外部用戶端送出具有唯一 proof id 的請求"></p>
+<p><img src="../../source/Day27/day27-extra-fig14.png" alt="Nginx Access Log 保存同一筆請求的用戶端與 Cloudflare Peer"></p>
+<p>圖（七）唯一 proof id 對應外部請求與 Nginx Access Log</p>
+<hr>
+<h2>8. 量測 Web VIP 接管後的公開 HTTPS 恢復時間</h2>
+<p>這項測試會短暫停止 proxy01 的 Nginx。開始前先確認 proxy01 持有 Web VIP，而且 proxy02 的 Nginx、Keepalived 都是 active。</p>
+<h3>8.1 測試前確認時間與角色</h3>
+<p>在外部測試主機、proxy01、proxy02 分別執行：</p>
+<pre><code class="language-bash">hostname
+date --iso-8601=ns
+timedatectl show -p NTPSynchronized --value
+</code></pre>
+<p>三台都應顯示正確時間。若 <code>NTPSynchronized=no</code>，先修正時間同步，再進行秒數量測。</p>
+<p>在 proxy01 與 proxy02 分別執行：</p>
+<pre><code class="language-bash">hostname
+systemctl is-active nginx keepalived
+ip -4 address show dev eth0 | grep -F &#39;10.77.20.10/24&#39; || \
+  echo &#39;web_vip_not_on_this_node&#39;
+</code></pre>
+<p>只有 proxy01 應顯示 Web VIP。若目前由 proxy02 持有，請以實際持有者作為故障注入節點，並相應交換下列節點名稱。</p>
+<h3>8.2 在外部測試主機建立完整探測腳本</h3>
+<p>執行位置：外部 Linux 測試主機。</p>
+<pre><code class="language-bash">mkdir -p &quot;$HOME/day27-proof&quot;
+
+tee &quot;$HOME/day27-proof/public-probe.sh&quot; &gt;/dev/null &lt;&lt;&#39;EOF&#39;
+#!/usr/bin/env bash
+set -u
+
+PUBLIC_HOST=&quot;${1:?usage: public-probe.sh PUBLIC_HOST [LOG_FILE]}&quot;
+LOG_FILE=&quot;${2:-$HOME/day27-proof/public-failover.log}&quot;
+
+mkdir -p &quot;$(dirname &quot;$LOG_FILE&quot;)&quot;
+: &gt; &quot;$LOG_FILE&quot;
+
+TMP_DIR=&quot;$(mktemp -d)&quot;
+cleanup() {
+  rm -rf -- &quot;$TMP_DIR&quot;
+}
+trap cleanup EXIT
+
+SEQUENCE=0
+
+while true; do
+  SEQUENCE=$((SEQUENCE + 1))
+  EPOCH=&quot;$(date +%s.%N)&quot;
+  ISO_TIME=&quot;$(date --iso-8601=ns)&quot;
+  HEADERS=&quot;$TMP_DIR/headers&quot;
+  BODY=&quot;$TMP_DIR/body&quot;
+  ERROR_FILE=&quot;$TMP_DIR/error&quot;
+
+  : &gt; &quot;$HEADERS&quot;
+  : &gt; &quot;$BODY&quot;
+  : &gt; &quot;$ERROR_FILE&quot;
+
+  HTTP_CODE=&quot;$(
+    curl -sS \
+      --connect-timeout 2 \
+      --max-time 4 \
+      -H &#39;Cache-Control: no-cache, no-store&#39; \
+      -H &#39;Pragma: no-cache&#39; \
+      -D &quot;$HEADERS&quot; \
+      -o &quot;$BODY&quot; \
+      -w &#39;%{http_code}&#39; \
+      &quot;https://${PUBLIC_HOST}/health?day27_failover=${EPOCH}-${SEQUENCE}&quot; \
+      2&gt;&quot;$ERROR_FILE&quot;
+  )&quot;
+  CURL_RC=&quot;$?&quot;
+
+  CACHE_STATUS=&quot;$(
+    awk &#39;BEGIN { IGNORECASE=1 }
+         /^cf-cache-status:/ {
+           sub(/^[^:]*:[[:space:]]*/, &quot;&quot;)
+           gsub(/\r/, &quot;&quot;)
+           print
+           exit
+         }&#39; &quot;$HEADERS&quot;
+  )&quot;
+  [ -n &quot;$CACHE_STATUS&quot; ] || CACHE_STATUS=&#39;NONE&#39;
+
+  BODY_TEXT=&quot;$(tr &#39;\r\n|&#39; &#39;   &#39; &lt; &quot;$BODY&quot; | cut -c 1-160)&quot;
+  ERROR_TEXT=&quot;$(tr &#39;\r\n|&#39; &#39;   &#39; &lt; &quot;$ERROR_FILE&quot; | cut -c 1-160)&quot;
+
+  if [ &quot;$CURL_RC&quot; -eq 0 ] &amp;&amp; [ &quot;$HTTP_CODE&quot; = &#39;200&#39; ]; then
+    if [ &quot;$CACHE_STATUS&quot; = &#39;HIT&#39; ]; then
+      STATUS=&#39;CACHE_HIT&#39;
+    else
+      STATUS=&#39;OK&#39;
+    fi
+  else
+    STATUS=&#39;FAIL&#39;
+  fi
+
+  printf &#39;%s|%s|%s|seq=%s|curl_rc=%s|http=%s|cache=%s|body=%s|error=%s\n&#39; \
+    &quot;$EPOCH&quot; \
+    &quot;$ISO_TIME&quot; \
+    &quot;$STATUS&quot; \
+    &quot;$SEQUENCE&quot; \
+    &quot;$CURL_RC&quot; \
+    &quot;$HTTP_CODE&quot; \
+    &quot;$CACHE_STATUS&quot; \
+    &quot;$BODY_TEXT&quot; \
+    &quot;$ERROR_TEXT&quot; |
+    tee -a &quot;$LOG_FILE&quot;
+
+  sleep 1
+done
+EOF
+
+chmod 750 &quot;$HOME/day27-proof/public-probe.sh&quot;
+bash -n &quot;$HOME/day27-proof/public-probe.sh&quot;
+printf &#39;probe_script_syntax=ok\n&#39;
+</code></pre>
+<h3>8.3 開始外部探測</h3>
+<p>在外部測試主機執行，並填入實際主機名稱：</p>
+<pre><code class="language-bash">PUBLIC_HOST=&#39;請填入實際公開完整主機名稱&#39;
+LOG_FILE=&quot;$HOME/day27-proof/public-failover.log&quot;
+
+clear
+hostname
+date --iso-8601=ns
+&quot;$HOME/day27-proof/public-probe.sh&quot; \
+  &quot;$PUBLIC_HOST&quot; \
+  &quot;$LOG_FILE&quot;
+</code></pre>
+<p>先確認連續出現 <code>OK</code>，保持這個終端執行。</p>
+<h3>8.4 在目前 Web VIP 持有者注入故障</h3>
+<p>開啟另一個終端登入 proxy01。若 8.1 顯示 Web VIP 由 proxy02 持有，則改在 proxy02 執行。</p>
+<pre><code class="language-bash">mkdir -p &quot;$HOME/day27-proof&quot;
+
+FAULT_EPOCH=&quot;$(date +%s.%N)&quot;
+FAULT_TIME=&quot;$(date --iso-8601=ns)&quot;
+
+{
+  printf &#39;fault_node=%s\n&#39; &quot;$(hostname)&quot;
+  printf &#39;fault_epoch=%s\n&#39; &quot;$FAULT_EPOCH&quot;
+  printf &#39;fault_time=%s\n&#39; &quot;$FAULT_TIME&quot;
+  printf &#39;fault_action=systemctl_stop_nginx\n&#39;
+} | tee &quot;$HOME/day27-proof/fault-injected.txt&quot;
+
+sudo systemctl stop nginx
+
+printf &#39;%s\n&#39; &#39;--- state five seconds after fault injection ---&#39;
+sleep 5
+hostname
+date --iso-8601=ns
+systemctl is-active nginx || true
+systemctl is-active keepalived
+ip -4 address show dev eth0 | grep -F &#39;10.77.20.10/24&#39; || \
+  echo &#39;web_vip_not_on_this_node&#39;
+
+printf &#39;FAULT_EPOCH=%s\n&#39; &quot;$FAULT_EPOCH&quot;
+</code></pre>
+<h3>8.5 確認另一台 Proxy 接管</h3>
+<p>在 proxy02 執行；若故障注入節點原本是 proxy02，則改在 proxy01 執行。</p>
+<pre><code class="language-bash">clear
+hostname
+date --iso-8601=ns
+systemctl is-active nginx keepalived
+ip -4 address show dev eth0 | grep -F &#39;10.77.20.10/24&#39; || \
+  echo &#39;ERROR_web_vip_not_on_takeover_node&#39;
+
+printf &#39;%s\n&#39; &#39;--- recent Keepalived events ---&#39;
+sudo journalctl \
+  -u keepalived \
+  --since &#39;-3 minutes&#39; \
+  --no-pager \
+  -n 30
+</code></pre>
+<h3>8.6 停止探測並計算兩種時間</h3>
+<p>外部探測恢復且至少連續出現三筆 <code>OK</code> 後，以 <code>Ctrl+C</code> 停止。將 8.4 顯示的數值貼入 <code>FAULT_EPOCH</code>，再整段執行：</p>
+<pre><code class="language-bash">FAULT_EPOCH=&#39;1790163384.222833464&#39;
+LOG_FILE=&quot;$HOME/day27-proof/public-failover.log&quot;
+
+clear
+hostname
+date --iso-8601=ns
+printf &#39;fault_epoch=%s\n&#39; &quot;$FAULT_EPOCH&quot;
+printf &#39;log_file=%s\n&#39; &quot;$LOG_FILE&quot;
+
+awk -F &#39;|&#39; -v fault=&quot;$FAULT_EPOCH&quot; &#39;
+  ($1 + 0) &lt; (fault + 0) {
+    next
+  }
+
+  $3 == &quot;FAIL&quot; &amp;&amp; first_failure == &quot;&quot; {
+    first_failure = $1
+    first_failure_line = $0
+  }
+
+  $3 == &quot;OK&quot; {
+    if (streak == 0) {
+      streak_start = $1
+      streak_start_line = $0
+    }
+
+    streak++
+
+    if (streak == 3) {
+      recovered = streak_start
+      confirmed = $1
+      recovered_line = streak_start_line
+      confirmed_line = $0
+      exit
+    }
+
+    next
+  }
+
+  {
+    streak = 0
+    streak_start = &quot;&quot;
+    streak_start_line = &quot;&quot;
+  }
+
+  END {
+    printf &quot;fault_epoch=%.9f\n&quot;, fault
+
+    if (recovered == &quot;&quot;) {
+      print &quot;ERROR=no_three_consecutive_uncached_HTTP_200_after_fault&quot;
+      exit 1
+    }
+
+    printf &quot;first_stable_recovery_epoch=%.9f\n&quot;, recovered
+    printf &quot;third_success_confirmation_epoch=%.9f\n&quot;, confirmed
+    printf &quot;fault_to_first_stable_recovery=%.3f_seconds\n&quot;, \
+      recovered - fault
+
+    if (first_failure != &quot;&quot;) {
+      printf &quot;first_observed_failure_epoch=%.9f\n&quot;, first_failure
+      printf &quot;user_visible_interruption=%.3f_seconds\n&quot;, \
+        recovered - first_failure
+      print &quot;first_failure_record=&quot; first_failure_line
+    } else {
+      print &quot;user_visible_interruption=no_failed_request_observed&quot;
+    }
+
+    print &quot;first_stable_recovery_record=&quot; recovered_line
+    print &quot;third_success_confirmation_record=&quot; confirmed_line
+  }
+&#39; &quot;$LOG_FILE&quot;
+</code></pre>
+<p>兩個時間的含義：</p>
+<ul>
+<li><code>fault_to_first_stable_recovery</code>：從停止 Nginx 到連續三筆成功中的第一筆。</li>
+<li><code>user_visible_interruption</code>：從外部觀察到第一筆失敗，到連續三筆成功中的第一筆。</li>
+<li>若沒有任何 <code>FAIL</code>，只能寫成「本次一秒取樣未觀察到失敗」，不可宣稱中斷時間為 0 秒。</li>
+<li><code>CACHE_HIT</code> 不列入成功，避免以 Cloudflare Cache 回覆代替 Origin 可用性。</li>
+</ul>
+<h3>8.7 恢復故障注入節點</h3>
+<p>回到被停止 Nginx 的 Proxy 執行：</p>
+<pre><code class="language-bash">sudo systemctl start nginx
+
+clear
+hostname
+date --iso-8601=ns
+systemctl is-active nginx keepalived
+sudo nginx -t 2&gt;&amp;1
+sudo /usr/local/sbin/check-nginx
+CHECK_NGINX_RC=&quot;$?&quot;
+printf &#39;check_nginx_rc=%s\n&#39; &quot;$CHECK_NGINX_RC&quot;
+ip -4 address show dev eth0 | grep -F &#39;10.77.20.10/24&#39; || \
+  echo &#39;web_vip_not_on_this_node&#39;
+</code></pre>
+<p>等待 Keepalived 穩定後，在兩台 Proxy 再執行一次 VIP 檢查，確認只有一台持有 <code>10.77.20.10/24</code>。</p>
+<p>故障節點與注入時間、接管節點的 Web VIP 與服務狀態，以及第一筆失敗、第一筆穩定恢復與第三筆成功確認，共同構成公開 HTTPS 恢復時間的證據鏈。</p>
+<p><img src="../../source/Day27/day27-extra-fig15.png" alt="proxy01 停止 Nginx 並記錄故障注入時間"></p>
+<p><img src="../../source/Day27/day27-extra-fig16.png" alt="proxy02 進入 MASTER 並接管 Web VIP"></p>
+<p><img src="../../source/Day27/day27-extra-fig17.png" alt="外部探測計算故障切換與使用者可見中斷時間"></p>
+<p>圖（八）故障注入、Web VIP 接管與公開 HTTPS 恢復時間</p>
+<hr>
+<h2>9. 驗證 Cloudflare WAF 阻擋受控請求</h2>
+<p>本節建立一條只匹配測試路徑的 Custom Rule，完成外部阻擋驗證後立即移除，避免測試規則長期留在正式入口。</p>
+<ol>
+<li>Cloudflare Dashboard → Security → WAF／Security rules → Custom rules。</li>
+<li>建立只用於測試的規則：</li>
+</ol>
+<pre><code class="language-text">Rule name: DAY27_WAF_PROOF
+Expression: http.request.uri.path eq &quot;/day27-waf-proof&quot;
+Action: Block
+</code></pre>
+<ol start="3">
+<li>從外部 Linux 測試主機執行：</li>
+</ol>
+<pre><code class="language-bash">PUBLIC_HOST=&#39;請填入實際公開完整主機名稱&#39;
+
+clear
+hostname
+date --iso-8601=ns
+curl -sS \
+  --connect-timeout 10 \
+  --max-time 15 \
+  -D - \
+  -o /dev/null \
+  -w &#39;http_code=%{http_code}\nremote_ip=%{remote_ip}\n&#39; \
+  &quot;https://${PUBLIC_HOST}/day27-waf-proof?proof=$(date +%s%N)&quot;
+</code></pre>
+<ol start="4">
+<li>Cloudflare Dashboard → Security → Events，依時間、主機名稱與 URI Path 篩選，核對 <code>DAY27_WAF_PROOF</code>、Block Action、Path、Ray ID 與時間。</li>
+<li>停用或刪除 <code>DAY27_WAF_PROOF</code>，再從外部測試主機確認一般 <code>/health</code> 回傳 HTTP 200：</li>
+</ol>
+<pre><code class="language-bash">curl -sS \
+  --connect-timeout 10 \
+  --max-time 15 \
+  -o /dev/null \
+  -w &#39;http_code=%{http_code}\n&#39; \
+  &quot;https://${PUBLIC_HOST}/health?proof=day27-waf-cleanup-$(date +%s%N)&quot;
+</code></pre>
+<p><img src="../../source/Day27/day27-extra-fig18.png" alt="外部受控請求命中 Cloudflare WAF 並取得 HTTP 403"></p>
+<p><img src="../../source/Day27/day27-extra-fig19.png" alt="Cloudflare Security Events 記錄對應的阻擋事件"></p>
+<p>圖（九）HTTP 403 與 Security Events 共同驗證 Custom Rule 已命中</p>
+<hr>
+<h2>10. 完成後確認</h2>
+<ul>
+<li>公開網域經 Cloudflare 取得 HTTP 200，強制直連 Origin 的請求遭到阻擋。</li>
+<li>Nginx Access Log 能以相同的 <code>proof_id</code> 對應外部請求，並分辨真實用戶端與 Cloudflare Peer。</li>
+<li>Web VIP 接管後，外部 HTTPS 探測恢復連續三次 HTTP 200。</li>
+<li><code>DAY27_WAF_PROOF</code> 已停用或刪除，一般 <code>/health</code> 回復 HTTP 200。</li>
+<li>Cloudflare API Token、Cookie 與 Origin Private Key 未寫入文件或提交至 Git。</li>
+</ul>
+</main></body>
+</html>

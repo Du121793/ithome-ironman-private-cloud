@@ -1,8 +1,18 @@
 <!doctype html>
-<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Day 24｜PostgreSQL HA 叢集實作（下）：計畫性切換、故障切換與舊 Primary 安全回歸</title><style>
-:root{--orange:#f47b20;--ink:#30343b;--line:#e6e8eb}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:#fff;font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}main{width:min(940px,calc(100% - 40px));margin:auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35}h2{margin-top:42px;padding-bottom:10px;border-bottom:1px solid var(--line)}h3{margin-top:30px}a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2}code{padding:.15em .35em;border-radius:4px;background:#f4f5f6;color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}table{width:100%;border-collapse:collapse;margin:22px 0}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
-</style></head><body><main><h1>Day 24｜PostgreSQL HA 叢集實作（下）：計畫性切換、故障切換與舊 Primary 安全回歸</h1>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 24｜PostgreSQL HA 叢集實作（下）：計畫性切換、故障切換與舊 Primary 安全回歸</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 24｜PostgreSQL HA 叢集實作（下）：計畫性切換、故障切換與舊 Primary 安全回歸</h1>
 <p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 24｜PostgreSQL HA 叢集實作（下）：計畫性切換、故障切換與舊 Primary 安全回歸</a></p>
 <p>本日使用先前串流複寫實作建立的 <code>appdb.public.replication_demo</code> 測試資料。開始前要確認 3／3 etcd 與 3／3 Patroni 成員健康，並保存目前時間軸（Timeline）、Leader 與複寫狀態。</p>
 <blockquote>
@@ -116,7 +126,7 @@ curl -i http://10.77.30.13:8008/replica
 <pre><code class="language-bash">sudo -u postgres psql -d appdb -v ON_ERROR_STOP=1 \
   -c &quot;INSERT INTO public.replication_demo(source) VALUES (&#39;day24-after-failover&#39;) RETURNING id,created_at,source;&quot;
 </code></pre>
-<p>記錄故障注入時間、新 Leader 出現時間與第一筆 SQL 寫入成功時間。這些結果只涵蓋 PostgreSQL 節點的直接路徑；完整用戶端 RTO 還要納入 Nginx、HAProxy、VIP 與應用程式重連時間。需要重現正文的秒數時，使用前言連結的額外量測文件。</p>
+<p>記錄故障注入時間、新 Leader 出現時間與第一筆 SQL 寫入成功時間。這些結果只涵蓋 PostgreSQL 節點的直接路徑；完整用戶端 RTO 還要納入 Nginx、HAProxy、VIP 與應用程式重連時間。需要精確量測時，使用前言連結的額外量測文件。</p>
 <p><img src="../../source/Day24/day24-fig08.png" alt="PVE 停止 pg02 並記錄故障注入時間"></p>
 <p>圖（四）停止當下的 Primary pg02，並保存 VMID 與故障注入時間。</p>
 <p><img src="../../source/Day24/day24-fig10.png" alt="故障切換後只有 pg03 的 Primary 端點回傳 HTTP 200"></p>
@@ -166,4 +176,5 @@ sudo -u postgres patronictl -c /etc/patroni/config.yml \
 <li>不在角色未知時對 Data Directory 執行覆寫。</li>
 <li>不把 PVE HA 重啟 VM 當成 Patroni Promotion。</li>
 </ul>
-</main></body></html>
+</main></body>
+</html>

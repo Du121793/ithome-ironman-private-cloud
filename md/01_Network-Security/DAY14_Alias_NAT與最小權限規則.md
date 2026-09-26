@@ -214,7 +214,7 @@ BASTION_HOST → BASTION_TARGETS TCP 22
 7. OPNsense 不會顯示一個叫做 `Group Rule` 的狀態欄位。按其中一條規則右側的鉛筆進入編輯畫面，確認 `Interface` 只有 `LAB_INTERNAL` 一項，沒有同時勾選 SERVICE、DATABASE、BACKUP、BASTION。
 8. 確認沒有新增跨區 `any to any`。
 
-以下兩張為 app01 與 pg01 建立後補做的驗證畫面，不屬於 Day 14 當日必要操作。
+以下兩張呈現 app01 與 pg01 建立後的驗證結果，不屬於 Day 14 當日必要操作。
 
 ![從測試主機確認允許與拒絕結果](../../source/Day14/day14-fig05.png)
 

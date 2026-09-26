@@ -74,7 +74,7 @@ pvesh get /cluster/firewall/options
 
 圖（四）以足夠權限執行 `ss` 後，可以確認監聽 Socket 所屬程序。
 
-測試 VM 使用 DHCP，因此兩次補拍的位址不同；這不影響本圖確認監聽程序的用途。
+測試 VM 使用 DHCP，因此圖（三）與圖（四）的位址不同；這不影響監聽程序的判讀。
 
 保存盤點結果，但不要讓 Public IP、MAC、Token 與憑證內容出現在文件中。
 

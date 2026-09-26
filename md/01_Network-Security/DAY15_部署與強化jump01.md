@@ -275,7 +275,7 @@ Get-Content "${Jump01Key}.pub"
 Get-Content "${Jump01Key}.pub" | Set-Clipboard
 ```
 
-公鑰應是一整行，開頭通常是 `ssh-ed25519`。不要把沒有 `.pub` 的私鑰貼進終端、文章、截圖或 Repository。
+公鑰應是一整行，開頭通常是 `ssh-ed25519`。私鑰只留在本地管理電腦，不得貼入終端、文件或 Repository。
 
 ### 3.2 在 jump01 建立帳號並安裝公鑰
 

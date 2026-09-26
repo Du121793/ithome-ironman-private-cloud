@@ -555,7 +555,7 @@ FAULT_EPOCH='請貼上本次 Nginx 停止時的完整數值'
   tee "$RUN_DIR/result.txt"
 ```
 
-📷 截圖完整結果。若顯示 `observed_failure=no`，這是有效結果，不必重做到出現失敗。
+若顯示 `observed_failure=no`，代表本次探測未觀察到失敗，結果仍然有效，不需為了得到失敗樣本而重做。
 
 完成後在 proxy01 恢復：
 
@@ -620,7 +620,7 @@ FAULT_EPOCH='請貼上本次 HAProxy 停止時的完整數值'
   tee "$RUN_DIR/result.txt"
 ```
 
-📷 截圖需包含 `endpoint=ro` 與 `endpoint=rw` 的完整結果。
+結果應同時包含 `endpoint=ro` 與 `endpoint=rw`，才能完整判讀兩組資料庫入口。
 
 完成後在 proxy01 恢復：
 
@@ -722,7 +722,7 @@ FAULT_EPOCH='請貼上本次 VM 關機時的完整數值'
   tee "$RUN_DIR/result.txt"
 ```
 
-📷 截圖需包含 `endpoint=ro`、`endpoint=rw` 與 `endpoint=web` 的完整結果。
+結果應同時包含 `endpoint=ro`、`endpoint=rw` 與 `endpoint=web`，才能完整判讀三組入口。
 
 ### 5.5 重新啟動 proxy01
 

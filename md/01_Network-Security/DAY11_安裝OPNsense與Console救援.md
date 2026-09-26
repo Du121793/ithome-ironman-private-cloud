@@ -89,7 +89,7 @@ qm set 110 --boot 'order=ide2;scsi0'
 3. Keymap 選預設。
 4. 本 Lab 單顆 16GB 虛擬磁碟選 `Install (UFS)`；它沒有磁碟冗餘，正式設備再依磁碟規劃評估 ZFS。
 5. 確認選到 16GB 系統碟，接受 Partition 與 Swap 建議。
-6. 設定新的 root 密碼，不要錄到畫面中。
+6. 設定新的 root 密碼，且不得將密碼寫入文件或提交至 Git。
 7. 選 `Complete Install`，安裝完成後關機。
 8. 到 `Hardware` 的 CD/DVD Drive 退出 OPNsense ISO，或到 `Options` → `Boot Order` 將 `scsi0` 改成第一順位。
 9. 若使用 CLI，執行：

@@ -1,15 +1,25 @@
 <!doctype html>
-<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Day 25 額外實作｜量測代理與應用程式中斷時間</title><style>
-:root{--orange:#f47b20;--ink:#30343b;--line:#e6e8eb}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:#fff;font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}main{width:min(940px,calc(100% - 40px));margin:auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35}h2{margin-top:42px;padding-bottom:10px;border-bottom:1px solid var(--line)}h3{margin-top:30px}a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2}code{padding:.15em .35em;border-radius:4px;background:#f4f5f6;color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}table{width:100%;border-collapse:collapse;margin:22px 0}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
-</style></head><body><main><h1>Day 25 額外實作｜量測代理與應用程式中斷時間</h1>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 25 額外實作｜量測代理與應用程式中斷時間</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 25 額外實作｜量測代理與應用程式中斷時間</h1>
 <p>本文件接續 <a href="./DAY25_Nginx_HAProxy%E8%88%87WebBackend.md">Day 25 主實作</a>，量測兩個使用者實際會遇到的結果：</p>
 <ol>
 <li><code>app01</code> 停止服務時，經 Nginx 存取 Web 服務是否出現可見中斷。</li>
 <li>PostgreSQL 計畫性切換時，經 Nginx、應用程式與 HAProxy 寫入資料庫的服務恢復時間。</li>
 </ol>
 <p>本次尚未建立 Keepalived 與 VIP，因此兩項測試都固定使用 <code>proxy01</code> 的節點 IP <code>10.77.20.21</code>。這可以排除 VIP 漂移時間，只觀察代理與應用程式路徑。</p>
-<p>探測間隔為 0.2 秒。發生失敗後，以連續三次成功中的第一筆作為穩定恢復點。若整段樣本沒有捕捉到失敗，結果會顯示 <code>observed_failure=no</code> 與 <code>visible_interruption=not_observed</code>；正文會將它記錄為「本次未觀察到可見中斷」。</p>
+<p>探測間隔為 0.2 秒。發生失敗後，以連續三次成功中的第一筆作為穩定恢復點。若整段樣本沒有捕捉到失敗，結果會顯示 <code>observed_failure=no</code> 與 <code>visible_interruption=not_observed</code>，代表本次未觀察到可見中斷。</p>
 <h2>一、量測邊界與時間點</h2>
 <table>
 <thead>
@@ -47,7 +57,7 @@
 date --iso-8601=ns
 timedatectl show -p NTPSynchronized --value
 </code></pre>
-<p><code>NTPSynchronized</code> 應全部為 <code>yes</code>。任一主機尚未同步時，先修正時間來源再開始量測。正文以 client01 單機記錄的可見中斷為主要結果，跨主機的切換指令到恢復時間只作參考。</p>
+<p><code>NTPSynchronized</code> 應全部為 <code>yes</code>。任一主機尚未同步時，先修正時間來源再開始量測。client01 單機記錄的可見中斷是主要結果；跨主機的切換指令到恢復時間只作參考。</p>
 <h3>2.2 在 proxy01 確認入口與服務</h3>
 <pre><code class="language-bash">hostname
 
@@ -674,12 +684,12 @@ printf &#39;%s\n&#39; &#39;--- final successful samples ---&#39;
 tail -n 15 \
   &quot;$DAY25_WRITE_RUN/probe.log&quot;
 </code></pre>
-<p>如果 <code>measurement=COMPLETE</code>，正文可以採用：</p>
+<p>如果 <code>measurement=COMPLETE</code>，可依下列兩項結果判讀：</p>
 <ul>
 <li><code>visible_interruption</code>：client01 從第一個失敗到穩定可寫的時間。</li>
 <li><code>event_to_stable_recovery</code>：從送出切換指令前的記錄點到穩定可寫的時間；四台主機時間同步正常時才採用。</li>
 </ul>
-<p>如果 <code>measurement=COMPLETE_NO_VISIBLE_FAILURE</code>，正文記錄為「本次 0.2 秒間隔的樣本未觀察到失敗」，並保留連續成功的原始樣本。</p>
+<p>如果 <code>measurement=COMPLETE_NO_VISIBLE_FAILURE</code>，代表本次 0.2 秒間隔的樣本未觀察到失敗；連續成功的原始樣本可用於核對結果。</p>
 <p><img src="../../source/Day25/day25-practical-fig03.png" alt="PostgreSQL 由 pg02 計畫性切換至 pg01"></p>
 <p>圖（三）切換前 pg02 是 Leader，<code>patronictl</code> 成功將 Primary 角色交給 pg01</p>
 <p><img src="../../source/Day25/day25-practical-fig04.png" alt="HAProxy 將 pg01 標記為唯一可用的 Primary"></p>
@@ -774,7 +784,7 @@ printf &#39;\n&#39;
 <td>HAProxy 角色更新</td>
 <td>舊 Primary 的 <code>/primary</code> 開始回傳 503</td>
 <td>HAProxy 將新 Primary 標記為可用</td>
-<td>保留既有完整樣本，或以相同觀察點重新量測</td>
+<td>使用起點、終點與原始樣本皆完整的量測結果</td>
 </tr>
 <tr>
 <td>Web Backend 可見中斷</td>
@@ -796,4 +806,5 @@ printf &#39;\n&#39;
 </tr>
 </tbody></table>
 <p>三項結果具有不同觀察點：HAProxy 更新時間描述代理控制面，Web 測試描述一台應用程式失效的影響，<code>/write</code> 測試則涵蓋使用者請求、Web 代理、應用程式、資料庫代理與 Primary 切換的完整路徑。</p>
-</main></body></html>
+</main></body>
+</html>

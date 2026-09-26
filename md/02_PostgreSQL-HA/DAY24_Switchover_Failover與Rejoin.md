@@ -173,7 +173,7 @@ sudo -u postgres psql -d appdb -v ON_ERROR_STOP=1 \
   -c "INSERT INTO public.replication_demo(source) VALUES ('day24-after-failover') RETURNING id,created_at,source;"
 ```
 
-記錄故障注入時間、新 Leader 出現時間與第一筆 SQL 寫入成功時間。這些結果只涵蓋 PostgreSQL 節點的直接路徑；完整用戶端 RTO 還要納入 Nginx、HAProxy、VIP 與應用程式重連時間。需要重現正文的秒數時，使用前言連結的額外量測文件。
+記錄故障注入時間、新 Leader 出現時間與第一筆 SQL 寫入成功時間。這些結果只涵蓋 PostgreSQL 節點的直接路徑；完整用戶端 RTO 還要納入 Nginx、HAProxy、VIP 與應用程式重連時間。需要精確量測時，使用前言連結的額外量測文件。
 
 ![PVE 停止 pg02 並記錄故障注入時間](../../source/Day24/day24-fig08.png)
 

@@ -485,7 +485,7 @@ systemctl is-active nginx || true
   &quot;$FAULT_EPOCH&quot; |
   tee &quot;$RUN_DIR/result.txt&quot;
 </code></pre>
-<p>📷 截圖完整結果。若顯示 <code>observed_failure=no</code>，這是有效結果，不必重做到出現失敗。</p>
+<p>若顯示 <code>observed_failure=no</code>，代表本次探測未觀察到失敗，結果仍然有效，不需為了得到失敗樣本而重做。</p>
 <p>完成後在 proxy01 恢復：</p>
 <pre><code class="language-bash">sudo systemctl start nginx
 sleep 10
@@ -530,7 +530,7 @@ systemctl is-active haproxy || true
   &quot;$FAULT_EPOCH&quot; |
   tee &quot;$RUN_DIR/result.txt&quot;
 </code></pre>
-<p>📷 截圖需包含 <code>endpoint=ro</code> 與 <code>endpoint=rw</code> 的完整結果。</p>
+<p>結果應同時包含 <code>endpoint=ro</code> 與 <code>endpoint=rw</code>，才能完整判讀兩組資料庫入口。</p>
 <p>完成後在 proxy01 恢復：</p>
 <pre><code class="language-bash">sudo systemctl start haproxy
 sleep 10
@@ -608,7 +608,7 @@ pvesh get \
   &quot;$FAULT_EPOCH&quot; |
   tee &quot;$RUN_DIR/result.txt&quot;
 </code></pre>
-<p>📷 截圖需包含 <code>endpoint=ro</code>、<code>endpoint=rw</code> 與 <code>endpoint=web</code> 的完整結果。</p>
+<p>結果應同時包含 <code>endpoint=ro</code>、<code>endpoint=rw</code> 與 <code>endpoint=web</code>，才能完整判讀三組入口。</p>
 <h3>5.5 重新啟動 proxy01</h3>
 <p>在 PVE 執行：</p>
 <pre><code class="language-bash">pvesh create \

@@ -44,7 +44,7 @@
 15. Bridge 選 `vmbr1`、Model 選 `VirtIO`、VLAN Tag 填 `30`、Firewall 保持勾選，按 `OK`。
 16. 選 `Cloud-Init`。
 17. `User` 使用目前 Template 已驗證可登入的 `labadmin`。
-18. `Password` 使用本 Lab 的暫時密碼；不要在畫面或文件中顯示實際內容。
+18. `Password` 使用本 Lab 的暫時密碼；實際密碼不得寫入文件或提交至 Git。
 19. `IP Config (net0)` 按 `Edit`，IPv4 選 `Static`。
 20. IPv4/CIDR 填 `10.77.30.10/24`，Gateway 填 `10.77.30.1`，按 `OK`。
 21. `DNS domain` 填 `lab.home`，`DNS servers` 填 `10.77.30.1`。
@@ -355,7 +355,7 @@ sudo -u step-ca -H env STEPPATH=/var/lib/step-ca \
   grep -E '"(type|name|minTLSCertDuration|maxTLSCertDuration|defaultTLSCertDuration)"'
 ```
 
-輸出必須包含 `iron-lab-admin`、JWK 與設定的三組有效期。不直接錄下完整 JSON，避免將 `encryptedKey` 放進影片或公開文件。
+輸出必須包含 `iron-lab-admin`、JWK 與設定的三組有效期。完整 JSON 含有 `encryptedKey`，不得加入文件或提交至 Git。
 
 健康檢查：
 

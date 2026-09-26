@@ -75,7 +75,7 @@ sudo -u step-ca -H env STEPPATH=/var/lib/step-ca \
   --root /var/lib/step-ca/certs/root_ca.crt | \
   grep -E &#39;&quot;(type|name|minTLSCertDuration|maxTLSCertDuration|defaultTLSCertDuration)&quot;&#39;
 </code></pre>
-<p><code>iron-lab-etcd</code> 的 Provisioner Password 與 Day 19 使用的 <code>iron-lab-admin</code> 密碼分開保存，實際內容不得出現在畫面與 Git 中。</p>
+<p><code>iron-lab-etcd</code> 的 Provisioner Password 與 Day 19 使用的 <code>iron-lab-admin</code> 密碼分開保存，實際內容不得寫入文件或提交至 Git。</p>
 <h3>2.2 在三台節點準備 etcd TLS 目錄</h3>
 <p><strong>操作節點：pg01、pg02、pg03。以下步驟三台都要做。</strong></p>
 <p>Day 20 已安裝 <code>step-cli</code> 並完成 ca01 Bootstrap，因此不需要重新安裝套件或再次接受 Fingerprint：</p>

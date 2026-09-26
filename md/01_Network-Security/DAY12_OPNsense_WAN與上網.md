@@ -12,11 +12,11 @@
 ```text
 介面：vtnet0
 IPv4 Configuration Type：DHCP
-位址：由上游路由器配發的 Private IP
+位址：由上游路由器配發的私有 IP
 Gateway：上游路由器
 ```
 
-因 WAN 收到 Private IP，到 `Interfaces → WAN` 取消 `Block private networks`，保留 `Block bogon networks`，按 Save／Apply。
+因 WAN 收到私有 IP，到 `Interfaces → WAN` 取消 `Block private networks`，保留 `Block bogon networks`，按 Save／Apply。
 
 ![確認 OPNsense WAN、LAN 與 OPT1 介面狀態](../../source/Day12/1786893776308-image.png)
 
@@ -51,7 +51,7 @@ OPNsense 26.7 已將舊版的 `Outbound NAT` 選單改名為 `Source NAT`。到 
 
 1. 先確認目前使用自動產生 Source NAT 規則的模式；這就是舊文件所稱的 `Automatic outbound NAT rule generation`。
 2. 本日維持自動模式，不新增手動 Source NAT 規則。
-3. 若畫面出現需要套用的變更，再按 Save／Apply；沒有變更時不必為了截圖重存設定。
+3. 若畫面出現需要套用的變更，再按 Save／Apply；沒有變更時不需重新儲存設定。
 4. Day 13 建好 VLAN 後，回來確認自動產生的 Source NAT 規則是否包含 `10.77.20.0/24`～`10.77.50.0/24`。
 
 ![確認 OPNsense 自動產生的 Source NAT 規則](../../source/Day12/1786893837862-image.png)
@@ -82,9 +82,9 @@ Internet
   → Web VIP 或 jump01
 ```
 
-本系列已知上游路由器具有可接受入站連線的公網 IPv4。到上游路由器確認 WAN Address 與外部查到的 Public IP 相符；後續公開服務時，再分別建立上游路由器與 OPNsense 兩層 Port Forward。
+本系列已知上游路由器具有可接受入站連線的公網 IPv4。到上游路由器確認 WAN Address 與外部查到的公網 IP 相符；後續公開服務時，再分別建立上游路由器與 OPNsense 兩層 Port Forward。
 
-## 4. PPPoE 切換 Runbook（本日只確認設定位置）
+## 4. PPPoE 切換步驟（本日只確認設定位置）
 
 OPNsense 26.7 不再直接於 `Interfaces → WAN` 的 IPv4 Configuration Type 下拉選單建立 PPPoE。該選單只看到 `None`、`Static IPv4` 與 `DHCP` 是正常現象。PPPoE 必須先建立 Point-to-Point Device，再進行 Interface Assignment。
 
@@ -93,7 +93,7 @@ OPNsense 26.7 不再直接於 `Interfaces → WAN` 的 IPv4 Configuration Type �
 1. 到 `Interfaces` → `Devices` → `Point-to-Point`，按 `Add`。
 2. Link Type 選 `PPPoE`。
 3. Link interface 選 WAN Parent `vtnet0`。
-4. 填入 ISP Username／Password；Service Name 與 Host-Uniq 只有 ISP 明確要求時才填。帳密不得出現在截圖、文件或 Git。
+4. 填入 ISP Username／Password；Service Name 與 Host-Uniq 只有 ISP 明確要求時才填。帳密不得寫入文件或提交至 Git。
 5. 儲存後到 `Interfaces` → `Assignments`，選擇新建立的 `pppoe0` Device 並加入。
 6. 進入新指派的 PPPoE Interface，勾選 Enable，IPv4 Configuration Type 選 `PPPoE`，再 Save／Apply。
 7. 真正切換時，原本承載 DHCP 的 Parent WAN 必須停止取得 IPv4，避免同一條 WAN 同時保留 DHCP 與 PPPoE；這一步只在維護窗口執行。

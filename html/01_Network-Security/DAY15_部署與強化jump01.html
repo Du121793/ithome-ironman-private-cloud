@@ -206,7 +206,7 @@ ssh-keygen -t ed25519 -a 100 -f $Jump01Key -C &#39;opsadmin@jump01&#39;
 <pre><code class="language-powershell">Get-Content &quot;${Jump01Key}.pub&quot;
 Get-Content &quot;${Jump01Key}.pub&quot; | Set-Clipboard
 </code></pre>
-<p>公鑰應是一整行，開頭通常是 <code>ssh-ed25519</code>。不要把沒有 <code>.pub</code> 的私鑰貼進終端、文章、截圖或 Repository。</p>
+<p>公鑰應是一整行，開頭通常是 <code>ssh-ed25519</code>。私鑰只留在本地管理電腦，不得貼入終端、文件或 Repository。</p>
 <h3>3.2 在 jump01 建立帳號並安裝公鑰</h3>
 <p>從 PVE 開啟 VM 231 Console、登入 <code>labadmin</code> 後先確認：</p>
 <pre><code class="language-bash">hostnamectl --static

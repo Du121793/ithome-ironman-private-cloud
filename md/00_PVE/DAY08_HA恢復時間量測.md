@@ -559,7 +559,7 @@ fi
 
 這個數字包含 HA 偵測節點故障、Fencing／重新指派、VM 啟動與 Guest 網路恢復。
 
-本次從關閉 pve03 到 VM 首次恢復 Ping 共 223.006 秒；從第一筆未回覆到首次恢復回覆的可觀察中斷為 222.170 秒。正文採用前者，因為它以明確的故障注入時間為起點。
+本次從關閉 pve03 到 VM 首次恢復 Ping 共 223.006 秒；從第一筆未回覆到首次恢復回覆的可觀察中斷為 222.170 秒。前者以明確的故障注入時間為起點，適合用來描述本次完整恢復時間。
 
 ![HA Recovery 從故障注入到 Ping 恢復的量測結果](../../source/Day08/day08-fig23.jpg)
 
@@ -584,7 +584,7 @@ cat /root/day08-ha-measurement/pve03-started.epoch
 cat /root/day08-ha-measurement/pve03-started.iso
 ```
 
-保留畫面中的 `pve03-started.epoch` 數值，第 7.3 節會直接用它計算。
+記下 `pve03-started.epoch` 數值，第 7.3 節會直接用它計算。
 
 ### 7.2 在 pve01 等到 Ceph 完整恢復
 

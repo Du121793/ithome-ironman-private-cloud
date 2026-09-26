@@ -83,7 +83,7 @@
 </blockquote>
 <h3>第一次登入與固定租約</h3>
 <ol>
-<li>Console 開機完成後，拍下畫面顯示的完整 Web URL。</li>
+<li>Console 開機完成後，記下畫面顯示的完整 Web URL。</li>
 <li>同一個 LAN 的電腦開啟該 URL，接受自簽憑證警告。</li>
 <li><code>User name</code> 輸入 <code>root</code>，Realm 選 <code>Linux PAM standard authentication</code>。</li>
 <li>到路由器的 DHCP Client／Connected Devices 頁面找到 <code>pve-l0</code>。</li>
@@ -254,7 +254,7 @@ grep -R --line-number --no-messages &#39;download.proxmox.com\|enterprise.proxmo
 <p><img src="../../source/Day03/1786288606777-image.png" alt="安裝完成後停用虛擬光碟媒體"></p>
 <p><em>圖（十）安裝完成後停用虛擬光碟媒體。</em></p>
 <ol start="9">
-<li>從 Console 拍下每台顯示的 Web URL。</li>
+<li>從 Console 記下每台顯示的 Web URL。</li>
 <li>到路由器依 VM 的 net0 MAC 建立固定租約，保留它當下取得的 IP。</li>
 </ol>
 <p>完成一台並固定租約後再安裝下一台。這樣 Day 07 建 Cluster 時，三個節點的管理 IP 已經穩定。</p>

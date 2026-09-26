@@ -4,7 +4,7 @@
 
 本日以 pg01 為主節點（Primary），pg02／pg03 為實體待命節點（Physical Standby），先理解 WAL、LSN、複寫槽（Replication Slot）與同步狀態。完成原生複寫觀察後，後續會重建為 Patroni 管理的叢集。
 
-> 部分截圖來自較早期的規劃截圖，測試資料仍使用 `day22-*`，複寫連線名稱也可能顯示套件預設的 `18/main`。目前操作請以本文的 `day21-*` 與 `PGAPPNAME=pg02／pg03` 為準；這些畫面用來確認相同的複寫狀態與操作結果。
+> 部分驗證畫面保留較早期的測試值：測試資料顯示 `day22-*`，複寫連線名稱可能顯示套件預設的 `18/main`。操作請以本文的 `day21-*` 與 `PGAPPNAME=pg02／pg03` 為準；複寫狀態與判讀方式不受影響。
 
 ## 本日操作順序
 
@@ -177,7 +177,7 @@ sudo -u postgres psql -c 'SELECT pg_is_in_recovery();'
 
 ![pg02 使用複寫連線設定啟動並進入復原模式](../../source/Day21/day21-fig05.png)
 
-*圖（五）pg02 啟動後可讀取複寫連線設定，`pg_is_in_recovery()` 回傳 `true`，確認它以待命節點身分運作。畫面中的 `18/main` 是早期錄製時的預設連線名稱。*
+*圖（五）pg02 啟動後可讀取複寫連線設定，`pg_is_in_recovery()` 回傳 `true`，確認它以待命節點身分運作。畫面保留套件預設的連線名稱 `18/main`；依本文設定後應顯示 `pg02`。*
 
 ## 4. 建立 pg03 待命節點
 
@@ -211,7 +211,7 @@ ORDER BY application_name;
 
 ![pg01 同時看見 pg02 與 pg03 的串流複寫連線](../../source/Day21/day21-fig06.png)
 
-*圖（六）pg01 同時看見來自 `10.77.30.12` 與 `10.77.30.13` 的兩條 `streaming` 連線，且兩者均為非同步複寫。畫面中的 `18/main` 是早期錄製時的預設連線名稱。*
+*圖（六）pg01 同時看見來自 `10.77.30.12` 與 `10.77.30.13` 的兩條 `streaming` 連線，且兩者均為非同步複寫。畫面保留套件預設的連線名稱 `18/main`；依本文設定後應分別顯示 `pg02` 與 `pg03`。*
 
 應看到兩條 `streaming`。預設非同步時 `sync_state` 通常是 `async`，表示提交未等待待命節點確認；主節點永久損毀時，尚未送達的交易可能遺失。
 
@@ -335,7 +335,7 @@ ORDER BY application_name;
 
 ![pg01 觀察兩條串流複寫連線的傳送與套用進度](../../source/Day21/day21-fig12.png)
 
-*圖（十二）pg01 顯示兩條連線持續 `streaming`；pg03 的 Replay LSN 暫時落後，反映 WAL 已傳送但尚未完成套用。畫面中的 `18/main` 是早期錄製時的預設連線名稱。*
+*圖（十二）pg01 顯示兩條連線持續 `streaming`；pg03 的 Replay LSN 暫時落後，反映 WAL 已傳送但尚未完成套用。畫面保留套件預設的連線名稱 `18/main`；依本文設定後應顯示對應節點名稱。*
 
 再檢查實體複寫槽保留 WAL 的位置與估算容量：
 
@@ -460,4 +460,4 @@ PostgreSQL 應回傳 `cannot execute INSERT in a read-only transaction`。這項
 
 ![pg02 熱待命可讀取複寫資料並拒絕寫入操作](../../source/Day21/day21-fig16.png)
 
-*圖（十六）pg02 可以讀取已套用的資料，寫入操作則由 PostgreSQL 拒絕。畫面是在 Patroni 建立後補拍，因此資料內容與當下的主節點角色不同，熱待命的判讀方式相同。*
+*圖（十六）pg02 可以讀取已套用的資料，寫入操作則由 PostgreSQL 拒絕。圖中的節點已由 Patroni 管理，因此資料內容與當下角色不同；熱待命的判讀方式相同。*

@@ -7,7 +7,7 @@
 
 本次尚未建立 Keepalived 與 VIP，因此兩項測試都固定使用 `proxy01` 的節點 IP `10.77.20.21`。這可以排除 VIP 漂移時間，只觀察代理與應用程式路徑。
 
-探測間隔為 0.2 秒。發生失敗後，以連續三次成功中的第一筆作為穩定恢復點。若整段樣本沒有捕捉到失敗，結果會顯示 `observed_failure=no` 與 `visible_interruption=not_observed`；正文會將它記錄為「本次未觀察到可見中斷」。
+探測間隔為 0.2 秒。發生失敗後，以連續三次成功中的第一筆作為穩定恢復點。若整段樣本沒有捕捉到失敗，結果會顯示 `observed_failure=no` 與 `visible_interruption=not_observed`，代表本次未觀察到可見中斷。
 
 ## 一、量測邊界與時間點
 
@@ -31,7 +31,7 @@ date --iso-8601=ns
 timedatectl show -p NTPSynchronized --value
 ```
 
-`NTPSynchronized` 應全部為 `yes`。任一主機尚未同步時，先修正時間來源再開始量測。正文以 client01 單機記錄的可見中斷為主要結果，跨主機的切換指令到恢復時間只作參考。
+`NTPSynchronized` 應全部為 `yes`。任一主機尚未同步時，先修正時間來源再開始量測。client01 單機記錄的可見中斷是主要結果；跨主機的切換指令到恢復時間只作參考。
 
 ### 2.2 在 proxy01 確認入口與服務
 
@@ -763,12 +763,12 @@ tail -n 15 \
   "$DAY25_WRITE_RUN/probe.log"
 ```
 
-如果 `measurement=COMPLETE`，正文可以採用：
+如果 `measurement=COMPLETE`，可依下列兩項結果判讀：
 
 - `visible_interruption`：client01 從第一個失敗到穩定可寫的時間。
 - `event_to_stable_recovery`：從送出切換指令前的記錄點到穩定可寫的時間；四台主機時間同步正常時才採用。
 
-如果 `measurement=COMPLETE_NO_VISIBLE_FAILURE`，正文記錄為「本次 0.2 秒間隔的樣本未觀察到失敗」，並保留連續成功的原始樣本。
+如果 `measurement=COMPLETE_NO_VISIBLE_FAILURE`，代表本次 0.2 秒間隔的樣本未觀察到失敗；連續成功的原始樣本可用於核對結果。
 
 ![PostgreSQL 由 pg02 計畫性切換至 pg01](../../source/Day25/day25-practical-fig03.png)
 
@@ -880,7 +880,7 @@ printf '\n'
 
 | 觀察項目             | 起點                           | 終點                              | 本次結果                                                  |
 | -------------------- | ------------------------------ | --------------------------------- | --------------------------------------------------------- |
-| HAProxy 角色更新     | 舊 Primary 的 `/primary` 開始回傳 503 | HAProxy 將新 Primary 標記為可用   | 保留既有完整樣本，或以相同觀察點重新量測                  |
+| HAProxy 角色更新     | 舊 Primary 的 `/primary` 開始回傳 503 | HAProxy 將新 Primary 標記為可用   | 使用起點、終點與原始樣本皆完整的量測結果                  |
 | Web Backend 可見中斷 | client01 第一個 `/health` 失敗 | 連續三次 `/health` 成功中的第一筆 | 依 Web 測試的 `result.txt` 填寫；未見失敗則寫未觀察到中斷 |
 | 應用程式可寫中斷     | client01 第一個 `/write` 失敗  | 連續三次 `/write` 成功中的第一筆  | 依 Write 測試的 `result.txt` 填寫                         |
 | 切換到穩定可寫       | `switch_epoch`                 | 連續三次 `/write` 成功中的第一筆  | 時間同步正常時才填寫                                      |

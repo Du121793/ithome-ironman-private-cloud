@@ -1,12 +1,22 @@
 <!doctype html>
-<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Day 21｜讓三台 PostgreSQL 保持資料同步：串流複寫、WAL、複寫槽與熱待命</title><style>
-:root{--orange:#f47b20;--ink:#30343b;--line:#e6e8eb}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:#fff;font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}main{width:min(940px,calc(100% - 40px));margin:auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35}h2{margin-top:42px;padding-bottom:10px;border-bottom:1px solid var(--line)}h3{margin-top:30px}a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2}code{padding:.15em .35em;border-radius:4px;background:#f4f5f6;color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}table{width:100%;border-collapse:collapse;margin:22px 0}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
-</style></head><body><main><h1>Day 21｜讓三台 PostgreSQL 保持資料同步：串流複寫、WAL、複寫槽與熱待命</h1>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 21｜讓三台 PostgreSQL 保持資料同步：串流複寫、WAL、複寫槽與熱待命</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 21｜讓三台 PostgreSQL 保持資料同步：串流複寫、WAL、複寫槽與熱待命</h1>
 <p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 21｜讓三台 PostgreSQL 保持資料同步：串流複寫、WAL、複寫槽與熱待命</a></p>
 <p>本日以 pg01 為主節點（Primary），pg02／pg03 為實體待命節點（Physical Standby），先理解 WAL、LSN、複寫槽（Replication Slot）與同步狀態。完成原生複寫觀察後，後續會重建為 Patroni 管理的叢集。</p>
 <blockquote>
-<p>部分截圖來自較早期的規劃截圖，測試資料仍使用 <code>day22-*</code>，複寫連線名稱也可能顯示套件預設的 <code>18/main</code>。目前操作請以本文的 <code>day21-*</code> 與 <code>PGAPPNAME=pg02／pg03</code> 為準；這些畫面用來確認相同的複寫狀態與操作結果。</p>
+<p>部分驗證畫面保留較早期的測試值：測試資料顯示 <code>day22-*</code>，複寫連線名稱可能顯示套件預設的 <code>18/main</code>。操作請以本文的 <code>day21-*</code> 與 <code>PGAPPNAME=pg02／pg03</code> 為準；複寫狀態與判讀方式不受影響。</p>
 </blockquote>
 <h2>本日操作順序</h2>
 <ol>
@@ -114,7 +124,7 @@ sudo test -f /var/lib/postgresql/18/main/standby.signal
 sudo -u postgres psql -c &#39;SELECT pg_is_in_recovery();&#39;
 </code></pre>
 <p><img src="../../source/Day21/day21-fig05.png" alt="pg02 使用複寫連線設定啟動並進入復原模式"></p>
-<p><em>圖（五）pg02 啟動後可讀取複寫連線設定，<code>pg_is_in_recovery()</code> 回傳 <code>true</code>，確認它以待命節點身分運作。畫面中的 <code>18/main</code> 是早期錄製時的預設連線名稱。</em></p>
+<p><em>圖（五）pg02 啟動後可讀取複寫連線設定，<code>pg_is_in_recovery()</code> 回傳 <code>true</code>，確認它以待命節點身分運作。畫面保留套件預設的連線名稱 <code>18/main</code>；依本文設定後應顯示 <code>pg02</code>。</em></p>
 <h2>4. 建立 pg03 待命節點</h2>
 <p><strong>操作節點：只在 pg03。確認 pg02 已正常 Streaming 後才開始。</strong></p>
 <p>在 pg03 重複相同步驟，並將 <code>PGAPPNAME</code> 與複寫槽改為：</p>
@@ -134,7 +144,7 @@ FROM pg_stat_replication
 ORDER BY application_name;
 </code></pre>
 <p><img src="../../source/Day21/day21-fig06.png" alt="pg01 同時看見 pg02 與 pg03 的串流複寫連線"></p>
-<p><em>圖（六）pg01 同時看見來自 <code>10.77.30.12</code> 與 <code>10.77.30.13</code> 的兩條 <code>streaming</code> 連線，且兩者均為非同步複寫。畫面中的 <code>18/main</code> 是早期錄製時的預設連線名稱。</em></p>
+<p><em>圖（六）pg01 同時看見來自 <code>10.77.30.12</code> 與 <code>10.77.30.13</code> 的兩條 <code>streaming</code> 連線，且兩者均為非同步複寫。畫面保留套件預設的連線名稱 <code>18/main</code>；依本文設定後應分別顯示 <code>pg02</code> 與 <code>pg03</code>。</em></p>
 <p>應看到兩條 <code>streaming</code>。預設非同步時 <code>sync_state</code> 通常是 <code>async</code>，表示提交未等待待命節點確認；主節點永久損毀時，尚未送達的交易可能遺失。</p>
 <h2>6. WAL 與 LSN 實驗</h2>
 <p><strong>操作順序：先在 pg01 寫入，再到 pg02、pg03 讀取。</strong></p>
@@ -210,7 +220,7 @@ FROM pg_stat_replication
 ORDER BY application_name;
 </code></pre>
 <p><img src="../../source/Day21/day21-fig12.png" alt="pg01 觀察兩條串流複寫連線的傳送與套用進度"></p>
-<p><em>圖（十二）pg01 顯示兩條連線持續 <code>streaming</code>；pg03 的 Replay LSN 暫時落後，反映 WAL 已傳送但尚未完成套用。畫面中的 <code>18/main</code> 是早期錄製時的預設連線名稱。</em></p>
+<p><em>圖（十二）pg01 顯示兩條連線持續 <code>streaming</code>；pg03 的 Replay LSN 暫時落後，反映 WAL 已傳送但尚未完成套用。畫面保留套件預設的連線名稱 <code>18/main</code>；依本文設定後應顯示對應節點名稱。</em></p>
 <p>再檢查實體複寫槽保留 WAL 的位置與估算容量：</p>
 <pre><code class="language-sql">SELECT slot_name,
        active,
@@ -290,5 +300,6 @@ VALUES (&#39;day21-standby-write-test&#39;);
 </code></pre>
 <p>PostgreSQL 應回傳 <code>cannot execute INSERT in a read-only transaction</code>。這項錯誤是預期結果，用來證明熱待命的唯讀邊界。完成後輸入 <code>\q</code> 離開。</p>
 <p><img src="../../source/Day21/day21-fig16.png" alt="pg02 熱待命可讀取複寫資料並拒絕寫入操作"></p>
-<p><em>圖（十六）pg02 可以讀取已套用的資料，寫入操作則由 PostgreSQL 拒絕。畫面是在 Patroni 建立後補拍，因此資料內容與當下的主節點角色不同，熱待命的判讀方式相同。</em></p>
-</main></body></html>
+<p><em>圖（十六）pg02 可以讀取已套用的資料，寫入操作則由 PostgreSQL 拒絕。圖中的節點已由 Patroni 管理，因此資料內容與當下角色不同；熱待命的判讀方式相同。</em></p>
+</main></body>
+</html>

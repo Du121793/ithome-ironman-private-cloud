@@ -41,7 +41,7 @@ Bob
 <li>選取 <code>Hard Disk (scsi0)</code>，先記下目前容量，再按 <code>Disk Action</code> → <code>Resize</code>。</li>
 <li>app01 的目標容量為 12 GiB。GUI 的 <code>Size Increment (GiB)</code> 填的是「增加量」：若目前是 3 GiB 就填 <code>9</code>；若目前是 8 GiB 就填 <code>4</code>；若已經是 12 GiB 或更大則不要 Resize。</li>
 <li>Network Device 使用 <code>vmbr1</code>，VLAN Tag 填 <code>20</code>。</li>
-<li>到 <code>Cloud-Init</code>，User 保留 Template 的 <code>labadmin</code>。本次 Lab 沿用你目前設定的管理密碼，<code>SSH public key</code> 不強制填寫；密碼不要寫入文件或截圖。</li>
+<li>到 <code>Cloud-Init</code>，User 保留 Template 的 <code>labadmin</code>。本次 Lab 沿用你目前設定的管理密碼，<code>SSH public key</code> 不強制填寫；密碼不得寫入文件或提交至 Git。</li>
 <li>IP 設 <code>10.77.20.31/24</code>，Gateway 設 <code>10.77.20.1</code>。</li>
 <li>DNS 設 <code>10.77.20.1</code>，Search Domain 設 <code>lab.home</code>。</li>
 <li>按 <code>Regenerate Image</code>，再啟動 VM。</li>

@@ -88,7 +88,7 @@ sudo -u step-ca -H env STEPPATH=/var/lib/step-ca \
   grep -E '"(type|name|minTLSCertDuration|maxTLSCertDuration|defaultTLSCertDuration)"'
 ```
 
-`iron-lab-etcd` 的 Provisioner Password 與 Day 19 使用的 `iron-lab-admin` 密碼分開保存，實際內容不得出現在畫面與 Git 中。
+`iron-lab-etcd` 的 Provisioner Password 與 Day 19 使用的 `iron-lab-admin` 密碼分開保存，實際內容不得寫入文件或提交至 Git。
 
 ### 2.2 在三台節點準備 etcd TLS 目錄
 

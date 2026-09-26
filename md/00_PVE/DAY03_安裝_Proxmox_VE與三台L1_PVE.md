@@ -72,7 +72,7 @@ Get-FileHash .\proxmox-ve_9.2-1.iso -Algorithm SHA256
 
 ### 第一次登入與固定租約
 
-1. Console 開機完成後，拍下畫面顯示的完整 Web URL。
+1. Console 開機完成後，記下畫面顯示的完整 Web URL。
 2. 同一個 LAN 的電腦開啟該 URL，接受自簽憑證警告。
 3. `User name` 輸入 `root`，Realm 選 `Linux PAM standard authentication`。
 4. 到路由器的 DHCP Client／Connected Devices 頁面找到 `pve-l0`。
@@ -294,7 +294,7 @@ grep -R --line-number --no-messages 'download.proxmox.com\|enterprise.proxmox.co
 
 *圖（十）安裝完成後停用虛擬光碟媒體。*
 
-9. 從 Console 拍下每台顯示的 Web URL。
+9. 從 Console 記下每台顯示的 Web URL。
 10. 到路由器依 VM 的 net0 MAC 建立固定租約，保留它當下取得的 IP。
 
 完成一台並固定租約後再安裝下一台。這樣 Day 07 建 Cluster 時，三個節點的管理 IP 已經穩定。

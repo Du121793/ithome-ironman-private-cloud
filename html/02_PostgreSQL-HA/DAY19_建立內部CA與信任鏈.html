@@ -54,7 +54,7 @@
 <li>Bridge 選 <code>vmbr1</code>、Model 選 <code>VirtIO</code>、VLAN Tag 填 <code>30</code>、Firewall 保持勾選，按 <code>OK</code>。</li>
 <li>選 <code>Cloud-Init</code>。</li>
 <li><code>User</code> 使用目前 Template 已驗證可登入的 <code>labadmin</code>。</li>
-<li><code>Password</code> 使用本 Lab 的暫時密碼；不要在畫面或文件中顯示實際內容。</li>
+<li><code>Password</code> 使用本 Lab 的暫時密碼；實際密碼不得寫入文件或提交至 Git。</li>
 <li><code>IP Config (net0)</code> 按 <code>Edit</code>，IPv4 選 <code>Static</code>。</li>
 <li>IPv4/CIDR 填 <code>10.77.30.10/24</code>，Gateway 填 <code>10.77.30.1</code>，按 <code>OK</code>。</li>
 <li><code>DNS domain</code> 填 <code>lab.home</code>，<code>DNS servers</code> 填 <code>10.77.30.1</code>。</li>
@@ -255,7 +255,7 @@ sudo ss -lntp | grep &#39;:9000&#39;
   --root /var/lib/step-ca/certs/root_ca.crt | \
   grep -E &#39;&quot;(type|name|minTLSCertDuration|maxTLSCertDuration|defaultTLSCertDuration)&quot;&#39;
 </code></pre>
-<p>輸出必須包含 <code>iron-lab-admin</code>、JWK 與設定的三組有效期。不直接錄下完整 JSON，避免將 <code>encryptedKey</code> 放進影片或公開文件。</p>
+<p>輸出必須包含 <code>iron-lab-admin</code>、JWK 與設定的三組有效期。完整 JSON 含有 <code>encryptedKey</code>，不得加入文件或提交至 Git。</p>
 <p>健康檢查：</p>
 <pre><code class="language-bash">sudo -u step-ca curl --cacert /var/lib/step-ca/certs/root_ca.crt \
   https://ca01.lab.home:9000/health

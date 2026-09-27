@@ -1,0 +1,596 @@
+<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 28｜PostgreSQL 資料誤刪如何復原？使用 pgBackRest、WAL Archive 與 PITR 回到指定時間點</title><style>
+:root{--orange:#f47b20;--ink:#30343b;--line:#e6e8eb}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:#fff;font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}main{width:min(940px,calc(100% - 40px));margin:auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35}h2{margin-top:42px;padding-bottom:10px;border-bottom:1px solid var(--line)}h3{margin-top:30px}a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2}code{padding:.15em .35em;border-radius:4px;background:#f4f5f6;color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}table{width:100%;border-collapse:collapse;margin:22px 0}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+</style></head><body><main><h1>Day 28｜PostgreSQL 資料誤刪如何復原？使用 pgBackRest、WAL Archive 與 PITR 回到指定時間點</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 28｜PostgreSQL 資料誤刪如何復原？使用 pgBackRest、WAL Archive 與 PITR 回到指定時間點</a></p>
+<p>本日建立 backup01 專用 Repository Host，完成 Full Backup、WAL Archive 與獨立 Restore VM 的 Point-in-Time Recovery。禁止直接在運作中的 Patroni Cluster 上覆寫還原。</p>
+<h2>本日操作順序</h2>
+<ol>
+<li>在 PVE Web UI 建立 backup01 與 Repository Disk，先確認底層 Storage 空間再配置容量。</li>
+<li>依序在 backup01、pg01、pg02、pg03 安裝相同版本的 pgBackRest。</li>
+<li>只在 backup01 建立 Repository Account、目錄與 Server Config。</li>
+<li>逐台在 pg01、pg02、pg03 建立 Database Host Config 與 SSH 存取。</li>
+<li>在 DCS 寫入一次 Patroni Archive 設定；先逐台重啟 Replica，再計畫性切換並重啟舊 Leader。</li>
+<li>只在 backup01 建立 Stanza、執行 Full Backup 並驗證 WAL Archive。</li>
+<li>在目前 Leader 建立並誤刪測試資料，記錄精確時間。</li>
+<li>另外建立 Restore VM 做 PITR，不可直接還原到正在運作的 pg01～pg03。</li>
+</ol>
+<h2>1. 建立 backup01</h2>
+<p><strong>操作位置：PVE Web UI 建立 VM。作業系統內的磁碟與網路設定只在 backup01。</strong></p>
+<p>加入 Repository Disk 前，先在 pve01 Shell 執行：</p>
+<pre><code class="language-bash">pvesm status
+lvs -a -o lv_name,lv_size,data_percent,metadata_percent
+</code></pre>
+<p>若 <code>local-lvm</code> 剩餘不足 20%，先停止本節，檢查不再使用的 ISO、Backup、Snapshot 與 Test Clone，不要繼續超額分配。</p>
+<p>確認容量後建立 VM：</p>
+<ol>
+<li>左側選 Day 06 的 Debian 13 Template。</li>
+<li>右上角按 <code>More</code> → <code>Clone</code>。</li>
+<li><code>Target Node</code> 選 <code>pve01</code>。</li>
+<li><code>VM ID</code> 填 <code>261</code>。</li>
+<li><code>Name</code> 填 <code>backup01</code>。</li>
+<li><code>Mode</code> 選 <code>Full Clone</code>。</li>
+<li><code>Target Storage</code> 選 pve01 的 <code>local-lvm</code>。</li>
+<li>按 <code>Clone</code>，等待 Task 顯示 <code>OK</code>。</li>
+<li>選 VM 261 → <code>Hardware</code> → <code>Processors</code> → <code>Edit</code>。</li>
+<li>Sockets 填 <code>1</code>、Cores 填 <code>2</code>，按 <code>OK</code>。</li>
+<li>選 <code>Memory</code> → <code>Edit</code>，Memory 填 <code>2048 MiB</code>，取消 Ballooning，按 <code>OK</code>。</li>
+<li>選 <code>Network Device (net0)</code> → <code>Edit</code>。</li>
+<li>Bridge 選 <code>vmbr1</code>、VLAN Tag 填 <code>40</code>、Model 選 <code>VirtIO</code>、Firewall 勾選，按 <code>OK</code>。</li>
+<li>選 <code>Cloud-Init</code>，User 填 <code>labadmin</code>，Password 填 Lab 管理密碼。</li>
+<li>點 <code>IP Config (net0)</code> → <code>Edit</code>，IPv4 選 <code>Static</code>。</li>
+<li>IPv4/CIDR 填 <code>10.77.40.11/24</code>，Gateway 填 <code>10.77.40.1</code>，按 <code>OK</code>。</li>
+<li>DNS Domain 填 <code>lab.home</code>，DNS Server 填 <code>10.77.40.1</code>，按 <code>Regenerate Image</code>。</li>
+<li>到 <code>Hardware</code> → <code>Add</code> → <code>Hard Disk</code>。</li>
+<li>Bus／Device 選 <code>SCSI</code>，Storage 選 pve01 的 <code>local-lvm</code>，Disk size 填 <code>32 GiB</code>。</li>
+<li>勾選 <code>Discard</code> 與 <code>IO thread</code>，按 <code>Add</code>。</li>
+<li>到 <code>Options</code> → <code>Start at boot</code> → <code>Edit</code>，勾選後按 <code>OK</code>。</li>
+<li>按 <code>Start</code>，再開啟 <code>Console</code>。</li>
+</ol>
+<p><img src="../../source/Day28/day28-main-fig01.png" alt="backup01 的 Cloud-Init 網路與 DNS 設定"></p>
+<p>圖（一）backup01 使用 VLAN 40、固定 IP <code>10.77.40.11/24</code>、閘道與 DNS <code>10.77.40.1</code>。</p>
+<p><img src="../../source/Day28/day28-main-fig02.png" alt="backup01 的處理器、記憶體、系統磁碟與 Repository 磁碟"></p>
+<p>圖（二）backup01 配置 2 vCPU、2 GiB 記憶體、3 GiB 系統磁碟與 32 GiB Repository 磁碟。</p>
+<p>開機後先執行：</p>
+<pre><code class="language-bash">hostnamectl --static
+ip -br address
+ip route
+resolvectl status
+resolvectl query deb.debian.org
+sudo lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL
+</code></pre>
+<p><img src="../../source/Day28/day28-main-fig03.png" alt="backup01 的主機名稱、網路、DNS 與磁碟辨識結果"></p>
+<p>圖（三）backup01 已載入預定網路設定，<code>lsblk</code> 顯示 32 GiB 空白 Repository 磁碟為 <code>/dev/sda</code>。</p>
+<p><code>resolvectl status</code> 必須在 Global 或網路介面區塊看到 DNS Server <code>10.77.40.1</code> 與 DNS Domain <code>lab.home</code>。如果 Cloud-Init 已設定 IP 與預設閘道，systemd-resolved 卻沒有取得這兩項，執行：</p>
+<pre><code class="language-bash">sudo install -d -m 0755 /etc/systemd/resolved.conf.d
+printf &#39;%s\n&#39; \
+  &#39;[Resolve]&#39; \
+  &#39;DNS=10.77.40.1&#39; \
+  &#39;Domains=lab.home&#39; |
+  sudo tee /etc/systemd/resolved.conf.d/10-lab-dns.conf
+sudo systemctl restart systemd-resolved
+sudo resolvectl flush-caches
+resolvectl status
+resolvectl query deb.debian.org
+</code></pre>
+<p><code>deb.debian.org</code> 成功只代表對外 DNS 正常。Day 20 的 <code>pg01～03.lab.home</code> 使用各節點的固定 Hosts 清單，尚未建立成 OPNsense Host Override，因此新建的 backup01 還要加入三台 PostgreSQL 節點的固定名稱。</p>
+<p>先備份並開啟 Cloud-Init 使用的 Hosts Template：</p>
+<pre><code class="language-bash">sudo cp -a /etc/cloud/templates/hosts.debian.tmpl \
+  /etc/cloud/templates/hosts.debian.tmpl.before-day28
+sudo nano /etc/cloud/templates/hosts.debian.tmpl
+</code></pre>
+<p>在檔案末端加入：</p>
+<pre><code class="language-text">10.77.30.11 pg01.lab.home pg01
+10.77.30.12 pg02.lab.home pg02
+10.77.30.13 pg03.lab.home pg03
+</code></pre>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code>，再將相同三行加入目前正在使用的 <code>/etc/hosts</code>：</p>
+<pre><code class="language-bash">sudo nano /etc/hosts
+</code></pre>
+<p>完成後驗證：</p>
+<pre><code class="language-bash">for host in pg01.lab.home pg02.lab.home pg03.lab.home; do
+  getent ahostsv4 &quot;$host&quot; | head -n 1
+done
+</code></pre>
+<p>結果必須依序顯示 <code>10.77.30.11</code>、<code>10.77.30.12</code>、<code>10.77.30.13</code>。不要直接修改 <code>/etc/resolv.conf</code>；它是 systemd-resolved 管理的 Stub Resolver 設定。</p>
+<p>以下指令假設 32 GiB 空白 Repository Disk 是 <code>/dev/sda</code>。如 <code>lsblk</code> 顯示不同名稱，後續所有 <code>/dev/sda</code> 都要改成實際空白磁碟；不能只根據名稱猜測。</p>
+<p>確認空白磁碟後建立檔案系統：</p>
+<pre><code class="language-bash">sudo lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS
+sudo wipefs -n /dev/sda
+sudo mkfs.ext4 -L pgrepo /dev/sda
+sudo mkdir -p /var/lib/pgbackrest
+grep -q &#39;^LABEL=pgrepo /var/lib/pgbackrest &#39; /etc/fstab || \
+  echo &#39;LABEL=pgrepo /var/lib/pgbackrest ext4 defaults,noatime 0 2&#39; | \
+  sudo tee -a /etc/fstab
+sudo systemctl daemon-reload
+sudo findmnt --verify --verbose
+sudo mount -a
+findmnt /var/lib/pgbackrest
+df -hT /var/lib/pgbackrest
+</code></pre>
+<p><img src="../../source/Day28/day28-main-fig04.png" alt="backup01 的 Repository 磁碟已掛載至指定路徑"></p>
+<p>圖（四）<code>/dev/sda</code> 已以 ext4 掛載至 <code>/var/lib/pgbackrest</code>，可用容量約 30 GiB。</p>
+<h2>2. 逐台安裝相同版本 pgBackRest</h2>
+<p><strong>操作順序：backup01 → pg01 → pg02 → pg03。每台安裝後立即確認版本完全相同。</strong></p>
+<p>backup01、pg01～03 都使用 PGDG Repository：</p>
+<pre><code class="language-bash">sudo apt update
+sudo apt install -y postgresql-common ca-certificates curl
+sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+sudo apt update
+sudo apt install -y pgbackrest openssh-client openssh-server
+sudo systemctl enable --now ssh
+pgbackrest version
+</code></pre>
+<p>四台的 pgBackRest 版本必須完全一致。保存：</p>
+<pre><code class="language-bash">apt-cache policy pgbackrest
+</code></pre>
+<h2>3. 建立 Repository 帳號</h2>
+<p><strong>操作節點：只在 backup01。</strong></p>
+<p>backup01：</p>
+<pre><code class="language-bash">sudo useradd --system --create-home --home-dir /var/lib/pgbackrest --shell /bin/bash pgbackrest
+sudo chown -R pgbackrest:pgbackrest /var/lib/pgbackrest
+sudo chmod 750 /var/lib/pgbackrest
+sudo install -d -m 700 -o pgbackrest -g pgbackrest /var/lib/pgbackrest/.ssh
+</code></pre>
+<p>建立兩個方向的專用 SSH Key：</p>
+<pre><code class="language-text">Repository → pg01～03：執行備份時讀取 Primary／Standby
+pg01～03 postgres → Repository：archive-push 與 restore 存取 Repository
+</code></pre>
+<p>OPNsense 只允許 PG_NODES 與 BACKUP_NODE 間必要的 TCP 22。正式部署還應在 <code>authorized_keys</code> 加入 Forced Command，以及 <code>no-agent-forwarding</code>、<code>no-port-forwarding</code>、<code>no-X11-forwarding</code> 等限制，讓服務帳號金鑰只能執行必要的 pgBackRest 遠端命令。本篇先保留容易觀察與排錯的 Lab 設定。</p>
+<h3>3.1 建立 backup01 到三台 PG 的 Key</h3>
+<p>操作節點：只在 backup01。</p>
+<pre><code class="language-bash">sudo -u pgbackrest ssh-keygen -t ed25519 \
+  -f /var/lib/pgbackrest/.ssh/id_ed25519 \
+  -C &#39;pgbackrest@backup01&#39; -N &#39;&#39;
+sudo -u pgbackrest cat /var/lib/pgbackrest/.ssh/id_ed25519.pub
+</code></pre>
+<p><img src="../../source/Day28/day28-main-fig05.png" alt="backup01 建立 Repository 專用 SSH 金鑰"></p>
+<p>圖（五）backup01 以 <code>pgbackrest</code> 帳號建立專用 Ed25519 金鑰，後續只分發 Public Key。</p>
+<p>複製整行 Public Key，不要複製沒有 <code>.pub</code> 的 Private Key。</p>
+<p>操作節點：pg01、pg02、pg03 逐台執行。</p>
+<pre><code class="language-bash">sudo -u postgres install -d -m 700 /var/lib/postgresql/.ssh
+sudo -u postgres nano /var/lib/postgresql/.ssh/authorized_keys
+</code></pre>
+<p>在每一台貼上剛才的同一行 Public Key，按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code>，再執行：</p>
+<pre><code class="language-bash">sudo chown -R postgres:postgres /var/lib/postgresql/.ssh
+sudo chmod 700 /var/lib/postgresql/.ssh
+sudo chmod 600 /var/lib/postgresql/.ssh/authorized_keys
+</code></pre>
+<h3>3.2 建立三台 PG 到 backup01 的 Key</h3>
+<p>操作節點：pg01、pg02、pg03。每台都建立自己的 Key，不複製 Private Key。</p>
+<pre><code class="language-bash">sudo -u postgres ssh-keygen -t ed25519 \
+  -f /var/lib/postgresql/.ssh/id_ed25519 \
+  -C &quot;postgres@$(hostname -s)&quot; -N &#39;&#39;
+sudo -u postgres cat /var/lib/postgresql/.ssh/id_ed25519.pub
+</code></pre>
+<p>每次複製當前節點的 Public Key。到 backup01 開啟：</p>
+<pre><code class="language-bash">sudo -u pgbackrest nano /var/lib/pgbackrest/.ssh/authorized_keys
+</code></pre>
+<p>將 pg01、pg02、pg03 的三行 Public Key 各貼一行，按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code>，再執行：</p>
+<pre><code class="language-bash">sudo chown -R pgbackrest:pgbackrest /var/lib/pgbackrest/.ssh
+sudo chmod 700 /var/lib/pgbackrest/.ssh
+sudo chmod 600 /var/lib/pgbackrest/.ssh/authorized_keys
+</code></pre>
+<h3>3.3 放行並驗證 SSH 路徑</h3>
+<p>操作位置：OPNsense Web UI。</p>
+<ol>
+<li>進入 <code>Firewall</code> → <code>Rules</code>。</li>
+<li>按 <code>Add</code>，Interface 選 <code>LAB_INTERNAL</code>、Action 選 <code>Pass</code>、Version 選 <code>IPv4</code>、Protocol 選 <code>TCP</code>。</li>
+<li>Source 選 <code>PG_NODES</code>、Destination 選 <code>BACKUP_NODE</code>、Destination Port 填 <code>22</code>。</li>
+<li>Description 填 <code>PG nodes to pgBackRest repository</code>，按 <code>Save</code>。</li>
+<li>再按 <code>Add</code>，Interface 選 <code>LAB_INTERNAL</code>、Action 選 <code>Pass</code>、Version 選 <code>IPv4</code>、Protocol 選 <code>TCP</code>。</li>
+<li>Source 選 <code>BACKUP_NODE</code>、Destination 選 <code>PG_NODES</code>、Destination Port 填 <code>22</code>。</li>
+<li>Description 填 <code>pgBackRest repository to PG nodes</code>，按 <code>Save</code>。</li>
+<li>將兩條 Allow Rule 都移到 <code>Block LAB_INTERNAL to internal networks</code> 上方。</li>
+<li>按頁面上方 <code>Apply</code>。</li>
+</ol>
+<p><img src="../../source/Day28/day28-main-fig06.png" alt="LAB_INTERNAL 放行 PostgreSQL 節點與 backup01 之間的 SSH"></p>
+<p>圖（六）兩條 SSH 規則位於跨 VLAN Block 上方，分別允許 PG_NODES 到 BACKUP_NODE，以及 BACKUP_NODE 到 PG_NODES。</p>
+<p>兩條規則都要使用 <code>LAB_INTERNAL</code>，不要分別建立在 Database 或 Backup 個別 Interface。Day 14 的跨 VLAN Block 位於 <code>LAB_INTERNAL</code> Interface Group；Group Rule 會先於個別 Interface Rule 評估，因此建立在個別介面的 Allow 無法越過前面的 Group Block。</p>
+<p>在 backup01 逐一建立 Known Hosts 並測試：</p>
+<pre><code class="language-bash">sudo -u pgbackrest ssh-keyscan -H pg01.lab.home pg02.lab.home pg03.lab.home \
+  | sudo -u pgbackrest tee /var/lib/pgbackrest/.ssh/known_hosts
+sudo -u pgbackrest ssh postgres@pg01.lab.home &#39;hostnamectl --static&#39;
+sudo -u pgbackrest ssh postgres@pg02.lab.home &#39;hostnamectl --static&#39;
+sudo -u pgbackrest ssh postgres@pg03.lab.home &#39;hostnamectl --static&#39;
+</code></pre>
+<p>正式環境要先從 PVE Console 或資產管理資料比對 SSH Host Key Fingerprint，不能只依賴第一次 <code>ssh-keyscan</code>。</p>
+<p>在 pg01、pg02、pg03 各自執行：</p>
+<pre><code class="language-bash">sudo -u postgres ssh-keyscan -H backup01.lab.home \
+  | sudo -u postgres tee /var/lib/postgresql/.ssh/known_hosts
+sudo -u postgres ssh pgbackrest@backup01.lab.home &#39;hostnamectl --static&#39;
+</code></pre>
+<h2>4. Repository Host Config</h2>
+<p><strong>操作節點：只在 backup01。</strong></p>
+<p>backup01 開啟設定檔：</p>
+<pre><code class="language-bash">sudo install -d -m 755 /etc/pgbackrest
+sudo nano /etc/pgbackrest/pgbackrest.conf
+</code></pre>
+<p>貼上：</p>
+<pre><code class="language-ini">[iron-pg]
+pg1-host=pg01.lab.home
+pg1-host-user=postgres
+pg1-path=/var/lib/postgresql/18/patroni
+pg2-host=pg02.lab.home
+pg2-host-user=postgres
+pg2-path=/var/lib/postgresql/18/patroni
+pg3-host=pg03.lab.home
+pg3-host-user=postgres
+pg3-path=/var/lib/postgresql/18/patroni
+
+[global]
+repo1-path=/var/lib/pgbackrest/repo
+repo1-retention-full=2
+repo1-retention-diff=4
+start-fast=y
+process-max=2
+log-level-console=info
+log-level-file=detail
+</code></pre>
+<p><code>repo1-retention-full=2</code> 保留兩份 Full；<code>repo1-retention-diff=4</code> 的計數包含 Full，代表四個 Full／Differential 備份集合的計數範圍。</p>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code> 儲存，再執行：</p>
+<pre><code class="language-bash">sudo install -d -m 750 -o pgbackrest -g pgbackrest /var/lib/pgbackrest/repo /var/log/pgbackrest
+sudo chown root:pgbackrest /etc/pgbackrest/pgbackrest.conf
+sudo chmod 640 /etc/pgbackrest/pgbackrest.conf
+sudo -u pgbackrest pgbackrest --config=/etc/pgbackrest/pgbackrest.conf help &gt;/dev/null
+</code></pre>
+<h2>5. Database Host Config</h2>
+<p><strong>操作節點：pg01、pg02、pg03。逐台設定並各自測試連到 backup01。</strong></p>
+<p>pg01～03 逐台開啟：</p>
+<pre><code class="language-bash">sudo install -d -m 755 /etc/pgbackrest
+sudo nano /etc/pgbackrest/pgbackrest.conf
+</code></pre>
+<p>三台都貼上：</p>
+<pre><code class="language-ini">[iron-pg]
+pg1-path=/var/lib/postgresql/18/patroni
+
+[global]
+repo1-host=backup01.lab.home
+repo1-host-user=pgbackrest
+repo1-path=/var/lib/pgbackrest/repo
+process-max=2
+log-level-console=info
+</code></pre>
+<p><code>pg1-path</code> 提供預設還原位置；本次演練會在 Restore 命令使用 <code>--pg1-path</code> 覆寫為專用的 <code>day28-proof-*</code> 目錄，讓每次還原彼此隔離。</p>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code> 儲存，再執行：</p>
+<pre><code class="language-bash">sudo chown root:postgres /etc/pgbackrest/pgbackrest.conf
+sudo chmod 640 /etc/pgbackrest/pgbackrest.conf
+sudo -u postgres pgbackrest --config=/etc/pgbackrest/pgbackrest.conf help &gt;/dev/null
+</code></pre>
+<h2>6. Patroni 啟用 Archive</h2>
+<p><strong>操作順序：先逐台處理 Replica，確認它重新加入後再處理下一台。Leader 最後處理，必要時先 Planned Switchover。</strong></p>
+<p><code>edit-config</code> 只需在任一台目前正常運作的 Patroni 節點執行一次，不要在三台重複操作。這是儲存在 DCS 的 Cluster Dynamic Configuration，套用後三台成員都會讀到相同設定。執行完整命令開啟 Dynamic Configuration：</p>
+<pre><code class="language-bash">sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  edit-config iron-pg
+</code></pre>
+<p>在編輯器的 <code>postgresql.parameters</code> 下加入：</p>
+<pre><code class="language-yaml">archive_mode: &quot;on&quot;
+archive_command: &quot;pgbackrest --stanza=iron-pg archive-push %p&quot;
+restore_command: &quot;pgbackrest --stanza=iron-pg archive-get %f %p&quot;
+archive_timeout: 60s
+</code></pre>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code> 儲存並離開編輯器。<code>patronictl</code> 顯示差異後，確認四個參數位於 <code>postgresql.parameters</code>，再輸入 <code>y</code> 套用。</p>
+<pre><code class="language-bash">sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  list
+sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  show-config iron-pg
+</code></pre>
+<p><code>archive_mode</code> 需要 PostgreSQL Restart 才會生效，因此 <code>edit-config</code> 雖然只執行一次，三台成員都要逐台完成 Restart。請使用下列 <code>patronictl restart</code> 順序，一次只重新啟動一台成員。</p>
+<p>先執行 <code>list</code> 記下當下的 Leader 與兩台 Replica。以下範例假設 pg01 是 Leader、pg02 與 pg03 是 Replica；如果畫面角色不同，必須將命令中的成員名稱換成實際角色。</p>
+<p>先 Restart 第一台 Replica：</p>
+<pre><code class="language-bash">sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  restart iron-pg pg02 --force
+
+sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  list
+</code></pre>
+<p>等待 pg02 恢復為 <code>Replica / streaming</code>、Lag 回到可接受範圍後，才 Restart 第二台 Replica：</p>
+<pre><code class="language-bash">sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  restart iron-pg pg03 --force
+
+sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  list
+</code></pre>
+<p><img src="../../source/Day28/day28-main-fig07.png" alt="逐台重新啟動 Replica 後確認 Patroni 叢集狀態"></p>
+<p>圖（七）重新啟動 pg03 後，叢集維持一台 Leader 與兩台串流中的 Replica，Lag 為 0。</p>
+<p>等待 pg03 也恢復為 <code>Replica / streaming</code>。接著把 Leader 從 pg01 Planned Switchover 到已完成 Restart 且 Lag 為 0 的 pg02：</p>
+<pre><code class="language-bash">sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  switchover iron-pg \
+  --leader pg01 \
+  --candidate pg02 \
+  --force
+
+sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  list
+</code></pre>
+<p>確認 pg02 已成為 Leader、pg01 已成為 <code>Replica / streaming</code> 後，Restart 原 Leader：</p>
+<pre><code class="language-bash">sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  restart iron-pg pg01 --force
+
+sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  list
+</code></pre>
+<p>最後必須看到一台 Leader、兩台 <code>Replica / streaming</code>，三台都沒有 <code>Pending restart</code>。接著在 pg01、pg02、pg03 各自執行下列命令，透過本機 Unix Socket 查詢該 PostgreSQL Instance 實際載入的 Archive 設定：</p>
+<pre><code class="language-bash">hostnamectl --static
+sudo -u postgres psql \
+  -X -d postgres -P pager=off \
+  -c &quot;SELECT current_setting(&#39;archive_mode&#39;) AS archive_mode,
+             current_setting(&#39;archive_command&#39;) AS archive_command,
+             current_setting(&#39;restore_command&#39;) AS restore_command,
+             current_setting(&#39;archive_timeout&#39;) AS archive_timeout;&quot;
+</code></pre>
+<p>本 Lab 維持既有 HBA 限制，並在三台節點各自透過本機 Unix Socket 查詢。三台的 <code>archive_mode</code> 都必須是 <code>on</code>，另外三個值也必須與本節設定一致。Dynamic Configuration 顯示的是預定設定，實際查詢結果才能確認需要 Restart 的參數已載入。任一台顯示 <code>off</code> 時，請先以 <code>patronictl restart</code> 完成該成員的 Restart，再執行 <code>check</code> 或 <code>backup</code>。<code>stanza-create</code> 成功只確認 Stanza 已建立；修正 Archive 參數後無須重建 Stanza。</p>
+<p><img src="../../source/Day28/day28-main-fig08.png" alt="PostgreSQL 節點已載入 WAL Archive 設定"></p>
+<p>圖（八）節點實際載入 <code>archive_mode=on</code>、pgBackRest Archive Push／Get 命令與 <code>archive_timeout=1min</code>。</p>
+<h2>7. 建立 Stanza 與 Full Backup</h2>
+<p><strong>操作順序：先在 backup01 建立 Stanza 與 Full Backup，再到目前 Patroni Leader 切換 WAL 並檢查 Archive。</strong></p>
+<p>在 backup01：</p>
+<pre><code class="language-bash">sudo -u pgbackrest pgbackrest --stanza=iron-pg stanza-create
+sudo -u pgbackrest pgbackrest --stanza=iron-pg check
+sudo -u pgbackrest pgbackrest --stanza=iron-pg --type=full backup
+sudo -u pgbackrest pgbackrest --stanza=iron-pg info
+</code></pre>
+<p><img src="../../source/Day28/day28-main-fig09.png" alt="backup01 列出狀態正常的 Stanza 與完整備份"></p>
+<p>圖（九）<code>iron-pg</code> Stanza 狀態為 <code>ok</code>，並列出完整備份及其 WAL 起訖範圍。</p>
+<p>在目前 Primary：</p>
+<pre><code class="language-bash">sudo -u postgres pgbackrest --stanza=iron-pg check
+sudo -u postgres psql -c &#39;SELECT pg_switch_wal();&#39;
+</code></pre>
+<p><img src="../../source/Day28/day28-main-fig10.png" alt="目前 Primary 完成 pgBackRest Check 並切換 WAL"></p>
+<p>圖（十）pgBackRest Check 成功後，Primary 以 <code>pg_switch_wal()</code> 主動完成目前 WAL 區段。</p>
+<p>Repository 中應看到 Backup Set 與 WAL 範圍。只看到 <code>backup command end: completed successfully</code> 還不算完成，必須做還原。</p>
+<h2>8. 建立誤刪時間點</h2>
+<p><strong>操作順序：先找出目前 Leader，再於該 Leader 建立測試資料、記錄時間、執行誤刪。</strong></p>
+<p>在任一 PG Node 先確認目前 Leader：</p>
+<pre><code class="language-bash">sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  list
+</code></pre>
+<p>進入目前顯示為 <code>Leader</code> 的節點 Console，先建立本次測試專用的 <code>PROOF_ID</code>，再使用本機 Unix Socket 開啟管理 Session：</p>
+<pre><code class="language-bash">hostnamectl --static
+PROOF_ID=&quot;day28-$(date +%Y%m%dT%H%M%S%z)&quot;
+printf &#39;PROOF_ID=%s\n&#39; &quot;$PROOF_ID&quot;
+sudo -u postgres psql \
+  -X -d appdb -v ON_ERROR_STOP=1 \
+  -P pager=off -v proof_id=&quot;$PROOF_ID&quot;
+</code></pre>
+<p>在 psql 中切換成 <code>app_owner</code> 後建立測試資料：</p>
+<pre><code class="language-sql">SET ROLE app_owner;
+CREATE TABLE IF NOT EXISTS app.pitr_demo(
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  note text NOT NULL,
+  created_at timestamptz DEFAULT clock_timestamp()
+);
+INSERT INTO app.pitr_demo(note) VALUES (:&#39;proof_id&#39;)
+RETURNING id, note, created_at;
+SELECT clock_timestamp() AS restore_target_time;
+RESET ROLE;
+SELECT pg_walfile_name(pg_current_wal_lsn()) AS target_wal;
+SELECT pg_switch_wal();
+</code></pre>
+<p><img src="../../source/Day28/day28-main-fig11.png" alt="目前 Primary 建立唯一測試資料並記錄復原目標"></p>
+<p>圖（十一）同一次操作建立唯一 <code>PROOF_ID</code>、記錄復原目標時間與目標 WAL，並確認該 WAL 已封存。</p>
+<p>保存 <code>PROOF_ID</code>、<code>restore_target_time</code> 與 <code>target_wal</code>。<code>restore_target_time</code> 要保存查詢結果中的完整時間戳，例如 <code>2026-09-02 02:15:43.123456+08</code>；不要只記錄日期、整點或欄位名稱。保持這個 psql Session，不要先執行 <code>DELETE</code>。在目前 Leader 的另一個 Console 查詢 Archiver：</p>
+<pre><code class="language-bash">sudo -u postgres psql \
+  -X -d postgres -P pager=off \
+  -c &quot;SELECT archived_count,
+             last_archived_wal,
+             last_archived_time,
+             failed_count,
+             last_failed_wal,
+             last_failed_time
+      FROM pg_stat_archiver;&quot;
+</code></pre>
+<p><code>last_archived_wal</code> 必須等於剛才保存的 <code>target_wal</code>，或已經是它之後的 WAL；<code>last_archived_time</code> 必須是本次操作後的新時間。<code>last_failed_wal</code> 與 <code>last_failed_time</code> 是排錯線索；曾經失敗但後來成功時，歷史失敗欄位不會立刻清空，因此以較新的 <code>last_archived_wal</code> 與 <code>last_archived_time</code> 判斷最終結果。</p>
+<p>接著在 backup01 執行 Repository 端檢查：</p>
+<pre><code class="language-bash">sudo -u pgbackrest pgbackrest \
+  --stanza=iron-pg check
+</code></pre>
+<p>必須看到 <code>check command end: completed successfully</code>。只有 Leader 的 <code>pg_stat_archiver</code> 已越過 <code>target_wal</code>，而且 Repository Check 成功，才能回到剛才保持開啟的 psql Session 執行誤刪：</p>
+<pre><code class="language-sql">SET ROLE app_owner;
+DELETE FROM app.pitr_demo WHERE note = :&#39;proof_id&#39;;
+SELECT count(*) AS rows_visible_after_delete
+FROM app.pitr_demo
+WHERE note = :&#39;proof_id&#39;;
+RESET ROLE;
+\q
+</code></pre>
+<p><img src="../../source/Day28/day28-main-fig12.png" alt="正式 Cluster 已刪除本次測試資料"></p>
+<p>圖（十二）正式 Cluster 已刪除本次 <code>PROOF_ID</code>，條件查詢結果為 0 筆。</p>
+<p>Day 25 的 HBA 只允許 Proxy 節點以 <code>app_rw</code> 與 <code>app_ro</code> 連線，沒有允許權限較高的 <code>app_owner</code> 從網路登入。不要為本節新增 <code>app_owner</code> HBA，也不要從 client01 經 DB RW VIP 使用該帳號。不要用模糊的「大約幾分鐘前」；保存含時區的完整 Timestamp。</p>
+<h2>9. 建立 Restore VM</h2>
+<p><strong>操作位置：先在 PVE Web UI 建立全新的 Restore VM，後續還原指令只在該 VM 執行。</strong></p>
+<p>在 PVE Web UI 建立臨時 VM：</p>
+<ol>
+<li>左側選 Debian 13 Template，按 <code>More</code> → <code>Clone</code>。</li>
+<li><code>Target Node</code> 選 <code>pve03</code>、<code>VM ID</code> 填 <code>904</code>、<code>Name</code> 填 <code>pg-restore01</code>。</li>
+<li><code>Mode</code> 選 <code>Full Clone</code>、<code>Target Storage</code> 選 pve03 的 <code>local-lvm</code>，按 <code>Clone</code>。</li>
+<li>Task 顯示 <code>OK</code> 後，到 VM 904 → <code>Hardware</code> → <code>Processors</code> → <code>Edit</code>。</li>
+<li>Sockets 填 <code>1</code>、Cores 填 <code>2</code>，按 <code>OK</code>。</li>
+<li>選 <code>Memory</code> → <code>Edit</code>，Memory 填 <code>2048 MiB</code>、取消 Ballooning，按 <code>OK</code>。</li>
+<li>選 System Disk → <code>Disk Action</code> → <code>Resize</code>，使最終容量為 16 GiB。</li>
+<li>選 <code>Network Device (net0)</code> → <code>Edit</code>，Bridge 選 <code>vmbr1</code>、VLAN Tag 填 <code>30</code>、Model 選 <code>VirtIO</code>、Firewall 勾選，按 <code>OK</code>。</li>
+<li>到 <code>Cloud-Init</code>，User 填 <code>labadmin</code>、Password 填 Lab 管理密碼。</li>
+<li><code>IP Config (net0)</code> → <code>Edit</code>，IPv4 選 <code>Static</code>，IPv4/CIDR 填 <code>10.77.30.21/24</code>、Gateway 填 <code>10.77.30.1</code>，按 <code>OK</code>。</li>
+<li>DNS Domain 填 <code>lab.home</code>、DNS Server 填 <code>10.77.30.1</code>，按 <code>Regenerate Image</code>。</li>
+<li>到 <code>Hardware</code> → <code>Add</code> → <code>Hard Disk</code>。</li>
+<li>Bus／Device 選 <code>SCSI</code>、Storage 選 pve03 的 <code>local-lvm</code>、Disk size 填 <code>16 GiB</code>。</li>
+<li>勾選 <code>Discard</code> 與 <code>IO thread</code>，按 <code>Add</code>。</li>
+<li>按 <code>Start</code>，再開啟 <code>Console</code>。</li>
+</ol>
+<p>這台 VM 不加入 Patroni／etcd，不接受 Application 流量。開機後先確認 DNS：</p>
+<pre><code class="language-bash">resolvectl status
+resolvectl query deb.debian.org
+</code></pre>
+<p><code>resolvectl status</code> 必須看到 DNS Server <code>10.77.30.1</code> 與 DNS Domain <code>lab.home</code>。若缺少，執行：</p>
+<pre><code class="language-bash">sudo install -d -m 0755 /etc/systemd/resolved.conf.d
+printf &#39;%s\n&#39; \
+  &#39;[Resolve]&#39; \
+  &#39;DNS=10.77.30.1&#39; \
+  &#39;Domains=lab.home&#39; |
+  sudo tee /etc/systemd/resolved.conf.d/10-lab-dns.conf
+sudo systemctl restart systemd-resolved
+sudo resolvectl flush-caches
+resolvectl query deb.debian.org
+</code></pre>
+<p>確認解析正常後，再找出 16 GiB 空白 Data Disk：</p>
+<pre><code class="language-bash">sudo lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL
+</code></pre>
+<p>以下假設空白磁碟是 <code>/dev/sdb</code>。請先以 <code>lsblk</code> 確認它是 16 GiB，且 FSTYPE 與 Mountpoint 都為空，再執行：</p>
+<pre><code class="language-bash">sudo wipefs -n /dev/sdb
+sudo mkfs.ext4 -L pgrestore /dev/sdb
+sudo mkdir -p /var/lib/postgresql
+grep -q &#39;^LABEL=pgrestore /var/lib/postgresql &#39; /etc/fstab || \
+  echo &#39;LABEL=pgrestore /var/lib/postgresql ext4 defaults,noatime 0 2&#39; | \
+  sudo tee -a /etc/fstab
+sudo systemctl daemon-reload
+sudo findmnt --verify --verbose
+sudo mount -a
+df -hT /var/lib/postgresql
+</code></pre>
+<p>安裝與 Primary 完全相同版本的 PostgreSQL 18 與 pgBackRest：</p>
+<pre><code class="language-bash">sudo apt update
+sudo apt install -y postgresql-common ca-certificates curl openssh-client
+sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+sudo apt update
+sudo apt install -y postgresql-18 postgresql-client-18 pgbackrest
+psql --version
+pgbackrest version
+</code></pre>
+<p>版本與 pg01 相同後，停止套件預設 Cluster，確認 PostgreSQL 18 的上層目錄由 <code>postgres</code> 管理：</p>
+<pre><code class="language-bash">sudo systemctl disable --now postgresql
+sudo install -d -m 700 -o postgres -g postgres /var/lib/postgresql/18
+</code></pre>
+<p>開啟 Restore VM 的設定檔：</p>
+<pre><code class="language-bash">sudo install -d -m 755 /etc/pgbackrest
+sudo nano /etc/pgbackrest/pgbackrest.conf
+</code></pre>
+<p>貼上：</p>
+<pre><code class="language-ini">[iron-pg]
+pg1-path=/var/lib/postgresql/18/restore
+
+[global]
+repo1-host=backup01.lab.home
+repo1-host-user=pgbackrest
+repo1-path=/var/lib/pgbackrest/repo
+process-max=2
+log-level-console=info
+</code></pre>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code> 儲存，再執行：</p>
+<pre><code class="language-bash">sudo chown root:postgres /etc/pgbackrest/pgbackrest.conf
+sudo chmod 640 /etc/pgbackrest/pgbackrest.conf
+sudo -u postgres install -d -m 700 /var/lib/postgresql/.ssh
+sudo -u postgres ssh-keygen -t ed25519 \
+  -f /var/lib/postgresql/.ssh/id_ed25519 \
+  -C &#39;postgres@pg-restore01&#39; -N &#39;&#39;
+sudo -u postgres cat /var/lib/postgresql/.ssh/id_ed25519.pub
+</code></pre>
+<p>複製這行 Public Key。到 backup01 執行 <code>sudo -u pgbackrest nano /var/lib/pgbackrest/.ssh/authorized_keys</code>，把 Key 貼到新的一行，按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code>。</p>
+<p>在 OPNsense 進入 <code>Firewall</code> → <code>Rules</code>，按 <code>Add</code>。Interface 選 <code>LAB_INTERNAL</code>、Action 選 <code>Pass</code>、Version 選 <code>IPv4</code>、Protocol 選 <code>TCP</code>、Source 填 <code>10.77.30.21</code>、Destination 選 <code>BACKUP_NODE</code>、Destination Port 填 <code>22</code>，Description 填 <code>PITR restore VM to repository</code>。按 <code>Save</code> 後將規則移到 <code>Block LAB_INTERNAL to internal networks</code> 上方，再按 <code>Apply</code>。不建立 backup01 主動連回 Restore VM 的規則。</p>
+<p>回到 pg-restore01，加入 backup01 Host Key 並測試：</p>
+<pre><code class="language-bash">grep -qE &#39;^10\.77\.40\.11[[:space:]]+backup01\.lab\.home([[:space:]]|$)&#39; /etc/hosts || \
+  echo &#39;10.77.40.11 backup01.lab.home backup01&#39; | \
+  sudo tee -a /etc/hosts
+getent ahostsv4 backup01.lab.home
+sudo -u postgres ssh-keyscan -H backup01.lab.home \
+  | sudo -u postgres tee /var/lib/postgresql/.ssh/known_hosts
+sudo -u postgres ssh pgbackrest@backup01.lab.home &#39;hostnamectl --static&#39;
+</code></pre>
+<p>確認回傳 <code>backup01</code> 後才執行 Restore。先建立本次專用的還原目錄並記錄開始時間：</p>
+<p>將下方 <code>2026-09-02 02:15:43.123456+08</code> 換成前面實際保存的 <code>restore_target_time</code>，不要直接照抄範例時間。</p>
+<blockquote>
+<p><strong>安全限制：</strong> <code>pg-restore01</code> 只用來讀取與驗證還原結果，不得產生新 Timeline，也不得把 WAL 寫回正式 Repository。以下 Restore 使用 <code>--target-action=pause</code>，讓 PostgreSQL 到達目標時間後停在 Recovery；<code>--archive-mode=off</code> 與啟動參數中的 <code>-c archive_mode=off</code> 則是兩道防護。不要將 <code>pause</code> 改成 <code>promote</code>，也不要移除這兩個 Archive Mode 設定。</p>
+</blockquote>
+<pre><code class="language-bash">RESTORE_DIR=&quot;/var/lib/postgresql/18/day28-proof-$(date +%Y%m%dT%H%M%S)&quot;
+sudo -u postgres test ! -e &quot;$RESTORE_DIR&quot;
+sudo -u postgres install -d -m 700 &quot;$RESTORE_DIR&quot;
+
+sudo -u postgres pgbackrest --stanza=iron-pg info
+
+RESTORE_START_EPOCH=&quot;$(date +%s.%N)&quot;
+
+sudo -u postgres pgbackrest --stanza=iron-pg \
+  --pg1-path=&quot;$RESTORE_DIR&quot; \
+  --type=time \
+  --target=&#39;2026-09-02 02:15:43.123456+08&#39; \
+  --target-action=pause \
+  --archive-mode=off \
+  restore
+
+RESTORE_END_EPOCH=&quot;$(date +%s.%N)&quot;
+</code></pre>
+<p><img src="../../source/Day28/day28-main-fig13.png" alt="pg-restore01 可以讀取正式 Repository 的備份資訊"></p>
+<p>圖（十三）pg-restore01 已透過專用 SSH 路徑讀取 <code>iron-pg</code> Stanza、完整備份與 Archived WAL 範圍。</p>
+<p>以獨立 Port <code>55432</code> 啟動，不加入 Patroni。還原資料會保留正式 Cluster 的 TLS 與絕對 HBA 路徑；Restore VM 不複製正式 Server Private Key，而且只監聽 Loopback，因此啟動時覆寫這些設定。啟動命令再次強制關閉 Archive Mode，並使用 <code>-l</code> 將背景 Recovery Log 寫入檔案：</p>
+<pre><code class="language-bash">PG_START_EPOCH=&quot;$(date +%s.%N)&quot;
+
+sudo -u postgres /usr/lib/postgresql/18/bin/pg_ctl \
+  -D &quot;$RESTORE_DIR&quot; \
+  -l &quot;$RESTORE_DIR/restore-startup.log&quot; \
+  -o &quot;-p 55432 -c listen_addresses=127.0.0.1 -c ssl=off -c archive_mode=off -c hba_file=$RESTORE_DIR/pg_hba.conf -c ident_file=$RESTORE_DIR/pg_ident.conf&quot; \
+  start
+
+for attempt in $(seq 1 60); do
+  recovery_state=$(sudo -u postgres psql \
+    -p 55432 -d postgres -Atqc \
+    &quot;SELECT current_setting(&#39;archive_mode&#39;),
+            pg_is_in_recovery(),
+            pg_get_wal_replay_pause_state();&quot; 2&gt;/dev/null || true)
+  if [ &quot;$recovery_state&quot; = &#39;off|t|paused&#39; ]; then
+    echo &#39;PITR target: reached and paused; archive_mode=off&#39;
+    break
+  fi
+  sleep 1
+done
+
+test &quot;$recovery_state&quot; = &#39;off|t|paused&#39; || {
+  echo &#39;PITR target was not reached safely or timed out&#39;
+  sudo -u postgres tail -n 80 \
+    &quot;$RESTORE_DIR/restore-startup.log&quot;
+  exit 1
+}
+
+TARGET_REACHED_EPOCH=&quot;$(date +%s.%N)&quot;
+
+PROOF_ID=&#39;請填入前面保存的 PROOF_ID&#39;
+sudo -u postgres psql \
+  -p 55432 -X -d appdb -v proof_id=&quot;$PROOF_ID&quot; \
+  -c &quot;SELECT id, note, created_at
+      FROM app.pitr_demo
+      WHERE note = :&#39;proof_id&#39;;&quot;
+
+VALIDATION_END_EPOCH=&quot;$(date +%s.%N)&quot;
+
+awk \
+  -v restore_start=&quot;$RESTORE_START_EPOCH&quot; \
+  -v restore_end=&quot;$RESTORE_END_EPOCH&quot; \
+  -v pg_start=&quot;$PG_START_EPOCH&quot; \
+  -v target_reached=&quot;$TARGET_REACHED_EPOCH&quot; \
+  -v validation_end=&quot;$VALIDATION_END_EPOCH&quot; \
+  &#39;BEGIN {
+    printf &quot;base_restore_duration=%.3f_seconds\n&quot;, restore_end-restore_start
+    printf &quot;startup_and_wal_replay_duration=%.3f_seconds\n&quot;, target_reached-pg_start
+    printf &quot;validation_duration=%.3f_seconds\n&quot;, validation_end-target_reached
+    printf &quot;restore_to_validated_duration=%.3f_seconds\n&quot;, validation_end-restore_start
+  }&#39;
+</code></pre>
+<p><img src="../../source/Day28/day28-main-fig14.png" alt="pg-restore01 在 Paused Recovery 找回相同測試資料"></p>
+<p>圖（十四）隔離 Restore Instance 維持 <code>archive_mode=off</code> 與 Paused Recovery，並找回相同 <code>PROOF_ID</code>。</p>
+<p>預期可以查到相同的 <code>PROOF_ID</code>，表示這筆 <code>DELETE</code> 尚未在還原狀態中套用。此時 Restore Instance 位於 Recovery 並已暫停 WAL Replay，只提供唯讀驗證。驗證完成後立即停止，不要將它升級成 Primary，也不要把它加入正式流量：</p>
+<pre><code class="language-bash">sudo -u postgres /usr/lib/postgresql/18/bin/pg_ctl \
+  -D &quot;$RESTORE_DIR&quot; \
+  -m fast stop
+</code></pre>
+</main></body></html>

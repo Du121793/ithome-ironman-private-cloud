@@ -1,0 +1,972 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 28 額外實作｜量測 WAL Archive 中斷時的 RPO</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 28 額外實作｜量測 WAL Archive 中斷時的 RPO</h1>
+<p>本文件接續 <a href="./DAY28_pgBackRest_WAL%E8%88%87PITR.md">Day 28｜PostgreSQL 資料誤刪如何復原？使用 pgBackRest、WAL Archive 與 PITR 回到指定時間點</a>。主實作完成備份、WAL Archive 與指定時間 PITR；本額外實作建立受控的 Archive 中斷，量測事故發生時的資料缺口、隔離還原階段耗時，以及恢復 Archive 後追上 Repository 的時間。</p>
+<p>本次測試把「基準 WAL 已封存」到「事故時間」放進同一支腳本，先驗證 Archive 停止前進，再產生測試交易，讓資料缺口只反映受控的 Archive 中斷。</p>
+<p>本次同時取得三組彼此獨立的結果：</p>
+<table>
+<thead>
+<tr>
+<th>結果</th>
+<th>起點與終點</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>RPO 資料缺口</td>
+<td>事故時間 − Restore Instance 最後可見交易時間</td>
+<td>與預先設定的 60 秒 RPO 比較</td>
+</tr>
+<tr>
+<td>隔離還原階段耗時</td>
+<td>Restore 開始、檔案還原完成、WAL 重播到目標、資料驗證完成</td>
+<td>提供災難復原分析；完整服務 RTO 另行量測</td>
+</tr>
+<tr>
+<td>Archive 恢復耗時</td>
+<td>恢復 <code>archive_command</code> − 目標 WAL 完成封存</td>
+<td>評估維運處置與 Repository 追趕時間</td>
+</tr>
+</tbody></table>
+<h2>一、測試安全邊界</h2>
+<ul>
+<li>只在目前 Primary 執行來源端腳本。</li>
+<li>測試期間不要執行 Switchover 或 Failover。</li>
+<li>來源端腳本成功時會刻意保留 <code>archive_command=/bin/false</code>，直到隔離還原完成。</li>
+<li>來源端腳本若中途失敗或收到中斷訊號，會自動重設 <code>archive_command</code>。</li>
+<li>pg-restore01 使用新的資料目錄與 TCP <code>55434</code>，不修改正式 Patroni Cluster。</li>
+<li>RPO 只比較資料時間與交易序號；Restore 耗時及 Archive 追趕耗時分開記錄。</li>
+</ul>
+<h2>二、確認開始條件</h2>
+<h3>在任一 PostgreSQL 節點確認角色</h3>
+<pre><code class="language-bash">sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  list -e
+</code></pre>
+<p>記住目前顯示為 <code>Leader</code> 的節點，後續來源端與恢復 Archive 的命令都必須在同一台節點執行。開始時應為一台 Leader、兩台 <code>Replica / streaming</code>，Lag 為 0。</p>
+<h3>在 backup01 確認 Repository</h3>
+<pre><code class="language-bash">hostnamectl --static
+date --iso-8601=ns
+
+sudo -u pgbackrest pgbackrest \
+  --stanza=iron-pg \
+  check
+
+sudo -u pgbackrest pgbackrest \
+  --stanza=iron-pg \
+  info
+</code></pre>
+<p>只有 Check 成功且至少存在一份有效 Full Backup 時才繼續。</p>
+<h2>三、在目前 Primary 建立補測腳本</h2>
+<p>登入目前 Leader，建立腳本：</p>
+<pre><code class="language-bash">mkdir -p /tmp/day28-rpo-clean
+nano /tmp/day28-rpo-clean/run-source.sh
+</code></pre>
+<p>貼入以下完整內容：</p>
+<pre><code class="language-bash">#!/usr/bin/env bash
+set -Eeuo pipefail
+
+RUN_DIR=&#39;/tmp/day28-rpo-clean&#39;
+SOURCE_ENV=&quot;$RUN_DIR/source.env&quot;
+WRITE_LOG=&quot;$RUN_DIR/writes.log&quot;
+RPO_TARGET_SECONDS=&#39;60&#39;
+EXPECTED_ARCHIVE_COMMAND=&#39;pgbackrest --stanza=iron-pg archive-push %p&#39;
+DAY28_RPO_RUN=&quot;day28-rpo-clean-$(date +%s)&quot;
+RESTORE_POINT_NAME=&quot;day28_rpo_clean_$(date +%s)&quot;
+FAULT_ACTIVE=&#39;no&#39;
+SOURCE_COMPLETE=&#39;no&#39;
+
+mkdir -p &quot;$RUN_DIR&quot;
+rm -f &quot;$SOURCE_ENV&quot; &quot;$WRITE_LOG&quot;
+
+restore_archive_after_error() {
+  exit_code=$?
+
+  if [ &quot;$FAULT_ACTIVE&quot; = &#39;yes&#39; ] &amp;&amp; \
+     [ &quot;$SOURCE_COMPLETE&quot; != &#39;yes&#39; ]; then
+    printf &#39;%s\n&#39; \
+      &#39;ERROR: source measurement stopped early; restoring archive_command&#39;
+
+    sudo -u postgres psql \
+      -X -d postgres -v ON_ERROR_STOP=1 \
+      -c &#39;ALTER SYSTEM RESET archive_command;&#39; \
+      -c &#39;SELECT pg_reload_conf();&#39; \
+      &gt;/dev/null || true
+  fi
+
+  exit &quot;$exit_code&quot;
+}
+
+trap restore_archive_after_error ERR INT TERM
+
+FAULT_NODE=&quot;$(hostnamectl --static)&quot;
+
+IS_IN_RECOVERY=&quot;$(
+  sudo -u postgres psql \
+    -X -d postgres -Atqc \
+    &#39;SELECT pg_is_in_recovery();&#39;
+)&quot;
+
+if [ &quot;$IS_IN_RECOVERY&quot; != &#39;f&#39; ]; then
+  echo &#39;ERROR: this node is not the current Primary&#39; &gt;&amp;2
+  exit 1
+fi
+
+ARCHIVE_COMMAND_SOURCE=&quot;$(
+  sudo -u postgres psql \
+    -X -d postgres -Atqc \
+    &quot;SELECT coalesce(sourcefile, &#39;&#39;)
+     FROM pg_settings
+     WHERE name = &#39;archive_command&#39;;&quot;
+)&quot;
+
+ARCHIVE_COMMAND_BEFORE=&quot;$(
+  sudo -u postgres psql \
+    -X -d postgres -Atqc \
+    &#39;SHOW archive_command;&#39;
+)&quot;
+
+if [[ &quot;$ARCHIVE_COMMAND_SOURCE&quot; == */postgresql.auto.conf ]]; then
+  echo &#39;ERROR: archive_command already has an ALTER SYSTEM override&#39; &gt;&amp;2
+  exit 1
+fi
+
+if [ &quot;$ARCHIVE_COMMAND_BEFORE&quot; != \
+     &quot;$EXPECTED_ARCHIVE_COMMAND&quot; ]; then
+  echo &#39;ERROR: unexpected archive_command&#39; &gt;&amp;2
+  printf &#39;actual_archive_command=%s\n&#39; &quot;$ARCHIVE_COMMAND_BEFORE&quot;
+  exit 1
+fi
+
+sudo -u postgres psql \
+  -X -d appdb -v ON_ERROR_STOP=1 \
+  -P pager=off \
+  -c &quot;SET ROLE app_owner;
+      CREATE TABLE IF NOT EXISTS app.rpo_probe(
+        run_id text NOT NULL,
+        seq integer NOT NULL,
+        committed_at timestamptz NOT NULL
+          DEFAULT clock_timestamp(),
+        committed_epoch numeric NOT NULL
+          DEFAULT extract(epoch FROM clock_timestamp()),
+        PRIMARY KEY(run_id, seq)
+      );
+      RESET ROLE;&quot; \
+  &gt;/dev/null
+
+BASELINE_ROW=&quot;$(
+  sudo -u postgres psql \
+    -X -qAt -F &#39;|&#39; -d appdb -v ON_ERROR_STOP=1 \
+    -c &quot;SET ROLE app_owner;
+        INSERT INTO app.rpo_probe(run_id, seq)
+        VALUES (&#39;$DAY28_RPO_RUN&#39;, 0)
+        RETURNING seq, committed_at, committed_epoch;&quot;
+)&quot;
+
+RESTORE_POINT_LSN=&quot;$(
+  sudo -u postgres psql \
+    -X -d postgres -v ON_ERROR_STOP=1 -Atqc \
+    &quot;SELECT pg_create_restore_point(&#39;$RESTORE_POINT_NAME&#39;);&quot;
+)&quot;
+
+BASELINE_TARGET_WAL=&quot;$(
+  sudo -u postgres psql \
+    -X -d postgres -Atqc \
+    &quot;SELECT pg_walfile_name(pg_current_wal_lsn());&quot;
+)&quot;
+
+sudo -u postgres psql \
+  -X -d postgres -Atqc \
+  &#39;SELECT pg_switch_wal();&#39; \
+  &gt;/dev/null
+
+BASELINE_ARCHIVED=&#39;no&#39;
+LAST_ARCHIVED_WAL=&#39;&#39;
+
+for attempt in $(seq 1 90); do
+  LAST_ARCHIVED_WAL=&quot;$(
+    sudo -u postgres psql \
+      -X -d postgres -Atqc \
+      &quot;SELECT coalesce(last_archived_wal, &#39;&#39;)
+       FROM pg_stat_archiver;&quot;
+  )&quot;
+
+  if [[ &quot;$LAST_ARCHIVED_WAL&quot; == &quot;$BASELINE_TARGET_WAL&quot; || \
+        &quot;$LAST_ARCHIVED_WAL&quot; &gt; &quot;$BASELINE_TARGET_WAL&quot; ]]; then
+    BASELINE_ARCHIVED=&#39;yes&#39;
+    break
+  fi
+
+  sleep 1
+done
+
+if [ &quot;$BASELINE_ARCHIVED&quot; != &#39;yes&#39; ]; then
+  echo &#39;ERROR: baseline WAL was not archived within 90 seconds&#39; &gt;&amp;2
+  exit 1
+fi
+
+BASELINE_ARCHIVED_EPOCH=&quot;$(date +%s.%N)&quot;
+
+FAILED_COUNT_BEFORE=&quot;$(
+  sudo -u postgres psql \
+    -X -d postgres -Atqc \
+    &#39;SELECT failed_count FROM pg_stat_archiver;&#39;
+)&quot;
+
+# 先把故障狀態交給 Trap 管理。即使 ALTER SYSTEM 或 Reload 失敗，
+# RESET archive_command 也只會移除可能存在的本次 Override。
+FAULT_ACTIVE=&#39;yes&#39;
+
+sudo -u postgres psql \
+  -X -d postgres -v ON_ERROR_STOP=1 \
+  -c &quot;ALTER SYSTEM SET archive_command = &#39;/bin/false&#39;;&quot; \
+  -c &#39;SELECT pg_reload_conf();&#39; \
+  &gt;/dev/null
+
+sleep 2
+
+ARCHIVE_COMMAND_DURING=&quot;$(
+  sudo -u postgres psql \
+    -X -d postgres -Atqc \
+    &#39;SHOW archive_command;&#39;
+)&quot;
+
+if [ &quot;$ARCHIVE_COMMAND_DURING&quot; != &#39;/bin/false&#39; ]; then
+  echo &#39;ERROR: archive fault was not activated&#39; &gt;&amp;2
+  exit 1
+fi
+
+FAULT_INJECTED_EPOCH=&quot;$(date +%s.%N)&quot;
+FAULT_INJECTED_TIME=&quot;$(date --iso-8601=ns)&quot;
+
+sudo -u postgres psql \
+  -X -d postgres -Atqc \
+  &#39;SELECT pg_switch_wal();&#39; \
+  &gt;/dev/null
+
+ARCHIVE_FAILURE_OBSERVED=&#39;no&#39;
+ARCHIVE_FAILURE_EPOCH=&#39;&#39;
+ARCHIVE_FAILURE_WAL=&#39;&#39;
+FAILED_COUNT_AFTER=&#39;&#39;
+
+for attempt in $(seq 1 90); do
+  ARCHIVER_FAILURE_STATE=&quot;$(
+    sudo -u postgres psql \
+      -X -d postgres -At -F &#39;|&#39; \
+      -c &quot;SELECT failed_count,
+                 coalesce(last_failed_wal, &#39;&#39;),
+                 coalesce(extract(epoch FROM last_failed_time), 0)
+          FROM pg_stat_archiver;&quot;
+  )&quot;
+
+  IFS=&#39;|&#39; read -r \
+    FAILED_COUNT_AFTER \
+    ARCHIVE_FAILURE_WAL \
+    ARCHIVE_FAILURE_EPOCH \
+    &lt;&lt;&lt; &quot;$ARCHIVER_FAILURE_STATE&quot;
+
+  if [ &quot;$FAILED_COUNT_AFTER&quot; -gt &quot;$FAILED_COUNT_BEFORE&quot; ]; then
+    ARCHIVE_FAILURE_OBSERVED=&#39;yes&#39;
+    break
+  fi
+
+  sleep 1
+done
+
+if [ &quot;$ARCHIVE_FAILURE_OBSERVED&quot; != &#39;yes&#39; ]; then
+  echo &#39;ERROR: pg_stat_archiver did not record the injected fault&#39; &gt;&amp;2
+  exit 1
+fi
+
+for seq in $(seq 1 15); do
+  sudo -u postgres psql \
+    -X -qAt -F &#39;|&#39; -d appdb -v ON_ERROR_STOP=1 \
+    -c &quot;SET ROLE app_owner;
+        INSERT INTO app.rpo_probe(run_id, seq)
+        VALUES (&#39;$DAY28_RPO_RUN&#39;, $seq)
+        RETURNING seq, committed_at, committed_epoch;&quot;
+  sleep 1
+done | tee &quot;$WRITE_LOG&quot;
+
+INCIDENT_RECORD=&quot;$(
+  sudo -u postgres psql \
+    -X -d postgres -At -F &#39;|&#39; \
+    -c &quot;WITH captured AS (
+          SELECT clock_timestamp() AS ts
+        )
+        SELECT ts, extract(epoch FROM ts)
+        FROM captured;&quot;
+)&quot;
+
+IFS=&#39;|&#39; read -r INCIDENT_TIME INCIDENT_EPOCH \
+  &lt;&lt;&lt; &quot;$INCIDENT_RECORD&quot;
+
+SOURCE_SUMMARY=&quot;$(
+  sudo -u postgres psql \
+    -X -d appdb -At -F &#39;|&#39; \
+    -c &quot;SELECT count(*),
+               max(seq),
+               max(committed_at),
+               max(committed_epoch)
+        FROM app.rpo_probe
+        WHERE run_id = &#39;$DAY28_RPO_RUN&#39;;&quot;
+)&quot;
+
+IFS=&#39;|&#39; read -r \
+  SOURCE_COUNT \
+  SOURCE_MAX_SEQ \
+  SOURCE_LAST_TIME \
+  SOURCE_LAST_EPOCH \
+  &lt;&lt;&lt; &quot;$SOURCE_SUMMARY&quot;
+
+if [ &quot;$SOURCE_COUNT&quot; != &#39;16&#39; ] || \
+   [ &quot;$SOURCE_MAX_SEQ&quot; != &#39;15&#39; ]; then
+  echo &#39;ERROR: source transaction set is incomplete&#39; &gt;&amp;2
+  exit 1
+fi
+
+{
+  printf &#39;FAULT_NODE=%q\n&#39; &quot;$FAULT_NODE&quot;
+  printf &#39;DAY28_RPO_RUN=%q\n&#39; &quot;$DAY28_RPO_RUN&quot;
+  printf &#39;RESTORE_POINT_NAME=%q\n&#39; &quot;$RESTORE_POINT_NAME&quot;
+  printf &#39;RESTORE_POINT_LSN=%q\n&#39; &quot;$RESTORE_POINT_LSN&quot;
+  printf &#39;RPO_TARGET_SECONDS=%q\n&#39; &quot;$RPO_TARGET_SECONDS&quot;
+  printf &#39;BASELINE_ROW=%q\n&#39; &quot;$BASELINE_ROW&quot;
+  printf &#39;BASELINE_TARGET_WAL=%q\n&#39; &quot;$BASELINE_TARGET_WAL&quot;
+  printf &#39;BASELINE_ARCHIVED_EPOCH=%q\n&#39; &quot;$BASELINE_ARCHIVED_EPOCH&quot;
+  printf &#39;FAULT_INJECTED_TIME=%q\n&#39; &quot;$FAULT_INJECTED_TIME&quot;
+  printf &#39;FAULT_INJECTED_EPOCH=%q\n&#39; &quot;$FAULT_INJECTED_EPOCH&quot;
+  printf &#39;ARCHIVE_FAILURE_EPOCH=%q\n&#39; &quot;$ARCHIVE_FAILURE_EPOCH&quot;
+  printf &#39;ARCHIVE_FAILURE_WAL=%q\n&#39; &quot;$ARCHIVE_FAILURE_WAL&quot;
+  printf &#39;INCIDENT_TIME=%q\n&#39; &quot;$INCIDENT_TIME&quot;
+  printf &#39;INCIDENT_EPOCH=%q\n&#39; &quot;$INCIDENT_EPOCH&quot;
+  printf &#39;SOURCE_SUMMARY=%q\n&#39; &quot;$SOURCE_SUMMARY&quot;
+} | tee &quot;$SOURCE_ENV&quot; &gt;/dev/null
+
+FAULT_TO_FAILURE_SECONDS=&quot;$(
+  awk \
+    -v start=&quot;$FAULT_INJECTED_EPOCH&quot; \
+    -v finish=&quot;$ARCHIVE_FAILURE_EPOCH&quot; \
+    &#39;BEGIN { printf &quot;%.3f&quot;, finish-start }&#39;
+)&quot;
+
+FAULT_TO_INCIDENT_SECONDS=&quot;$(
+  awk \
+    -v start=&quot;$FAULT_INJECTED_EPOCH&quot; \
+    -v finish=&quot;$INCIDENT_EPOCH&quot; \
+    &#39;BEGIN { printf &quot;%.3f&quot;, finish-start }&#39;
+)&quot;
+
+SOURCE_COMPLETE=&#39;yes&#39;
+
+printf &#39;%s\n&#39; &#39;--- precise source measurement ---&#39;
+printf &#39;fault_node=%s\n&#39; &quot;$FAULT_NODE&quot;
+printf &#39;run_id=%s\n&#39; &quot;$DAY28_RPO_RUN&quot;
+printf &#39;baseline_row=%s\n&#39; &quot;$BASELINE_ROW&quot;
+printf &#39;baseline_target_wal=%s\n&#39; &quot;$BASELINE_TARGET_WAL&quot;
+printf &#39;baseline_archived=yes\n&#39;
+printf &#39;fault_injected_time=%s\n&#39; &quot;$FAULT_INJECTED_TIME&quot;
+printf &#39;archive_failure_wal=%s\n&#39; &quot;$ARCHIVE_FAILURE_WAL&quot;
+printf &#39;fault_to_archive_failure=%s_seconds\n&#39; \
+  &quot;$FAULT_TO_FAILURE_SECONDS&quot;
+printf &#39;incident_time=%s\n&#39; &quot;$INCIDENT_TIME&quot;
+printf &#39;fault_to_incident=%s_seconds\n&#39; \
+  &quot;$FAULT_TO_INCIDENT_SECONDS&quot;
+printf &#39;source_count=%s\n&#39; &quot;$SOURCE_COUNT&quot;
+printf &#39;source_max_seq=%s\n&#39; &quot;$SOURCE_MAX_SEQ&quot;
+printf &#39;source_last_commit=%s\n&#39; &quot;$SOURCE_LAST_TIME&quot;
+printf &#39;archive_command_during=%s\n&#39; &quot;$ARCHIVE_COMMAND_DURING&quot;
+printf &#39;source_measurement=READY_FOR_ISOLATED_RESTORE\n&#39;
+
+printf &#39;%s\n&#39; &#39;--- transfer token ---&#39;
+base64 -w 0 &quot;$SOURCE_ENV&quot;
+printf &#39;\n&#39;
+</code></pre>
+<p>儲存後檢查並執行：</p>
+<pre><code class="language-bash">chmod 750 /tmp/day28-rpo-clean/run-source.sh
+bash -n /tmp/day28-rpo-clean/run-source.sh
+sudo /tmp/day28-rpo-clean/run-source.sh
+</code></pre>
+<p>完成後先不要關閉這個終端，也不要恢復 <code>archive_command</code>。複製輸出最後一行的 Base64 Transfer Token。</p>
+<p>下圖保留本次來源端輸出，可核對基準 WAL、Archive 故障成立時間、事故時間、交易數量與故障期間的 <code>archive_command</code>。</p>
+<p><img src="../../source/Day28/day28-extra-fig01.png" alt="來源端自動確認基準 WAL、Archive 故障與事故時間"></p>
+<p>圖（一）基準 WAL <code>9E</code> 已封存，Archive 故障於 0.258 秒後留下紀錄；來源端在 16.022 秒後完成 <code>seq=1～15</code> 並固定事故時間。</p>
+<h2>四、在 pg-restore01 還原並計算資料缺口</h2>
+<p>先把上一節的 Transfer Token 填入：</p>
+<pre><code class="language-bash">SOURCE_ENV_B64=&#39;請貼上來源端腳本輸出的完整 Base64 Transfer Token&#39;
+
+SOURCE_ENV_FILE=&#39;/tmp/day28-rpo-clean-source.env&#39;
+
+unset \
+  FAULT_NODE \
+  DAY28_RPO_RUN \
+  RESTORE_POINT_NAME \
+  RESTORE_POINT_LSN \
+  RPO_TARGET_SECONDS \
+  BASELINE_ROW \
+  BASELINE_TARGET_WAL \
+  BASELINE_ARCHIVED_EPOCH \
+  FAULT_INJECTED_TIME \
+  FAULT_INJECTED_EPOCH \
+  ARCHIVE_FAILURE_EPOCH \
+  ARCHIVE_FAILURE_WAL \
+  INCIDENT_TIME \
+  INCIDENT_EPOCH \
+  SOURCE_SUMMARY
+
+sudo install \
+  -o &quot;$(id -un)&quot; \
+  -g &quot;$(id -gn)&quot; \
+  -m 600 \
+  /dev/null \
+  &quot;$SOURCE_ENV_FILE&quot;
+
+printf &#39;%s&#39; &quot;$SOURCE_ENV_B64&quot; | \
+  base64 -d &gt; &quot;$SOURCE_ENV_FILE&quot;
+
+source &quot;$SOURCE_ENV_FILE&quot;
+
+printf &#39;fault_node=%s\n&#39; &quot;$FAULT_NODE&quot;
+printf &#39;run_id=%s\n&#39; &quot;$DAY28_RPO_RUN&quot;
+printf &#39;restore_point=%s\n&#39; &quot;$RESTORE_POINT_NAME&quot;
+printf &#39;incident_time=%s\n&#39; &quot;$INCIDENT_TIME&quot;
+printf &#39;source_summary=%s\n&#39; &quot;$SOURCE_SUMMARY&quot;
+</code></pre>
+<p>輸出必須是本次 <code>day28-rpo-clean-*</code> 樣本。若出現舊的 <code>day28-rpo-*</code> Run ID，表示環境檔沒有載入成功，先停止，不要執行 Restore。</p>
+<p>建立補測腳本：</p>
+<pre><code class="language-bash">nano /tmp/day28-rpo-clean-restore.sh
+</code></pre>
+<p>貼入以下完整內容：</p>
+<pre><code class="language-bash">#!/usr/bin/env bash
+set -Eeuo pipefail
+
+source /tmp/day28-rpo-clean-source.env
+
+RESTORE_PORT=&#39;55434&#39;
+RESTORE_DIR=&quot;/var/lib/postgresql/18/day28-rpo-clean-$(date +%Y%m%dT%H%M%S)&quot;
+RESULT_ENV=&#39;/tmp/day28-rpo-clean-result.env&#39;
+
+if ss -lnt | grep -qE \
+   &quot;127\\.0\\.0\\.1:${RESTORE_PORT}([[:space:]]|$)&quot;; then
+  echo &quot;ERROR: TCP $RESTORE_PORT is already in use&quot; &gt;&amp;2
+  exit 1
+fi
+
+getent ahostsv4 backup01.lab.home
+
+sudo -u postgres ssh \
+  -o BatchMode=yes \
+  -o ConnectTimeout=5 \
+  pgbackrest@backup01.lab.home \
+  &#39;hostnamectl --static&#39;
+
+sudo -u postgres pgbackrest \
+  --stanza=iron-pg \
+  info \
+  &gt;/dev/null
+
+sudo -u postgres test ! -e &quot;$RESTORE_DIR&quot;
+sudo -u postgres install -d -m 700 &quot;$RESTORE_DIR&quot;
+
+RESTORE_START_EPOCH=&quot;$(date +%s.%N)&quot;
+
+sudo -u postgres pgbackrest \
+  --stanza=iron-pg \
+  --pg1-path=&quot;$RESTORE_DIR&quot; \
+  --type=name \
+  --target=&quot;$RESTORE_POINT_NAME&quot; \
+  --target-action=pause \
+  --archive-mode=off \
+  restore
+
+RESTORE_END_EPOCH=&quot;$(date +%s.%N)&quot;
+PG_START_EPOCH=&quot;$(date +%s.%N)&quot;
+
+sudo -u postgres /usr/lib/postgresql/18/bin/pg_ctl \
+  -D &quot;$RESTORE_DIR&quot; \
+  -l &quot;$RESTORE_DIR/restore-startup.log&quot; \
+  -o &quot;-p $RESTORE_PORT -c listen_addresses=127.0.0.1 -c ssl=off -c archive_mode=off -c hba_file=$RESTORE_DIR/pg_hba.conf -c ident_file=$RESTORE_DIR/pg_ident.conf&quot; \
+  start
+
+TARGET_REACHED=&#39;no&#39;
+RECOVERY_STATE=&#39;&#39;
+
+for attempt in $(seq 1 90); do
+  RECOVERY_STATE=&quot;$(
+    sudo -u postgres psql \
+      -p &quot;$RESTORE_PORT&quot; -d postgres -Atqc \
+      &quot;SELECT current_setting(&#39;archive_mode&#39;),
+              pg_is_in_recovery(),
+              pg_get_wal_replay_pause_state();&quot; \
+      2&gt;/dev/null || true
+  )&quot;
+
+  if [ &quot;$RECOVERY_STATE&quot; = &#39;off|t|paused&#39; ]; then
+    TARGET_REACHED=&#39;yes&#39;
+    break
+  fi
+
+  sleep 1
+done
+
+if [ &quot;$TARGET_REACHED&quot; != &#39;yes&#39; ]; then
+  sudo -u postgres tail -n 100 \
+    &quot;$RESTORE_DIR/restore-startup.log&quot;
+  echo &#39;ERROR: PITR target was not reached within 90 seconds&#39; &gt;&amp;2
+  exit 1
+fi
+
+TARGET_REACHED_EPOCH=&quot;$(date +%s.%N)&quot;
+
+RECOVERED_SUMMARY=&quot;$(
+  sudo -u postgres psql \
+    -p &quot;$RESTORE_PORT&quot; -X -d appdb -At -F &#39;|&#39; \
+    -c &quot;SELECT count(*),
+               max(seq),
+               max(committed_at),
+               max(committed_epoch)
+        FROM app.rpo_probe
+        WHERE run_id = &#39;$DAY28_RPO_RUN&#39;;&quot;
+)&quot;
+
+VALIDATION_END_EPOCH=&quot;$(date +%s.%N)&quot;
+
+SOURCE_SUMMARY_NORMALIZED=&quot;$(
+  printf &#39;%s&#39; &quot;$SOURCE_SUMMARY&quot; | tr -d &#39;\\&#39;
+)&quot;
+
+IFS=&#39;|&#39; read -r \
+  SOURCE_COUNT \
+  SOURCE_MAX_SEQ \
+  SOURCE_LAST_TIME \
+  SOURCE_LAST_EPOCH \
+  &lt;&lt;&lt; &quot;$SOURCE_SUMMARY_NORMALIZED&quot;
+
+IFS=&#39;|&#39; read -r \
+  RECOVERED_COUNT \
+  RECOVERED_MAX_SEQ \
+  RECOVERED_LAST_TIME \
+  RECOVERED_LAST_EPOCH \
+  &lt;&lt;&lt; &quot;$RECOVERED_SUMMARY&quot;
+
+if [ &quot;$SOURCE_COUNT&quot; != &#39;16&#39; ] || \
+   [ &quot;$SOURCE_MAX_SEQ&quot; != &#39;15&#39; ] || \
+   [ &quot;$RECOVERED_COUNT&quot; != &#39;1&#39; ] || \
+   [ &quot;$RECOVERED_MAX_SEQ&quot; != &#39;0&#39; ]; then
+  RESULT=&#39;INVALID_SAMPLE&#39;
+else
+  RESULT=&quot;$(
+    awk \
+      -v incident=&quot;$INCIDENT_EPOCH&quot; \
+      -v recovered=&quot;$RECOVERED_LAST_EPOCH&quot; \
+      -v target=&quot;$RPO_TARGET_SECONDS&quot; \
+      &#39;BEGIN {
+        if ((incident-recovered) &lt;= target) print &quot;PASS&quot;
+        else print &quot;FAIL&quot;
+      }&#39;
+  )&quot;
+fi
+
+RPO_TIME_GAP=&quot;$(
+  awk \
+    -v incident=&quot;$INCIDENT_EPOCH&quot; \
+    -v recovered=&quot;$RECOVERED_LAST_EPOCH&quot; \
+    &#39;BEGIN { printf &quot;%.3f&quot;, incident-recovered }&#39;
+)&quot;
+
+RPO_TRANSACTION_GAP=&quot;$((
+  SOURCE_MAX_SEQ - RECOVERED_MAX_SEQ
+))&quot;
+
+RESTORE_COPY_DURATION=&quot;$(
+  awk \
+    -v start=&quot;$RESTORE_START_EPOCH&quot; \
+    -v finish=&quot;$RESTORE_END_EPOCH&quot; \
+    &#39;BEGIN { printf &quot;%.3f&quot;, finish-start }&#39;
+)&quot;
+
+STARTUP_REPLAY_DURATION=&quot;$(
+  awk \
+    -v start=&quot;$PG_START_EPOCH&quot; \
+    -v finish=&quot;$TARGET_REACHED_EPOCH&quot; \
+    &#39;BEGIN { printf &quot;%.3f&quot;, finish-start }&#39;
+)&quot;
+
+VALIDATION_DURATION=&quot;$(
+  awk \
+    -v start=&quot;$TARGET_REACHED_EPOCH&quot; \
+    -v finish=&quot;$VALIDATION_END_EPOCH&quot; \
+    &#39;BEGIN { printf &quot;%.3f&quot;, finish-start }&#39;
+)&quot;
+
+RESTORE_TO_VALIDATED_DURATION=&quot;$(
+  awk \
+    -v start=&quot;$RESTORE_START_EPOCH&quot; \
+    -v finish=&quot;$VALIDATION_END_EPOCH&quot; \
+    &#39;BEGIN { printf &quot;%.3f&quot;, finish-start }&#39;
+)&quot;
+
+{
+  printf &#39;RESTORE_DIR=%q\n&#39; &quot;$RESTORE_DIR&quot;
+  printf &#39;RESTORE_PORT=%q\n&#39; &quot;$RESTORE_PORT&quot;
+  printf &#39;RPO_TIME_GAP=%q\n&#39; &quot;$RPO_TIME_GAP&quot;
+  printf &#39;RPO_TRANSACTION_GAP=%q\n&#39; &quot;$RPO_TRANSACTION_GAP&quot;
+  printf &#39;RPO_RESULT=%q\n&#39; &quot;$RESULT&quot;
+  printf &#39;RESTORE_COPY_DURATION=%q\n&#39; \
+    &quot;$RESTORE_COPY_DURATION&quot;
+  printf &#39;STARTUP_REPLAY_DURATION=%q\n&#39; \
+    &quot;$STARTUP_REPLAY_DURATION&quot;
+  printf &#39;VALIDATION_DURATION=%q\n&#39; \
+    &quot;$VALIDATION_DURATION&quot;
+  printf &#39;RESTORE_TO_VALIDATED_DURATION=%q\n&#39; \
+    &quot;$RESTORE_TO_VALIDATED_DURATION&quot;
+} | sudo tee &quot;$RESULT_ENV&quot; &gt;/dev/null
+
+printf &#39;%s\n&#39; &#39;--- RPO result ---&#39;
+printf &#39;run_id=%s\n&#39; &quot;$DAY28_RPO_RUN&quot;
+printf &#39;incident_time=%s\n&#39; &quot;$INCIDENT_TIME&quot;
+printf &#39;source_summary=%s\n&#39; &quot;$SOURCE_SUMMARY_NORMALIZED&quot;
+printf &#39;recovered_summary=%s\n&#39; &quot;$RECOVERED_SUMMARY&quot;
+printf &#39;observed_rpo_time_gap=%s_seconds\n&#39; &quot;$RPO_TIME_GAP&quot;
+printf &#39;observed_rpo_transaction_gap=%s_transactions\n&#39; \
+  &quot;$RPO_TRANSACTION_GAP&quot;
+printf &#39;rpo_target=%s_seconds\n&#39; &quot;$RPO_TARGET_SECONDS&quot;
+printf &#39;rpo_result=%s\n&#39; &quot;$RESULT&quot;
+
+printf &#39;%s\n&#39; &#39;--- isolated recovery-stage durations ---&#39;
+printf &#39;restore_copy=%s_seconds\n&#39; &quot;$RESTORE_COPY_DURATION&quot;
+printf &#39;postgres_startup_and_wal_replay=%s_seconds\n&#39; \
+  &quot;$STARTUP_REPLAY_DURATION&quot;
+printf &#39;data_validation=%s_seconds\n&#39; &quot;$VALIDATION_DURATION&quot;
+printf &#39;restore_to_validated=%s_seconds\n&#39; \
+  &quot;$RESTORE_TO_VALIDATED_DURATION&quot;
+printf &#39;recovery_state=%s\n&#39; &quot;$RECOVERY_STATE&quot;
+
+sudo -u postgres psql \
+  -p &quot;$RESTORE_PORT&quot; -X -d appdb -P pager=off \
+  -c &quot;SELECT run_id, seq, committed_at
+      FROM app.rpo_probe
+      WHERE run_id = &#39;$DAY28_RPO_RUN&#39;
+      ORDER BY seq;&quot;
+</code></pre>
+<p>儲存後檢查並執行：</p>
+<pre><code class="language-bash">chmod 750 /tmp/day28-rpo-clean-restore.sh
+bash -n /tmp/day28-rpo-clean-restore.sh
+sudo /tmp/day28-rpo-clean-restore.sh
+</code></pre>
+<p>下圖將來源端與 Restore Instance 的摘要放在一起，並列出資料缺口、60 秒目標、判讀結果與各還原階段耗時。</p>
+<p><img src="../../source/Day28/day28-extra-fig02.png" alt="隔離 Restore Instance 的 RPO 結果與恢復階段耗時"></p>
+<p>圖（二）正式 Cluster 保存 16 筆測試資料，Restore Instance 只看見 <code>seq=0</code>。時間缺口為 19.623 秒、交易缺口為 15 筆，低於預先設定的 60 秒 RPO。</p>
+<h2>五、停止隔離 Instance</h2>
+<p>在 pg-restore01 執行：</p>
+<pre><code class="language-bash">source /tmp/day28-rpo-clean-result.env
+
+sudo -u postgres /usr/lib/postgresql/18/bin/pg_ctl \
+  -D &quot;$RESTORE_DIR&quot; \
+  -m fast \
+  stop
+</code></pre>
+<p>確認 TCP <code>55434</code> 已釋放：</p>
+<pre><code class="language-bash">ss -lnt | grep -E &#39;127\.0\.0\.1:55434([[:space:]]|$)&#39; || \
+  echo &#39;restore_instance_stopped=yes&#39;
+</code></pre>
+<h2>六、在原 Primary 恢復 Archive 並量測追趕時間</h2>
+<p>回到來源端腳本顯示的 <code>fault_node</code>。先確認該節點目前是 Primary：</p>
+<pre><code class="language-bash">source /tmp/day28-rpo-clean/source.env
+
+hostnamectl --static
+
+sudo -u postgres psql \
+  -X -d postgres -Atqc \
+  &#39;SELECT pg_is_in_recovery();&#39;
+
+sudo -u postgres psql \
+  -X -d postgres -Atqc \
+  &#39;SHOW archive_command;&#39;
+</code></pre>
+<p>主機名稱必須等於 <code>FAULT_NODE</code>，<code>pg_is_in_recovery()</code> 必須為 <code>f</code>，<code>archive_command</code> 必須維持 <code>/bin/false</code>。任一條件不符就先停止，不要直接執行後續命令。</p>
+<p>建立恢復腳本：</p>
+<pre><code class="language-bash">nano /tmp/day28-rpo-clean/restore-archive.sh
+</code></pre>
+<p>貼入以下完整內容：</p>
+<pre><code class="language-bash">#!/usr/bin/env bash
+set -Eeuo pipefail
+
+source /tmp/day28-rpo-clean/source.env
+
+EXPECTED_ARCHIVE_COMMAND=&#39;pgbackrest --stanza=iron-pg archive-push %p&#39;
+CURRENT_NODE=&quot;$(hostnamectl --static)&quot;
+
+if [ &quot;$CURRENT_NODE&quot; != &quot;$FAULT_NODE&quot; ]; then
+  echo &#39;ERROR: run this script on the original fault node&#39; &gt;&amp;2
+  exit 1
+fi
+
+IS_IN_RECOVERY=&quot;$(
+  sudo -u postgres psql \
+    -X -d postgres -Atqc \
+    &#39;SELECT pg_is_in_recovery();&#39;
+)&quot;
+
+if [ &quot;$IS_IN_RECOVERY&quot; != &#39;f&#39; ]; then
+  echo &#39;ERROR: the original fault node is no longer Primary&#39; &gt;&amp;2
+  echo &#39;Restoring archive_command on this node; the sample is invalid.&#39; &gt;&amp;2
+
+  sudo -u postgres psql \
+    -X -d postgres -v ON_ERROR_STOP=1 \
+    -c &#39;ALTER SYSTEM RESET archive_command;&#39; \
+    -c &#39;SELECT pg_reload_conf();&#39; \
+    &gt;/dev/null
+
+  printf &#39;archive_command_after_role_change=%s\n&#39; &quot;$(
+    sudo -u postgres psql \
+      -X -d postgres -Atqc \
+      &#39;SHOW archive_command;&#39;
+  )&quot;
+  printf &#39;measurement_result=INVALID_ROLE_CHANGE\n&#39;
+  exit 1
+fi
+
+ARCHIVE_RESTORE_START_EPOCH=&quot;$(date +%s.%N)&quot;
+ARCHIVE_RESTORE_START_TIME=&quot;$(date --iso-8601=ns)&quot;
+
+sudo -u postgres psql \
+  -X -d postgres -v ON_ERROR_STOP=1 \
+  -c &#39;ALTER SYSTEM RESET archive_command;&#39; \
+  -c &#39;SELECT pg_reload_conf();&#39; \
+  &gt;/dev/null
+
+sleep 2
+
+ARCHIVE_COMMAND_AFTER=&quot;$(
+  sudo -u postgres psql \
+    -X -d postgres -Atqc \
+    &#39;SHOW archive_command;&#39;
+)&quot;
+
+if [ &quot;$ARCHIVE_COMMAND_AFTER&quot; != \
+     &quot;$EXPECTED_ARCHIVE_COMMAND&quot; ]; then
+  echo &#39;ERROR: archive_command was not restored&#39; &gt;&amp;2
+  exit 1
+fi
+
+ARCHIVE_RECOVERY_POINT=&quot;day28_rpo_recovery_$(date +%s)&quot;
+
+sudo -u postgres psql \
+  -X -d postgres -v ON_ERROR_STOP=1 -Atqc \
+  &quot;SELECT pg_create_restore_point(&#39;$ARCHIVE_RECOVERY_POINT&#39;);&quot; \
+  &gt;/dev/null
+
+ARCHIVE_RECOVERY_TARGET_WAL=&quot;$(
+  sudo -u postgres psql \
+    -X -d postgres -Atqc \
+    &quot;SELECT pg_walfile_name(pg_current_wal_lsn());&quot;
+)&quot;
+
+sudo -u postgres psql \
+  -X -d postgres -Atqc \
+  &#39;SELECT pg_switch_wal();&#39; \
+  &gt;/dev/null
+
+ARCHIVE_CAUGHT_UP=&#39;no&#39;
+LAST_ARCHIVED_WAL=&#39;&#39;
+
+for attempt in $(seq 1 180); do
+  LAST_ARCHIVED_WAL=&quot;$(
+    sudo -u postgres psql \
+      -X -d postgres -Atqc \
+      &quot;SELECT coalesce(last_archived_wal, &#39;&#39;)
+       FROM pg_stat_archiver;&quot;
+  )&quot;
+
+  if [[ &quot;$LAST_ARCHIVED_WAL&quot; == \
+        &quot;$ARCHIVE_RECOVERY_TARGET_WAL&quot; || \
+        &quot;$LAST_ARCHIVED_WAL&quot; &gt; \
+        &quot;$ARCHIVE_RECOVERY_TARGET_WAL&quot; ]]; then
+    ARCHIVE_CAUGHT_UP=&#39;yes&#39;
+    break
+  fi
+
+  sleep 1
+done
+
+if [ &quot;$ARCHIVE_CAUGHT_UP&quot; != &#39;yes&#39; ]; then
+  echo &#39;ERROR: WAL Archive did not catch up within 180 seconds&#39; &gt;&amp;2
+  exit 1
+fi
+
+ARCHIVE_CAUGHT_UP_EPOCH=&quot;$(date +%s.%N)&quot;
+
+ARCHIVE_RECOVERY_DURATION=&quot;$(
+  awk \
+    -v start=&quot;$ARCHIVE_RESTORE_START_EPOCH&quot; \
+    -v finish=&quot;$ARCHIVE_CAUGHT_UP_EPOCH&quot; \
+    &#39;BEGIN { printf &quot;%.3f&quot;, finish-start }&#39;
+)&quot;
+
+printf &#39;%s\n&#39; &#39;--- archive recovery result ---&#39;
+printf &#39;fault_node=%s\n&#39; &quot;$FAULT_NODE&quot;
+printf &#39;archive_restore_start=%s\n&#39; \
+  &quot;$ARCHIVE_RESTORE_START_TIME&quot;
+printf &#39;archive_command_restored=%s\n&#39; \
+  &quot;$ARCHIVE_COMMAND_AFTER&quot;
+printf &#39;archive_recovery_target_wal=%s\n&#39; \
+  &quot;$ARCHIVE_RECOVERY_TARGET_WAL&quot;
+printf &#39;last_archived_wal=%s\n&#39; &quot;$LAST_ARCHIVED_WAL&quot;
+printf &#39;archive_restore_to_caught_up=%s_seconds\n&#39; \
+  &quot;$ARCHIVE_RECOVERY_DURATION&quot;
+printf &#39;archive_recovery_result=%s\n&#39; &quot;$ARCHIVE_CAUGHT_UP&quot;
+
+sudo -u postgres psql \
+  -X -d postgres -P pager=off \
+  -c &quot;SELECT archived_count,
+             last_archived_wal,
+             last_archived_time,
+             failed_count,
+             last_failed_wal,
+             last_failed_time
+      FROM pg_stat_archiver;&quot;
+</code></pre>
+<p>儲存後檢查並執行：</p>
+<pre><code class="language-bash">chmod 750 /tmp/day28-rpo-clean/restore-archive.sh
+bash -n /tmp/day28-rpo-clean/restore-archive.sh
+sudo /tmp/day28-rpo-clean/restore-archive.sh
+</code></pre>
+<p>下圖顯示 pgBackRest <code>archive-push</code> 已恢復、<code>last_archived_wal</code> 到達目標 WAL，以及 Archive 追趕耗時。</p>
+<p><img src="../../source/Day28/day28-extra-fig03.png" alt="恢復 archive_command 後目標 WAL 已完成封存"></p>
+<p>圖（三）恢復 pgBackRest <code>archive-push</code> 後，<code>last_archived_wal</code> 在 3.550 秒內到達目標 WAL <code>A2</code>。</p>
+<h2>七、在 backup01 完成最後檢查</h2>
+<pre><code class="language-bash">hostnamectl --static
+date --iso-8601=ns
+
+sudo -u pgbackrest pgbackrest \
+  --stanza=iron-pg \
+  check
+
+sudo -u pgbackrest pgbackrest \
+  --stanza=iron-pg \
+  info
+</code></pre>
+<p>最後在 backup01 重新執行 Check 與 Info，確認 <code>iron-pg</code> Stanza 和 Archived WAL 狀態。</p>
+<p><img src="../../source/Day28/day28-extra-fig04.png" alt="backup01 完成 pgBackRest Check 並確認最新 Archived WAL"></p>
+<p>圖（四）pgBackRest Check 成功、<code>iron-pg</code> Stanza 狀態為 <code>ok</code>，Archived WAL 已前進至 <code>A3</code>。</p>
+<h2>八、判讀規則</h2>
+<table>
+<thead>
+<tr>
+<th>結果</th>
+<th>判讀方式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>rpo_result=PASS</code></td>
+<td>本次受控 Archive 中斷樣本的資料時間缺口小於或等於 60 秒</td>
+</tr>
+<tr>
+<td><code>rpo_result=FAIL</code></td>
+<td>本次受控 Archive 中斷樣本的資料時間缺口超過 60 秒</td>
+</tr>
+<tr>
+<td><code>rpo_result=INVALID_SAMPLE</code></td>
+<td>來源端或還原端交易集合不符合預期，本次樣本不產生 RPO 結論</td>
+</tr>
+<tr>
+<td><code>fault_to_archive_failure</code></td>
+<td>PostgreSQL Archiver 從注入故障到留下失敗紀錄的時間</td>
+</tr>
+<tr>
+<td><code>restore_to_validated</code></td>
+<td>隔離還原開始到資料可驗證的時間；完整 RTO 還需量測事故判斷、核准及重新開放流量</td>
+</tr>
+<tr>
+<td><code>archive_restore_to_caught_up</code></td>
+<td>恢復 Archive 後追上明確 WAL 邊界的時間</td>
+</tr>
+</tbody></table>
+<p>資料傳遞與登入 pg-restore01 所花的時間不會進入 RPO 計算。RPO 的事故時間已由來源端腳本在完成 15 筆交易後固定記錄；隔離還原可以稍後執行。</p>
+<h2>九、實測結果</h2>
+<table>
+<thead>
+<tr>
+<th>RPO 觀察項目</th>
+<th align="right">實測結果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>RPO 目標</td>
+<td align="right">60 秒</td>
+</tr>
+<tr>
+<td>故障注入至 Archive 留下失敗紀錄</td>
+<td align="right">0.258 秒</td>
+</tr>
+<tr>
+<td>故障注入至模擬事故</td>
+<td align="right">16.022 秒</td>
+</tr>
+<tr>
+<td>最後可復原測試交易</td>
+<td align="right">2026-09-24 15:04:34.099860+08</td>
+</tr>
+<tr>
+<td>模擬事故時間</td>
+<td align="right">2026-09-24 15:04:53.722459+08</td>
+</tr>
+<tr>
+<td>正式 Cluster／Restore Instance 最大序號</td>
+<td align="right">15／0</td>
+</tr>
+<tr>
+<td>觀察到的時間缺口</td>
+<td align="right">19.623 秒</td>
+</tr>
+<tr>
+<td>觀察到的交易缺口</td>
+<td align="right">15 筆</td>
+</tr>
+<tr>
+<td>RPO 判讀</td>
+<td align="right">PASS</td>
+</tr>
+</tbody></table>
+<p>本次 PASS 代表約 16 秒的受控 Archive 中斷樣本符合 60 秒目標。Archive 持續停止時，Repository 的復原邊界也會持續落後；監控、告警與修復流程要在 RPO 用盡前完成處置。</p>
+<table>
+<thead>
+<tr>
+<th>隔離還原階段</th>
+<th align="right">實測時間</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>pgBackRest 還原檔案</td>
+<td align="right">7.537 秒</td>
+</tr>
+<tr>
+<td>PostgreSQL 啟動並重播 WAL 至命名還原點</td>
+<td align="right">13.594 秒</td>
+</tr>
+<tr>
+<td>查詢並驗證資料</td>
+<td align="right">0.055 秒</td>
+</tr>
+<tr>
+<td>從開始 Restore 到資料驗證完成</td>
+<td align="right">21.187 秒</td>
+</tr>
+</tbody></table>
+<p>21.187 秒是隔離 Restore、WAL 重播與資料驗證的階段耗時。完整服務 RTO 還要量測事故判斷、目標選擇、人工核准及重新開放流量。</p>
+<p>恢復 <code>archive_command</code> 後，<code>last_archived_wal</code> 在 3.550 秒內到達目標 WAL <code>A2</code>；backup01 隨後完成 pgBackRest Check，Stanza 狀態為 <code>ok</code>，Archived WAL 前進至 <code>A3</code>。</p>
+</main></body>
+</html>

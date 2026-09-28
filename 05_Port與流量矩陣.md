@@ -102,6 +102,8 @@
 | monitor01 本機 | 9090 | Prometheus |
 | monitor01 本機 | 9093 | Alertmanager |
 
+monitor01 與 Service VLAN 主機之間的流量不會經過 OPNsense。monitor01 的 nftables 只允許 Loopback 存取 TCP 3000、9090、9093、9100、9115，並允許 OpenVPN Tunnel 網段連入 TCP 3000、9090；實際 VPN 使用者再由 OPNsense 的 `VPN_MONITOR_CLIENTS` 限制為 `vpn-monitor01`。
+
 Ceph `10.77.70.0/24` 與 Corosync `10.77.80.0/24` 是無 Gateway 封閉網路，不建立 OPNsense 跨 VLAN 規則。其 Daemon Port 以部署當下產生的 Ceph／Corosync 設定與官方版本文件為準，不將未實測範圍硬寫成防火牆白名單。
 
 `pg01～03 → ca01 TCP 9000` 是同 VLAN 流量，OPNsense 看不到。實際 Allow 由 ca01 的 nftables Host Firewall 建立；ca01 不加入 `BASTION_TARGETS`、不接受 SSH，也不得主動連線 PostgreSQL 5432、Patroni 8008 或 etcd 2379／2380。

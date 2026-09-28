@@ -1,0 +1,830 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 29｜在使用者回報前看見異常：Prometheus、Grafana、Exporter 與 Alertmanager 告警</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 29｜在使用者回報前看見異常：Prometheus、Grafana、Exporter 與 Alertmanager 告警</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 29｜在使用者回報前看見異常：Prometheus、Grafana、Exporter 與 Alertmanager 告警</a></p>
+<p>本日沿用 Day 16 已建立的 monitor01，安裝 Prometheus、Grafana 與 Alertmanager，收集 Linux、Patroni、PostgreSQL、HAProxy，並從公開 Hostname 探測 Day 27 建立的 Cloudflare HTTPS。本次以單台 VM 完成監控流程，監控平台高可用性列為正式環境延伸。</p>
+<h2>本日操作順序</h2>
+<ol>
+<li>只在 monitor01 確認容量與網路，再安裝 Prometheus、Grafana、Alertmanager。</li>
+<li>逐台在被監控的 Debian VM 安裝 Node Exporter。ca01 透過 PVE Console 操作，先做一台確認 Target Up，再擴到其他主機。</li>
+<li>逐台在 pg01、pg02、pg03 安裝 PostgreSQL Exporter。</li>
+<li>逐台在 proxy01、proxy02 啟用 HAProxy Metrics。</li>
+<li>回到 monitor01 寫入 Prometheus Scrape Config，並先在本機驗證設定與服務。</li>
+<li>在 OPNsense 授權 <code>vpn-monitor01</code> 存取監控介面，連上 VPN 後才從管理電腦檢查 Prometheus Target。</li>
+<li>在 monitor01 加入 Alert Rule、Alertmanager 本機路由與 Grafana Data Source。</li>
+<li>一次停止一個測試目標，確認 Pending、Firing、Alertmanager Active Alert 與恢復後的清除流程，再立即恢復服務。</li>
+</ol>
+<h2>1. 確認 monitor01</h2>
+<p><strong>操作節點：只在 monitor01。不要重新 Clone VMID 251。</strong></p>
+<ul>
+<li>VMID／Name：<code>251</code>／<code>monitor01</code>。</li>
+<li>Node：pve02。</li>
+<li>vCPU／RAM：2／2GB。</li>
+<li>Disk：24GB。</li>
+<li>VLAN／IP：VLAN 20／<code>10.77.20.51/24</code>。</li>
+<li>Gateway／DNS：<code>10.77.20.1</code>。</li>
+</ul>
+<p>進入既有 monitor01，確認：</p>
+<pre><code class="language-bash">hostnamectl --static
+ip -br address
+cloud-init status --long
+resolvectl status
+resolvectl query deb.debian.org
+</code></pre>
+<p>Hostname 應為 <code>monitor01</code>，IP 應為 <code>10.77.20.51/24</code>。Day 16 建立的 Bob SSH 帳號與 Key 保留。</p>
+<p><code>resolvectl status</code> 必須在 Global 或網路介面區塊看到 DNS Server <code>10.77.20.1</code> 與 DNS Domain <code>lab.home</code>。若缺少，先建立持久化設定：</p>
+<pre><code class="language-bash">sudo install -d -m 0755 /etc/systemd/resolved.conf.d
+printf &#39;%s\n&#39; \
+  &#39;[Resolve]&#39; \
+  &#39;DNS=10.77.20.1&#39; \
+  &#39;Domains=lab.home&#39; |
+  sudo tee /etc/systemd/resolved.conf.d/10-lab-dns.conf
+sudo systemctl restart systemd-resolved
+sudo resolvectl flush-caches
+resolvectl status
+resolvectl query deb.debian.org
+</code></pre>
+<p>不要直接修改 <code>/etc/resolv.conf</code>。確認名稱解析正常後才安裝監控套件。</p>
+<pre><code class="language-bash">sudo apt update
+sudo apt install -y dnsutils prometheus prometheus-alertmanager prometheus-blackbox-exporter prometheus-node-exporter
+</code></pre>
+<h2>2. 安裝 Grafana OSS</h2>
+<p><strong>操作節點：只在 monitor01。Prometheus 與 Alertmanager 也集中在此節點。</strong></p>
+<p>依 Grafana 官方 APT Repository：</p>
+<pre><code class="language-bash">sudo apt install -y apt-transport-https wget gnupg
+sudo mkdir -p /etc/apt/keyrings
+sudo wget -O /etc/apt/keyrings/grafana.asc https://apt.grafana.com/gpg-full.key
+sudo chmod 644 /etc/apt/keyrings/grafana.asc
+echo &#39;deb [signed-by=/etc/apt/keyrings/grafana.asc] https://apt.grafana.com stable main&#39; | sudo tee /etc/apt/sources.list.d/grafana.list
+sudo apt update
+apt-cache policy grafana
+sudo apt install -y grafana
+sudo systemctl enable --now grafana-server
+</code></pre>
+<p><code>apt-cache policy grafana</code> 的 Candidate 應來自 <code>https://apt.grafana.com</code>。安裝後先在 monitor01 確認服務、TCP 3000、Grafana Health API 與本機資料庫：</p>
+<p>等待就緒後:</p>
+<pre><code class="language-bash">systemctl is-enabled grafana-server
+systemctl is-active grafana-server
+sudo ss -lntp | grep &#39;:3000&#39;
+curl -fsS http://127.0.0.1:3000/api/health
+sudo journalctl -u grafana-server -b --no-pager |
+  grep -E &#39;Connecting to DB|dbtype=sqlite3&#39; | tail
+sudo stat /var/lib/grafana/grafana.db
+</code></pre>
+<p>預期服務顯示 <code>enabled</code>、<code>active</code>，Health API 的 JSON 包含 <code>&quot;database&quot;:&quot;ok&quot;</code>，Log 顯示 <code>dbtype=sqlite3</code>，而且 <code>/var/lib/grafana/grafana.db</code> 存在。這只能確認 Grafana 在 monitor01 本機正常啟動；管理電腦要等第 6.1～6.3 節建立 OPNsense 授權規則並連上 VPN 後才能登入。</p>
+<p><img src="../../source/Day29/day29-main-fig01.png" alt="monitor01 的 Grafana 服務、Health API 與 SQLite 資料庫檢查"></p>
+<p>圖（一）Grafana 服務已啟用並正常執行，Health API 與 SQLite 資料庫也可正常讀取</p>
+<p>本 Lab 是單一 Grafana Instance，可使用套件預設的 SQLite 保存使用者、Data Source 與 Dashboard。正式 Grafana HA 需要多個 Grafana Instance 共用外部 PostgreSQL 或 MySQL；每台各自使用本機 SQLite 會保存不同狀態，無法形成一致的 HA 服務。</p>
+<h2>3. 逐台安裝 Node Exporter</h2>
+<p><strong>操作節點：所有要納管的 Debian VM。先挑一台完成安裝與遠端連線測試，再逐台擴充。</strong></p>
+<p>在 proxy、app、pg、jump、backup：</p>
+<pre><code class="language-bash">sudo apt update
+sudo apt install -y prometheus-node-exporter
+sudo systemctl enable --now prometheus-node-exporter
+curl -fsS http://127.0.0.1:9100/metrics | sed -n &#39;1,10p&#39;
+</code></pre>
+<p>OPNsense 只允許 monitor01 <code>10.77.20.51</code> 到各 VLAN Node Exporter TCP 9100；其他來源拒絕。因部分主機與 monitor01 同 VLAN，還要用 Host Firewall 限制來源。</p>
+<p><img src="../../source/Day29/day29-main-fig02.png" alt="Node Exporter 服務與本機 Metrics Endpoint 檢查"></p>
+<p>圖（二）Node Exporter 已啟用並正常執行，本機 Metrics Endpoint 可輸出指標</p>
+<h3>3.1 放行 monitor01 讀取 jump01 Node Exporter</h3>
+<p>jump01 在 Day 15 已使用 <code>policy drop</code> 的 nftables Host Firewall。安裝 Node Exporter 後，必須在現有的 Input Chain 放行 monitor01，否則 Prometheus 無法連入 TCP 9100。從 PVE Console 或現有的授權 SSH Session 登入 jump01，先確認服務正常：</p>
+<pre><code class="language-bash">systemctl is-active prometheus-node-exporter
+sudo ss -lntp | grep &#39;:9100&#39;
+curl -fsS http://127.0.0.1:9100/metrics | sed -n &#39;1,2p&#39;
+</code></pre>
+<p>備份並開啟 Host Firewall 設定：</p>
+<pre><code class="language-bash">sudo cp -a /etc/nftables.conf /etc/nftables.conf.before-day29
+sudo nano /etc/nftables.conf
+</code></pre>
+<p>在 <code>table inet filter</code> 的 <code>chain input</code> 內，放在 Chain 結束的 <code>}</code> 之前，加入：</p>
+<pre><code class="language-nftables">ip saddr 10.77.20.51 tcp dport 9100 accept
+</code></pre>
+<p>保留既有的 Loopback、Established Connection、ICMP 與 SSH Rule。儲存後檢查並重新載入：</p>
+<pre><code class="language-bash">sudo nft --check --file /etc/nftables.conf
+sudo systemctl reload nftables
+sudo nft list chain inet filter input
+</code></pre>
+<p>回到 monitor01 確認可以讀取 jump01 的 Metrics：</p>
+<pre><code class="language-bash">curl -fsS --connect-timeout 3 http://10.77.50.11:9100/metrics |
+  sed -n &#39;1,2p&#39;
+</code></pre>
+<p>預期輸出以 <code># HELP</code> 與 <code># TYPE</code> 開頭的 Metrics。</p>
+<h3>3.2 納管 ca01 與憑證期限</h3>
+<p>ca01 已停用網路 SSH，因此使用 PVE Console 登入 VMID 224：</p>
+<pre><code class="language-bash">sudo apt update
+sudo apt install -y prometheus-node-exporter
+sudo systemctl enable --now prometheus-node-exporter
+systemctl is-active step-ca prometheus-node-exporter
+curl -fsS http://127.0.0.1:9100/metrics | sed -n &#39;1,10p&#39;
+</code></pre>
+<p>在 ca01 的 <code>/etc/nftables.conf</code> Input Chain 加入下列規則，位置放在最後 Drop 之前：</p>
+<pre><code class="language-bash">sudo nano /etc/nftables.conf
+</code></pre>
+<pre><code class="language-nftables">ip saddr 10.77.20.51 tcp dport 9100 accept
+</code></pre>
+<p>套用並檢查：</p>
+<pre><code class="language-bash">sudo nft -c -f /etc/nftables.conf
+sudo systemctl reload nftables
+sudo nft list ruleset
+</code></pre>
+<p>OPNsense 的 <code>LAB_INTERNAL</code> Group Rule 只允許 monitor01 前往 <code>CA_NODE:9100</code>。這段是 VLAN 20 到 VLAN 30 的跨 VLAN 流量，先由 OPNsense 過濾，抵達 ca01 後再由 nftables 檢查來源與 Port。Target Down 時依序檢查 OPNsense Rule 與 ca01 nftables。</p>
+<p>CA 暫時離線與憑證即將到期是兩種不同事件。至少先保留以下檢查結果，之後可交給 Node Exporter Textfile Collector 或既有憑證監控工具定期輸出：</p>
+<pre><code class="language-bash">sudo -u step-ca curl --cacert /var/lib/step-ca/certs/root_ca.crt \
+  https://ca01.lab.home:9000/health
+sudo -u step-ca openssl x509 -checkend 2592000 -noout \
+  -in /var/lib/step-ca/certs/intermediate_ca.crt
+echo &quot;intermediate_ca check exit=$?&quot;
+</code></pre>
+<p>Health API 預期回傳 <code>{&quot;status&quot;:&quot;ok&quot;}</code>。憑證有效期超過未來 30 天時，OpenSSL 會顯示 <code>Certificate will not expire</code>，而 Exit Code 是 <code>0</code>；顯示 <code>Certificate will expire</code> 或非 <code>0</code> 時才需要處理續期。</p>
+<p><img src="../../source/Day29/day29-main-fig03.png" alt="ca01 的 Health API 與中繼 CA 憑證期限檢查"></p>
+<p>圖（三）ca01 Health API 回傳正常，中繼 CA 憑證有效期也超過未來 30 天</p>
+<p>另外在 pg01～03 分別對 PostgreSQL 與 etcd Leaf Certificate 執行 <code>openssl x509 -checkend 2592000</code>。<code>2592000</code> 代表 30 天；檢查失敗時應先續期，不要等到服務重啟或新連線才發現憑證已過期。</p>
+<h3>3.3 輸出 Cloudflare Origin Certificate 期限</h3>
+<p><strong>操作節點：proxy01、proxy02。</strong></p>
+<p>Day 27 的 Origin Certificate 必須在兩台 Proxy 分開監控。先確認 Debian 套件的 Textfile Collector 目錄：</p>
+<pre><code class="language-bash">systemctl cat prometheus-node-exporter |
+  grep -- &#39;--collector.textfile.directory&#39;
+sudo install -d -o root -g root -m 0755 \
+  /var/lib/prometheus/node-exporter
+sudo nano /usr/local/sbin/export-origin-cert-expiry
+</code></pre>
+<p>貼上：</p>
+<pre><code class="language-bash">#!/bin/sh
+set -eu
+
+cert=/etc/nginx/tls/iron-origin.crt
+out_dir=/var/lib/prometheus/node-exporter
+not_after=$(openssl x509 -enddate -noout -in &quot;$cert&quot; | cut -d= -f2-)
+expiry=$(date -d &quot;$not_after&quot; +%s)
+tmp=$(mktemp &quot;$out_dir/iron-origin-cert.prom.XXXXXX&quot;)
+
+printf &#39;%s\n&#39; \
+  &#39;# HELP iron_origin_cert_expiry_timestamp_seconds Origin certificate expiry time.&#39; \
+  &#39;# TYPE iron_origin_cert_expiry_timestamp_seconds gauge&#39; \
+  &quot;iron_origin_cert_expiry_timestamp_seconds $expiry&quot; &gt; &quot;$tmp&quot;
+chmod 0644 &quot;$tmp&quot;
+mv -f &quot;$tmp&quot; &quot;$out_dir/iron-origin-cert.prom&quot;
+</code></pre>
+<p>儲存後建立定期執行的 Service 與 Timer：</p>
+<pre><code class="language-bash">sudo chown root:root /usr/local/sbin/export-origin-cert-expiry
+sudo chmod 0750 /usr/local/sbin/export-origin-cert-expiry
+sudo nano /etc/systemd/system/iron-origin-cert-metric.service
+</code></pre>
+<pre><code class="language-ini">[Unit]
+Description=Export Cloudflare Origin certificate expiry metric
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/export-origin-cert-expiry
+</code></pre>
+<pre><code class="language-bash">sudo nano /etc/systemd/system/iron-origin-cert-metric.timer
+</code></pre>
+<pre><code class="language-ini">[Unit]
+Description=Refresh Cloudflare Origin certificate expiry metric
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+</code></pre>
+<p>兩台各自執行：</p>
+<pre><code class="language-bash">sudo systemctl daemon-reload
+sudo systemctl enable --now iron-origin-cert-metric.timer
+sudo systemctl start iron-origin-cert-metric.service
+systemctl status iron-origin-cert-metric.timer --no-pager
+curl -fsS http://127.0.0.1:9100/metrics |
+  grep &#39;^iron_origin_cert_expiry_timestamp_seconds&#39;
+</code></pre>
+<p>兩台都必須有 Metric。只檢查 proxy01 會遺漏 proxy02 憑證未同步或將要過期的情況。</p>
+<h2>4. PostgreSQL Exporter</h2>
+<p><strong>操作順序：三台先安裝套件；Database Role 只在目前 Leader 建立一次；HBA 寫入 Patroni Dynamic Configuration；最後逐台設定並啟動 Exporter。</strong></p>
+<p>pg01～03：</p>
+<pre><code class="language-bash">sudo apt install -y prometheus-postgres-exporter
+</code></pre>
+<h3>4.1 找出目前 Leader</h3>
+<p>在 pg01、pg02 或 pg03 任一台執行：</p>
+<pre><code class="language-bash">sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  list iron-pg -e
+</code></pre>
+<p>查看 <code>Role</code> 欄位，記下顯示 <code>Leader</code> 的 Member。Leader 可能因先前的 Switchover／Failover 而改變，不要直接假設一定是 pg01。切換到該節點後再次確認：</p>
+<pre><code class="language-bash">hostnamectl --static
+sudo -u postgres psql -X -d postgres -Atqc \
+  &#39;SELECT pg_is_in_recovery();&#39;
+</code></pre>
+<p>必須回傳 <code>f</code>；<code>t</code> 代表目前位於 Replica，回到 <code>patronictl list</code> 找出正確 Leader。</p>
+<p><img src="../../source/Day29/day29-main-fig04.png" alt="Patroni 叢集顯示目前 Leader 與兩個 Replica"></p>
+<p>圖（四）建立監控帳號前先確認目前由 pg02 擔任 Leader</p>
+<h3>4.2 只在 Leader 建立監控 Role</h3>
+<p>在剛確認的 Leader 開啟 psql：</p>
+<pre><code class="language-bash">sudo -u postgres psql -X -d postgres -P pager=off
+</code></pre>
+<p>在 psql 中執行：</p>
+<pre><code class="language-sql">CREATE ROLE monitor_user LOGIN;
+GRANT pg_monitor TO monitor_user;
+\password monitor_user
+</code></pre>
+<p><code>\password</code> 會要求輸入並再次確認密碼，輸入內容不會顯示。實際密碼不得出現在文件、Git、指令歷史或公開畫面。完成後驗證 Role：</p>
+<pre><code class="language-sql">SELECT rolname,
+       rolcanlogin,
+       pg_has_role(rolname, &#39;pg_monitor&#39;, &#39;member&#39;) AS member_of_pg_monitor
+FROM pg_roles
+WHERE rolname = &#39;monitor_user&#39;;
+\q
+</code></pre>
+<p>預期 <code>rolcanlogin</code> 與 <code>member_of_pg_monitor</code> 都是 <code>t</code>。Role 與密碼會透過 PostgreSQL Streaming Replication 傳到 Replica，不要在三台重複執行 <code>CREATE ROLE</code>。</p>
+<p><img src="../../source/Day29/day29-main-fig05.png" alt="monitor_user 可以登入並具有 pg_monitor 成員資格"></p>
+<p>圖（五）<code>monitor_user</code> 已具備登入能力與 <code>pg_monitor</code> 成員資格</p>
+<h3>4.3 允許三台 Exporter 連到各自的 PostgreSQL</h3>
+<p>在任一台正常的 Patroni 節點執行：</p>
+<pre><code class="language-bash">sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  edit-config iron-pg
+</code></pre>
+<p>在 Dynamic Configuration 的 <code>postgresql</code> → <code>pg_hba</code> 清單中，將以下三條規則加在最終 <code>host all all 0.0.0.0/0 reject</code> 之前；保留原有規則：</p>
+<pre><code class="language-yaml">- hostssl postgres monitor_user 10.77.30.11/32 scram-sha-256
+- hostssl postgres monitor_user 10.77.30.12/32 scram-sha-256
+- hostssl postgres monitor_user 10.77.30.13/32 scram-sha-256
+</code></pre>
+<p>儲存並確認差異後輸入 <code>y</code>，再 Reload 三台成員：</p>
+<pre><code class="language-bash">sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  reload iron-pg --force
+</code></pre>
+<p>等待一個 Patroni Loop Cycle，再於 pg01、pg02、pg03 逐台確認 HBA 已載入且沒有語法錯誤：</p>
+<pre><code class="language-bash">sudo -u postgres psql -X -d postgres -P pager=off \
+  -c &quot;SELECT line_number,type,database,user_name,address,auth_method,error
+      FROM pg_hba_file_rules
+      WHERE &#39;monitor_user&#39; = ANY(user_name)
+      ORDER BY line_number;&quot;
+</code></pre>
+<p>每台都應看到三條 <code>hostssl</code> 規則，且 <code>error</code> 為空。</p>
+<p><img src="../../source/Day29/day29-main-fig06.png" alt="三條 monitor_user hostssl 規則已載入且沒有錯誤"></p>
+<p>圖（六）三條 <code>monitor_user</code> HBA 規則已載入，<code>error</code> 欄位皆為空</p>
+<h3>4.4 逐台設定並啟動 Exporter</h3>
+<p>每台 <code>/etc/default/prometheus-postgres-exporter</code> 設定連向自己的 PostgreSQL 節點 IP。密碼如含 URL 保留字，必須先做 URL Encoding；實際密碼不寫入公開文章：</p>
+<pre><code class="language-bash">sudo nano /etc/default/prometheus-postgres-exporter
+</code></pre>
+<pre><code class="language-ini"># pg01 使用 10.77.30.11；pg02 使用 10.77.30.12；pg03 使用 10.77.30.13
+DATA_SOURCE_NAME=&#39;postgresql://monitor_user:URL編碼後的實際密碼@10.77.30.11:5432/postgres?sslmode=require&#39;
+</code></pre>
+<p>三台分別把 Host 改成自己的固定 IP。按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code>，再執行：</p>
+<pre><code class="language-bash">sudo chown root:root /etc/default/prometheus-postgres-exporter
+sudo chmod 600 /etc/default/prometheus-postgres-exporter
+sudo systemctl enable prometheus-postgres-exporter
+sudo systemctl restart prometheus-postgres-exporter
+sudo systemctl status prometheus-postgres-exporter --no-pager
+curl -fsS http://127.0.0.1:9187/metrics | sed -n &#39;1,10p&#39;
+curl -fsS http://127.0.0.1:9187/metrics |
+  grep &#39;^pg_up &#39;
+</code></pre>
+<p>預期服務為 <code>active (running)</code>，且 <code>pg_up 1</code>。若 Metrics Endpoint 可開啟但 <code>pg_up</code> 為 <code>0</code>，依序檢查該節點的 <code>DATA_SOURCE_NAME</code>、密碼、PostgreSQL 監聽位址與 <code>monitor_user</code> HBA。</p>
+<p><img src="../../source/Day29/day29-main-fig07.png" alt="PostgreSQL Exporter 回報 pg_up 1"></p>
+<p>圖（七）PostgreSQL Exporter 成功連入本機資料庫並回報 <code>pg_up 1</code></p>
+<h2>5. HAProxy Metrics</h2>
+<p><strong>操作節點：proxy01、proxy02。逐台修改並先做 Config Check。</strong></p>
+<p>先在 proxy01 開啟 HAProxy Config：</p>
+<pre><code class="language-bash">sudo nano /etc/haproxy/haproxy.cfg
+</code></pre>
+<p>在檔案最後新增：</p>
+<pre><code class="language-haproxy">frontend prometheus
+    bind 10.77.20.21:8405
+    mode http
+    log global
+    option dontlog-normal
+    http-request use-service prometheus-exporter if { path /metrics }
+</code></pre>
+<p>proxy02 改綁 <code>10.77.20.22:8405</code>。<code>log global</code> 讓 Frontend 使用 Global Log Target，<code>option dontlog-normal</code> 不記錄正常的 Metrics Scrape，只保留異常連線 Log，避免每次 Config Check 都顯示「沒有 Log Target，卻設定了 Log Format」的 Warning。</p>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code>，再執行：</p>
+<pre><code class="language-bash">sudo haproxy -c -f /etc/haproxy/haproxy.cfg
+sudo systemctl reload haproxy
+curl -fsS http://10.77.20.21:8405/metrics | sed -n &#39;1,10p&#39;
+</code></pre>
+<p>在 proxy02 重複相同操作，但 <code>bind</code> 與 <code>curl</code> 都改用 <code>10.77.20.22:8405</code>。</p>
+<p><img src="../../source/Day29/day29-main-fig08.png" alt="proxy01 的 HAProxy Metrics Endpoint"></p>
+<p>圖（八）proxy01 通過 HAProxy 設定檢查並可從 TCP 8405 讀取 Metrics</p>
+<p><img src="../../source/Day29/day29-main-fig09.png" alt="proxy02 的 HAProxy Metrics Endpoint"></p>
+<p>圖（九）proxy02 可從 TCP 8405 讀取 HAProxy Metrics</p>
+<h3>5.1 放行 monitor01 必要的 Scrape 流量</h3>
+<p>操作位置：OPNsense Web UI。</p>
+<ol>
+<li>進入 <code>Firewall</code> → <code>Aliases</code>，按 <code>Add</code>。Name 填 <code>MONITOR_NODE</code>、Type 選 <code>Host(s)</code>、Content 填 monitor01 的 IP <code>10.77.20.51</code>，Description 填 <code>Prometheus monitoring node</code>，按 <code>Save</code>。</li>
+<li>再按 <code>Add</code>。Name 填 <code>MONITOR_PORTS</code>、Type 選 <code>Port(s)</code>。</li>
+<li>Content 依次加入 <code>8008</code>、<code>8405</code>、<code>9100</code>、<code>9187</code>。</li>
+<li>Description 填 <code>Patroni HAProxy Node and PostgreSQL metrics</code>，按 <code>Save</code> 與 <code>Apply</code>。</li>
+<li>進入 <code>Firewall</code> → <code>Rules</code>，在頁面左上角的 Interface 選單選 <code>LAB_INTERNAL</code>。這是 Day 14 建立的 Interface Group，包含 <code>SERVICE</code>、<code>DATABASE</code>、<code>BACKUP</code> 與 <code>BASTION</code>；不要在這裡選單一的 <code>SERVICE</code> Interface。</li>
+<li>按 <code>Add</code>，Action 選 <code>Pass</code>、Protocol 選 <code>TCP</code>。</li>
+<li>Source 選 Alias <code>MONITOR_NODE</code>，Destination 選 Alias <code>INTERNAL_NETWORKS</code>，Destination Port 選 Alias <code>MONITOR_PORTS</code>。<code>INTERNAL_NETWORKS</code> 包含 <code>10.77.10.0/24</code>、<code>10.77.20.0/24</code>、<code>10.77.30.0/24</code>、<code>10.77.40.0/24</code> 與 <code>10.77.50.0/24</code>。</li>
+<li>Description 填 <code>monitor01 scrape internal targets</code>，按 <code>Save</code>。</li>
+<li>將這條 Pass Rule 移到 <code>Block LAB_INTERNAL to internal networks</code> 上方，再按 <code>Apply</code>。</li>
+</ol>
+<p><img src="../../source/Day29/day29-main-fig10.png" alt="MONITOR_PORTS Alias 包含四個監控連接埠"></p>
+<p>圖（十）<code>MONITOR_PORTS</code> 集中管理 Patroni、HAProxy、Node Exporter 與 PostgreSQL Exporter Port</p>
+<p><img src="../../source/Day29/day29-main-fig11.png" alt="LAB_INTERNAL 的監控放行規則位於內部網路封鎖規則上方"></p>
+<p>圖（十一）monitor01 的監控流量規則位於跨區封鎖規則上方</p>
+<h3>5.2 限制同 VLAN 的監控連入流量</h3>
+<p>monitor01 與 proxy01、proxy02、app01、app02 都位於 VLAN 20。這些主機之間的封包由虛擬交換器直接轉送，不會經過 OPNsense，因此還要使用各主機的 nftables 限制 TCP 9100 與 8405 的來源。</p>
+<h4>5.2.1 限制 proxy01 與 proxy02</h4>
+<p><strong>操作節點：proxy01、proxy02，兩台都要執行。</strong></p>
+<p>Proxy 同時提供 Node Exporter TCP 9100 與 HAProxy Metrics TCP 8405。先安裝 nftables，並備份現有設定：</p>
+<pre><code class="language-bash">sudo apt install -y nftables
+sudo cp -a /etc/nftables.conf /etc/nftables.conf.before-day29
+sudo nano /etc/nftables.conf
+</code></pre>
+<p>保留檔案原有內容，將下列區塊加在 <code>/etc/nftables.conf</code> 最後。不要把它放進另一個 Table 或 Chain 內，也不要另外新增 <code>flush ruleset</code>：</p>
+<pre><code class="language-nftables">table inet day29_monitor {
+  chain input {
+    type filter hook input priority 10; policy accept;
+
+    iifname &quot;lo&quot; tcp dport { 9100, 8405 } accept
+    ip saddr 10.77.20.51 tcp dport { 9100, 8405 } accept
+    tcp dport { 9100, 8405 } drop
+  }
+}
+</code></pre>
+<p>這個獨立 Table 只過濾 TCP 9100 與 8405：Loopback 與 monitor01 可以連入，其他來源則丟棄；其餘 Port 維持 <code>policy accept</code>，不會改變現有 SSH、Nginx、HAProxy 與 Keepalived 流量。</p>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code> 儲存，先檢查語法，確認通過後才套用：</p>
+<pre><code class="language-bash">sudo nft --check --file /etc/nftables.conf
+sudo systemctl enable --now nftables
+sudo systemctl reload nftables
+systemctl is-active nftables
+sudo nft list table inet day29_monitor
+sudo ss -lntp | grep -E &#39;:(8405|9100)\b&#39;
+</code></pre>
+<p><code>nft --check</code> 不得出現錯誤，服務應顯示 <code>active</code>，而 Ruleset 內應看到 monitor01 <code>10.77.20.51</code> 的 Allow 與其後的 Drop。</p>
+<h4>5.2.2 限制 app01 與 app02</h4>
+<p><strong>操作節點：app01、app02，兩台都要執行。</strong></p>
+<p>App 只提供 Node Exporter TCP 9100。先安裝 nftables，並備份現有設定：</p>
+<pre><code class="language-bash">sudo apt install -y nftables
+sudo cp -a /etc/nftables.conf /etc/nftables.conf.before-day29
+sudo nano /etc/nftables.conf
+</code></pre>
+<p>保留原有內容，在檔案最後加入：</p>
+<pre><code class="language-nftables">table inet day29_monitor {
+  chain input {
+    type filter hook input priority 10; policy accept;
+
+    iifname &quot;lo&quot; tcp dport 9100 accept
+    ip saddr 10.77.20.51 tcp dport 9100 accept
+    tcp dport 9100 drop
+  }
+}
+</code></pre>
+<p>儲存後檢查並套用：</p>
+<pre><code class="language-bash">sudo nft --check --file /etc/nftables.conf
+sudo systemctl enable --now nftables
+sudo systemctl reload nftables
+systemctl is-active nftables
+sudo nft list table inet day29_monitor
+sudo ss -lntp | grep &#39;:9100&#39;
+</code></pre>
+<h4>5.2.3 進行正向與負向測試</h4>
+<p><strong>正向測試位置：monitor01。</strong></p>
+<pre><code class="language-bash">for ip in 10.77.20.21 10.77.20.22 10.77.20.31 10.77.20.32; do
+  echo &quot;=== ${ip}:9100 ===&quot;
+  curl -fsS --connect-timeout 3 &quot;http://${ip}:9100/metrics&quot; |
+    sed -n &#39;1,2p&#39;
+done
+
+for ip in 10.77.20.21 10.77.20.22; do
+  echo &quot;=== ${ip}:8405 ===&quot;
+  curl -fsS --connect-timeout 3 &quot;http://${ip}:8405/metrics&quot; |
+    sed -n &#39;1,2p&#39;
+done
+</code></pre>
+<p>每個 Target 都應輸出以 <code># HELP</code> 或 <code># TYPE</code> 開頭的 Metrics。</p>
+<p><img src="../../source/Day29/day29-main-fig12.png" alt="monitor01 可以讀取 proxy01 與 app01 的 Metrics"></p>
+<p>圖（十二）monitor01 可成功讀取受監控節點的 Metrics Endpoint</p>
+<p><strong>負向測試位置：client01。</strong> client01 與這些主機同在 VLAN 20，可用來確認未經授權的同 VLAN 來源已被 Host Firewall 擋下：</p>
+<pre><code class="language-bash">curl -fsS --connect-timeout 3 http://10.77.20.21:9100/metrics
+echo &quot;proxy01 node exporter exit=$?&quot;
+
+curl -fsS --connect-timeout 3 http://10.77.20.21:8405/metrics
+echo &quot;proxy01 haproxy metrics exit=$?&quot;
+
+curl -fsS --connect-timeout 3 http://10.77.20.31:9100/metrics
+echo &quot;app01 node exporter exit=$?&quot;
+</code></pre>
+<p>三個 <code>curl</code> 都應失敗並回傳非 <code>0</code> 的 Exit Code。這組負向測試只限於 Metrics Port；Web Backend、Web VIP 與其他原有服務應繼續正常。</p>
+<p><img src="../../source/Day29/day29-main-fig13.png" alt="client01 無法連入受保護的 Metrics Port"></p>
+<p>圖（十三）client01 對 Metrics Port 的連線由主機防火牆拒絕</p>
+<h3>5.3 限制 monitor01 的管理介面與本機 Metrics</h3>
+<p><strong>操作節點：monitor01。</strong></p>
+<p>monitor01 與 client01、proxy01、proxy02、app01、app02 同在 VLAN 20，同 VLAN 流量不會經過 OPNsense。除了前面限制各受監控節點的 Metrics Port，monitor01 本身也要限制 Grafana、Prometheus、Alertmanager、Node Exporter 與 Blackbox Exporter 的連入來源。</p>
+<p>先安裝 nftables 並備份現有設定：</p>
+<pre><code class="language-bash">sudo apt install -y nftables
+sudo cp -a /etc/nftables.conf /etc/nftables.conf.before-day29
+sudo nano /etc/nftables.conf
+</code></pre>
+<p>保留檔案原有內容，在最後加入：</p>
+<pre><code class="language-nftables">table inet day29_monitor {
+  chain input {
+    type filter hook input priority 10; policy accept;
+
+    iifname &quot;lo&quot; tcp dport { 3000, 9090, 9093, 9100, 9115 } accept
+    ip saddr 10.77.60.0/24 tcp dport { 3000, 9090 } accept
+    tcp dport { 3000, 9090, 9093, 9100, 9115 } drop
+  }
+}
+</code></pre>
+<p>Loopback 規則保留 Grafana、Prometheus、Alertmanager、Node Exporter 與 Blackbox Exporter 在 monitor01 內部互相存取；<code>10.77.60.0/24</code> 只開放 Grafana TCP 3000 與 Prometheus TCP 9090。實際可通過的 VPN 使用者會在第 6.1～6.3 節由 OPNsense 的 <code>VPN_MONITOR_CLIENTS</code> 再縮小到 <code>vpn-monitor01</code>。</p>
+<p>檢查語法並套用：</p>
+<pre><code class="language-bash">sudo nft --check --file /etc/nftables.conf
+sudo systemctl enable --now nftables
+sudo systemctl reload nftables
+systemctl is-active nftables
+sudo nft list table inet day29_monitor
+</code></pre>
+<p>套用後，在 monitor01 確認五個本機 Endpoint 可正常存取：</p>
+<pre><code class="language-bash">curl -fsS http://127.0.0.1:3000/api/health
+curl -fsS http://127.0.0.1:9090/-/ready
+curl -fsS http://127.0.0.1:9093/-/ready
+curl -fsS http://127.0.0.1:9100/metrics | sed -n &#39;1,2p&#39;
+curl -fsS http://127.0.0.1:9115/-/healthy
+</code></pre>
+<p>再從同 VLAN 的 client01 執行負向測試：</p>
+<pre><code class="language-bash">for port in 3000 9090 9100; do
+  curl -fsS --connect-timeout 3 &quot;http://10.77.20.51:${port}/&quot;
+  echo &quot;monitor01 port ${port} exit=$?&quot;
+done
+</code></pre>
+<p>三個連線都應失敗並回傳非 <code>0</code> 的 Exit Code。後續使用 <code>vpn-monitor01</code> 完成 OPNsense 授權後，TCP 3000 與 9090 才會從 VPN 管理路徑開放。</p>
+<h2>6. Prometheus Scrape Config</h2>
+<p><strong>操作節點：只在 monitor01。每新增一組 Target 就先 Reload 並到 Targets 頁確認。</strong></p>
+<p>先備份原始檔案，再開啟 Editor：</p>
+<pre><code class="language-bash">sudo cp -a /etc/prometheus/prometheus.yml /etc/prometheus/prometheus.yml.before-day29
+sudo nano /etc/prometheus/prometheus.yml
+</code></pre>
+<p>保留既有 <code>global</code> 區塊。找到 Debian 預設的 <code>scrape_configs:</code>，將它和下方所有內容整段刪除，再以下列 <code>rule_files</code>、<code>alerting</code> 與 <code>scrape_configs</code> 完整取代。不要把新區塊追加在原本的 <code>job_name: prometheus</code> 後面；整份檔案只能有一個 <code>scrape_configs:</code>，而每個 <code>job_name</code> 也只能出現一次：</p>
+<pre><code class="language-yaml">rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: [&quot;127.0.0.1:9093&quot;]
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: [&quot;localhost:9090&quot;]
+
+  - job_name: node
+    static_configs:
+      - targets:
+          - localhost:9100
+          - 10.77.20.21:9100
+          - 10.77.20.22:9100
+          - 10.77.20.31:9100
+          - 10.77.20.32:9100
+          - 10.77.30.10:9100
+          - 10.77.30.11:9100
+          - 10.77.30.12:9100
+          - 10.77.30.13:9100
+          - 10.77.40.11:9100
+          - 10.77.50.11:9100
+
+  - job_name: patroni
+    metrics_path: /metrics
+    static_configs:
+      - targets: [&quot;10.77.30.11:8008&quot;, &quot;10.77.30.12:8008&quot;, &quot;10.77.30.13:8008&quot;]
+
+  - job_name: postgres
+    static_configs:
+      - targets: [&quot;10.77.30.11:9187&quot;, &quot;10.77.30.12:9187&quot;, &quot;10.77.30.13:9187&quot;]
+
+  - job_name: haproxy
+    static_configs:
+      - targets: [&quot;10.77.20.21:8405&quot;, &quot;10.77.20.22:8405&quot;]
+
+  - job_name: public-web-https
+    metrics_path: /probe
+    params: { module: [http_2xx] }
+    static_configs:
+      - targets: [&quot;https://app.example.com/health&quot;]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: 127.0.0.1:9115
+</code></pre>
+<p>把 <code>app.example.com</code> 改成 Day 27 的真實公開 Hostname。這個 Probe 檢查的是經公開 DNS、Cloudflare Edge 到 Origin 的完整路徑。在重啟 Prometheus 前，先從 monitor01 確認：</p>
+<pre><code class="language-bash">dig app.example.com A +short
+curl -fsS --connect-timeout 10 https://app.example.com/health
+</code></pre>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code>。先確認 <code>scrape_configs</code> 與 <code>job_name: prometheus</code> 各只出現一次，再檢查語法；成功才 Restart：</p>
+<pre><code class="language-bash">grep -n &#39;^scrape_configs:&#39; /etc/prometheus/prometheus.yml
+grep -nE &#39;^[[:space:]]*- job_name:[[:space:]]*prometheus[[:space:]]*$&#39; \
+  /etc/prometheus/prometheus.yml
+sudo promtool check config /etc/prometheus/prometheus.yml
+sudo systemctl restart prometheus
+sudo systemctl status prometheus --no-pager
+curl http://127.0.0.1:9090/-/ready
+</code></pre>
+<h3>6.1 建立 VPN-Monitor 群組與 Alias</h3>
+<p><strong>操作位置：OPNsense Web UI。</strong></p>
+<p>Day 17 已建立 <code>IRON-LAB-ROAD-WARRIOR</code> OpenVPN Instance、<code>vpn-monitor01</code> 帳號與 Client Profile。本節不重新建立 VPN，而是授權 <code>vpn-monitor01</code> 連入 monitor01 的 Grafana 與 Prometheus Web UI。Alertmanager 由 monitor01 本機透過 <code>amtool</code> 管理，不對 VPN 開放 TCP 9093。</p>
+<ol>
+<li>進入 <code>System</code> → <code>Access</code> → <code>Groups</code>，按 <code>Add</code>。</li>
+<li>Group Name 填 <code>vpn-monitor</code>，Description 填 <code>Monitoring UI operators</code>。</li>
+<li>Members 只選 <code>vpn-monitor01</code>；不要加入 <code>vpn-ro01</code>、<code>vpn-rw01</code> 或 <code>vpn-admin01</code>，按 <code>Save</code>。</li>
+<li>進入 <code>Firewall</code> → <code>Aliases</code>，按 <code>Add</code>。</li>
+<li>Name 填 <code>VPN_MONITOR_CLIENTS</code>、Type 選 <code>OpenVPN group</code>、Content 選剛建立的 <code>vpn-monitor</code>。</li>
+<li>Description 填 <code>Connected OpenVPN members of vpn-monitor</code>，按 <code>Save</code>。</li>
+<li>再按 <code>Add</code>，Name 填 <code>MONITOR_UI_PORTS</code>、Type 選 <code>Port(s)</code>，Content 依次加入 <code>3000</code>、<code>9090</code>。</li>
+<li>Description 填 <code>Grafana and Prometheus UI</code>，按 <code>Save</code> 與 <code>Apply</code>。</li>
+</ol>
+<p><code>VPN_MONITOR_CLIENTS</code> 是動態 Alias。<code>vpn-monitor01</code> 尚未連線時可以是空的；連線後，OPNsense 會將該 Client 取得的 <code>10.77.60.x</code> Tunnel IP 加入 Alias。</p>
+<p><img src="../../source/Day29/day29-main-fig14.png" alt="vpn-monitor 群組只包含 vpn-monitor01"></p>
+<p>圖（十四）<code>vpn-monitor</code> 群組只納入監控用途的 <code>vpn-monitor01</code></p>
+<p><img src="../../source/Day29/day29-main-fig15.png" alt="VPN_MONITOR_CLIENTS 使用 OpenVPN group 動態 Alias"></p>
+<p>圖（十五）<code>VPN_MONITOR_CLIENTS</code> 會依 <code>vpn-monitor</code> 的已連線成員動態更新</p>
+<h3>6.2 建立 OpenVPN 到監控介面的規則</h3>
+<ol>
+<li>進入 <code>Firewall</code> → <code>Rules</code>，在頁面左上角的 Interface 選單選 <code>OpenVPN</code>；不要選 <code>WAN</code>、<code>SERVICE</code> 或 <code>LAB_INTERNAL</code>。</li>
+<li>按 <code>Add</code>，Action 選 <code>Pass</code>、Direction 選 <code>in</code>、Version 選 <code>IPv4</code>、Protocol 選 <code>TCP</code>。</li>
+<li>Source 選 Alias <code>VPN_MONITOR_CLIENTS</code>。</li>
+<li>Destination 選 Alias <code>MONITOR_NODE</code>。</li>
+<li>Destination Port 選 Alias <code>MONITOR_UI_PORTS</code>。</li>
+<li>勾選 Log，Description 填 <code>ALLOW_VPN_MONITOR_TO_MONITORING_UI</code>，按 <code>Save</code> 與 <code>Apply</code>。</li>
+<li>確認這條 Allow 位於所有可能拒絕 OpenVPN 內部流量的 Block Rule 上方。未命中 Allow 的其他 VPN 使用者會由 OPNsense 的隱含 Default Deny 拒絕。</li>
+</ol>
+<p><img src="../../source/Day29/day29-main-fig16.png" alt="OpenVPN 群組只允許 VPN_MONITOR_CLIENTS 存取監控介面"></p>
+<p>圖（十六）OpenVPN 規則只允許 <code>VPN_MONITOR_CLIENTS</code> 存取 monitor01 的管理介面</p>
+<h3>6.3 使用 vpn-monitor01 連線並測試</h3>
+<p>在管理電腦匯入或選擇 Day 17 匯出的 <code>vpn-monitor01</code> Client Profile，連上 <code>IRON-LAB-ROAD-WARRIOR</code>。不要改用 <code>vpn-admin01</code>、<code>vpn-rw01</code> 或 <code>vpn-ro01</code>。</p>
+<p>連線後在 PowerShell 確認兩個監控 Port 都已通過防火牆：</p>
+<pre><code class="language-powershell">Test-NetConnection 10.77.20.51 -Port 3000
+Test-NetConnection 10.77.20.51 -Port 9090
+</code></pre>
+<p><code>TcpTestSucceeded</code> 都必須是 <code>True</code>。若為 <code>False</code>，先確認目前使用的 Profile 是 <code>vpn-monitor01</code>，再檢查 <code>VPN_MONITOR_CLIENTS</code> 是否已展開為該 Client 的 Tunnel IP、<code>ALLOW_VPN_MONITOR_TO_MONITORING_UI</code> 規則順序，以及 Grafana 與 Prometheus 的監聽狀態。</p>
+<p>保持第 6.3 節建立的 <code>vpn-monitor01</code> OpenVPN Connection，在管理電腦開啟 <code>http://10.77.20.51:9090</code>。如果畫面顯示 Debian 未內建現代 React Web UI 的提示，這是 Debian Prometheus 套件的預期畫面。按 <code>Use classic web UI</code>，再進入 <code>Status</code> → <code>Targets</code>；也可直接開啟：</p>
+<pre><code class="language-text">http://10.77.20.51:9090/classic/targets
+</code></pre>
+<p>本 Lab 使用 Grafana 作為主要圖形介面，Prometheus Web UI 只用來檢查 Target、Rule 與查詢結果，因此不需要執行提示頁上的 <code>/usr/share/prometheus/install-ui.sh</code>。先確認 <code>node</code> Targets，再確認 Patroni、PostgreSQL、HAProxy 與 Web Probe；不要在 Target Down 時直接繼續建 Dashboard。</p>
+<p>正常時應看到 <code>prometheus (1/1 up)</code>、<code>node (11/11 up)</code>、<code>patroni (3/3 up)</code>、<code>postgres (3/3 up)</code>、<code>haproxy (2/2 up)</code> 與 <code>public-web-https (1/1 up)</code>。若十個遠端 TCP 9100 Target 出現在 <code>prometheus</code> Job 下，代表 <code>/etc/prometheus/prometheus.yml</code> 的縮排或 <code>job_name</code> 放錯：<code>prometheus</code> 只保留 <code>localhost:9090</code>，本機與遠端的 TCP 9100 Target 全部放在 <code>node</code> Job。修正後再執行：</p>
+<pre><code class="language-bash">sudo promtool check config /etc/prometheus/prometheus.yml
+sudo systemctl restart prometheus
+</code></pre>
+<p><img src="../../source/Day29/day29-main-fig17.png" alt="Prometheus Targets 顯示各監控工作與 Target 狀態"></p>
+<p>圖（十七）Prometheus Targets 顯示各工作預期的 Target 數量與狀態</p>
+<h2>7. Alert Rules</h2>
+<p><strong>操作節點：只在 monitor01。</strong></p>
+<p>建立目錄並開啟 Rule File：</p>
+<pre><code class="language-bash">sudo install -d -m 755 /etc/prometheus/rules
+sudo nano /etc/prometheus/rules/iron-lab.yml
+</code></pre>
+<p>貼上：</p>
+<pre><code class="language-yaml">groups:
+  - name: iron-lab
+    rules:
+      - alert: InstanceDown
+        expr: up == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: &quot;{{ $labels.job }} {{ $labels.instance }} is down&quot;
+          runbook: &quot;Day29-InstanceDown&quot;
+
+      - alert: FilesystemLow
+        expr: node_filesystem_avail_bytes{fstype!~&quot;tmpfs|overlay&quot;} / node_filesystem_size_bytes{fstype!~&quot;tmpfs|overlay&quot;} &lt; 0.15
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: &quot;Filesystem below 15% on {{ $labels.instance }}&quot;
+          runbook: &quot;Day29-FilesystemLow&quot;
+
+      - alert: PatroniHasNoLeader
+        expr: sum(patroni_primary) != 1
+        for: 30s
+        labels: { severity: critical }
+        annotations:
+          summary: &quot;Patroni cluster does not have exactly one leader&quot;
+          runbook: &quot;Day29-PatroniLeader&quot;
+
+      - alert: PublicHttpsDown
+        expr: probe_success{job=&quot;public-web-https&quot;} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: &quot;Public Cloudflare HTTPS probe is failing&quot;
+          runbook: &quot;Day29-PublicHttps&quot;
+
+      - alert: PublicEdgeCertificateExpiring
+        expr: probe_ssl_earliest_cert_expiry{job=&quot;public-web-https&quot;} - time() &lt; 1209600
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: &quot;Public edge certificate expires within 14 days&quot;
+          runbook: &quot;Day29-PublicEdgeCertificate&quot;
+
+      - alert: OriginCertificateExpiring
+        expr: iron_origin_cert_expiry_timestamp_seconds - time() &lt; 2592000
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: &quot;Origin certificate expires within 30 days on {{ $labels.instance }}&quot;
+          runbook: &quot;Day29-OriginCertificate&quot;
+</code></pre>
+<p>先到 Prometheus <code>/metrics</code> 查證實際 Patroni Metric Name；若目前版本名稱不同，修改 Expression 後用 <code>promtool check rules</code>，不要照抄一條永遠沒有資料的規則。</p>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code>，再執行：</p>
+<pre><code class="language-bash">sudo promtool check rules /etc/prometheus/rules/iron-lab.yml
+sudo systemctl reload prometheus
+</code></pre>
+<p><img src="../../source/Day29/day29-main-fig18.png" alt="六條 Prometheus 告警規則已載入並處於 Inactive"></p>
+<p>圖（十八）六條告警規則已成功載入，正常狀態下全部為 Inactive</p>
+<h2>8. Alertmanager 本機路由</h2>
+<p><strong>操作節點：只在 monitor01。本 Lab 使用不掛載外部通知整合的本機 Receiver。</strong></p>
+<p>本節只建立 Alertmanager 的本機 Routing Tree，讓 <code>warning</code> 與 <code>critical</code> 依 <code>severity</code> Label 分類到不同 Receiver。Receiver 不掛載通知整合，因此 Alert 只透過 monitor01 上的 <code>amtool</code> 或 HTTP API 查看，不會寄送 Email 或呼叫 Webhook。Debian 的 Alertmanager 套件未內建 Web UI，瀏覽器開啟 TCP 9093 時看到提示頁屬於預期行為。</p>
+<p>先備份再開啟設定檔：</p>
+<pre><code class="language-bash">sudo cp -a /etc/prometheus/alertmanager.yml /etc/prometheus/alertmanager.yml.before-day29
+sudo nano /etc/prometheus/alertmanager.yml
+</code></pre>
+<p>將內容完整取代為：</p>
+<pre><code class="language-yaml">global:
+  resolve_timeout: 5m
+
+route:
+  receiver: warning-local
+  group_by: [alertname, job, instance]
+  group_wait: 1m
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - receiver: critical-local
+      matchers:
+        - &#39;severity=&quot;critical&quot;&#39;
+      group_wait: 10s
+      repeat_interval: 30m
+
+    - receiver: warning-local
+      matchers:
+        - &#39;severity=&quot;warning&quot;&#39;
+      group_wait: 1m
+      repeat_interval: 4h
+
+receivers:
+  - name: warning-local
+  - name: critical-local
+</code></pre>
+<p>頂層 Route 不設 Matcher，讓所有 Alert 先進入同一棵 Routing Tree。<code>critical</code> 會匹配 <code>critical-local</code>，<code>warning</code> 會匹配 <code>warning-local</code>；沒有 <code>severity</code> Label 的 Alert 使用頂層 <code>warning-local</code>，避免未分類 Alert 被遺漏。</p>
+<p>按 <code>Ctrl+O</code>、Enter、<code>Ctrl+X</code>，再驗證設定與路由結果：</p>
+<pre><code class="language-bash">sudo chown root:prometheus /etc/prometheus/alertmanager.yml
+sudo chmod 640 /etc/prometheus/alertmanager.yml
+sudo amtool check-config /etc/prometheus/alertmanager.yml
+sudo amtool config routes test \
+  --config.file=/etc/prometheus/alertmanager.yml \
+  --verify.receivers=warning-local \
+  severity=warning
+sudo amtool config routes test \
+  --config.file=/etc/prometheus/alertmanager.yml \
+  --verify.receivers=critical-local \
+  severity=critical
+</code></pre>
+<p>預期兩次 Route Test 都顯示 <code>SUCCESS</code>。重新啟動 Alertmanager，並確認 Readiness Endpoint：</p>
+<pre><code class="language-bash">sudo systemctl restart prometheus-alertmanager
+sudo systemctl status prometheus-alertmanager --no-pager
+curl -fsS http://127.0.0.1:9093/-/ready
+</code></pre>
+<p>服務應為 <code>active (running)</code>，Readiness Endpoint 應回覆 <code>OK</code>。本日會在第 10 節停止真實 Target，觀察 Alert 觸發與恢復後的清除流程，不另外建立 Webhook 測試 Alert。</p>
+<p><img src="../../source/Day29/day29-main-fig19.png" alt="Alertmanager Readiness Endpoint 回覆 OK"></p>
+<p>圖（十九）Alertmanager Readiness Endpoint 回覆 <code>OK</code></p>
+<p>要在 monitor01 列出 Alertmanager 目前收到的 Active Alert，執行：</p>
+<pre><code class="language-bash">sudo amtool alert query \
+  --alertmanager.url=http://127.0.0.1:9093
+</code></pre>
+<blockquote>
+<p>**正式環境延伸：**可在 Receiver 下加入 <code>email_configs</code> 或 <code>webhook_configs</code>，並將 <code>warning</code> 送往維運通知、<code>critical</code> 送往即時通知管道。外部 Receiver 上線前要實際驗證 Firing 與 Resolved 通知，敏感 Token 不得進入 Git。本次 Lab 使用本機 Receiver 觀察告警路由與 Active Alert 狀態。</p>
+</blockquote>
+<h2>9. Grafana</h2>
+<p><strong>操作位置：從管理電腦開啟 monitor01 的 Grafana Web UI。</strong></p>
+<p>管理電腦已在第 6.3 節使用 <code>vpn-monitor01</code> 連上 <code>IRON-LAB-ROAD-WARRIOR</code>，並已通過 TCP 3000 與 9090 的連線測試。</p>
+<h3>9.1 首次登入、修改密碼並驗證</h3>
+<ol>
+<li>以瀏覽器開啟 <code>http://10.77.20.51:3000</code>。</li>
+<li>在登入頁的 <code>Email or username</code> 輸入 <code>admin</code>，<code>Password</code> 輸入初始密碼 <code>admin</code>，按 <code>Log in</code>。</li>
+<li>首次登入會顯示修改密碼畫面。在 <code>New password</code> 與 <code>Confirm new password</code> 輸入相同的新密碼，按 <code>Submit</code>；新密碼不得出現在文件、Git、指令歷史或公開畫面。</li>
+<li>進入 Grafana 首頁後，打開使用者選單並按 <code>Sign out</code>。</li>
+<li>再次開啟 <code>http://10.77.20.51:3000</code>，使用帳號 <code>admin</code> 與剛設定的新密碼登入。</li>
+<li>確認能再次進入 Grafana 首頁。舊密碼 <code>admin</code> 已失效且新密碼可登入，才算完成首次帳密更換驗證。</li>
+</ol>
+<h3>9.2 加入 Prometheus Data Source 與 Dashboard</h3>
+<ol>
+<li>左側選 <code>Connections</code> → <code>Data sources</code>。</li>
+<li>按 <code>Add new data source</code>，選 <code>Prometheus</code>。</li>
+<li>Name 填 <code>Prometheus</code>，Prometheus server URL 填 <code>http://127.0.0.1:9090</code>。</li>
+<li>按頁面底部 <code>Save &amp; test</code>，確認顯示連線成功。</li>
+<li>從本 Repository 取得 <a href="./DAY29_IRON-LAB-Overview.dashboard.json"><code>Day29_IRON-LAB-Overview.dashboard.json</code></a>，不要修改檔案副檔名。</li>
+<li>回到 Grafana，左側選 <code>Dashboards</code>，按 <code>New</code> → <code>Import</code>。</li>
+<li>按 <code>Upload dashboard JSON file</code>，選擇 <code>Day29_IRON-LAB-Overview.dashboard.json</code>。</li>
+<li>在 Import 畫面的 Prometheus Data Source 選單選擇剛建立的 <code>Prometheus</code>。</li>
+<li>Name 保持 <code>IRON-LAB Overview</code>、Folder 保持 <code>General</code>，按 <code>Import</code>。</li>
+<li>確認 Dashboard 出現 Node CPU、Memory、Filesystem、Patroni Role、PostgreSQL Connections、HAProxy Backend 與 Public HTTPS Probe 七個 Panel。</li>
+<li>將右上角時間範圍保持為 <code>Last 6 hours</code>，等待至少一次 15 秒 Refresh；各 Panel 應顯示資料，Public HTTPS Probe 應顯示 <code>UP</code>。</li>
+</ol>
+<p>若某個 Panel 顯示 <code>No data</code>，先在 Prometheus 的 Graph 頁面查詢該 Panel 使用的 Metric，並確認對應 Target 是 <code>UP</code>；不要在匯入後直接改寫 Query。Dashboard JSON 使用 Import Input 綁定 Prometheus，不包含 Data Source Password、Grafana 密碼或外部通知 Credential。</p>
+<p><img src="../../source/Day29/day29-main-fig20.png" alt="Grafana IRON-LAB Overview 顯示七個監控面板"></p>
+<p>圖（二十）Grafana 儀表板整合主機、資料庫、代理與公開 HTTPS 指標</p>
+<h2>10. 實際觸發</h2>
+<p><strong>操作順序：先保持監控畫面開啟，再到單一目標節點注入故障，確認告警恢復後才進下一項。</strong></p>
+<ol>
+<li>在管理電腦開啟 Prometheus <code>Alerts</code> 與 Grafana Dashboard；另外在 monitor01 開啟一個 Terminal，執行 <code>watch -n 2 &quot;amtool alert query --alertmanager.url=http://127.0.0.1:9093&quot;</code>。</li>
+<li>到 app02 執行 <code>date -Is</code> 與 <code>sudo systemctl stop prometheus-node-exporter</code>。</li>
+<li>等 <code>InstanceDown</code> 從 Pending 變成 Firing，記錄時間。</li>
+<li>確認 monitor01 的 <code>amtool</code> 輸出出現該 Alert，並檢查 Severity、Summary 與 Runbook Annotation。</li>
+<li>回 app02 執行 <code>sudo systemctl start prometheus-node-exporter</code>。</li>
+<li>確認 Prometheus Target 回到 Up、Prometheus 不再顯示 Firing，而且該 Alert 隨後從 <code>amtool alert query</code> 的 Active Alert 清單消失。</li>
+</ol>
+<p><img src="../../source/Day29/day29-main-fig21.png" alt="app02 停止 Node Exporter 以注入故障"></p>
+<p>圖（二十一）在 app02 停止 Node Exporter，建立可控制的 Target 故障</p>
+<p><img src="../../source/Day29/day29-main-fig22.png" alt="app02 的 InstanceDown 進入 Pending"></p>
+<p>圖（二十二）<code>InstanceDown</code> 先進入 Pending，等待 <code>for: 2m</code> 持續時間</p>
+<p><img src="../../source/Day29/day29-main-fig23.png" alt="Alertmanager 收到 app02 的 Active Alert"></p>
+<p>圖（二十三）條件持續成立後，Alertmanager 收到 app02 的 Active Alert</p>
+<p><img src="../../source/Day29/day29-main-fig24.png" alt="app02 恢復後 Active Alert 已清除"></p>
+<p>圖（二十四）app02 恢復後，該告警從 Active Alert 清單消失</p>
+<h3>10.1 停止一個 Replica 的 Patroni</h3>
+<p><strong>操作節點：pg01，以及本次選定的一個 Replica。不可停止 Leader。</strong></p>
+<p>先確認 app02 的 Node Exporter 已恢復，前一項 <code>InstanceDown</code> 也已從 Active Alert 清單消失。接著在 pg01 列出 Patroni Cluster：</p>
+<pre><code class="language-bash">sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  list -e
+</code></pre>
+<p>開始故障測試前必須符合：</p>
+<ul>
+<li>剛好一個 Member 是 <code>Leader</code>，State 是 <code>running</code>。</li>
+<li>另外兩個 Member 是 <code>Replica</code>，State 是 <code>streaming</code>。</li>
+<li>三個 Member 的 Timeline 相同，Replication Lag 沒有異常累積。</li>
+</ul>
+<p>從兩個 Replica 中選一個測試。下方以 <code>pg03</code> 為例；只有剛才的清單明確顯示 <code>pg03</code> 是 <code>Replica</code> 時，才可以照抄。</p>
+<p>在 monitor01 另開一個 Terminal，持續查看 Alertmanager 收到的 Active Alert：</p>
+<pre><code class="language-bash">watch -n 2 \
+  &#39;amtool alert query --alertmanager.url=http://127.0.0.1:9093&#39;
+</code></pre>
+<p>再登入 pg03 執行下列命令；不要留在 pg01 執行。本 Lab 的 Patroni REST API 只監聽各節點的 <code>10.77.30.x:8008</code>，沒有監聽 <code>127.0.0.1:8008</code>。<code>/replica</code> 只會在該節點當下是 Replica 時回傳 HTTP 200；若它已變成 Leader，<code>curl -f</code> 會失敗，後方的停止命令就不會執行：</p>
+<pre><code class="language-bash">date -Is
+curl -fsS http://10.77.30.13:8008/replica &gt;/dev/null &amp;&amp; \
+  sudo systemctl stop patroni
+systemctl is-active patroni
+</code></pre>
+<p>預期 <code>systemctl is-active</code> 顯示 <code>inactive</code>。回到管理電腦的 Prometheus：</p>
+<ol>
+<li>進入 <code>Status</code> → <code>Targets</code>，確認 <code>10.77.30.13:8008</code> 變成 <code>DOWN</code>。</li>
+<li>進入 <code>Alerts</code>，確認 <code>InstanceDown</code> 先進入 <code>Pending</code>。</li>
+<li>等待 <code>for: 2m</code> 持續時間通過，確認 <code>InstanceDown</code> 變成 <code>Firing</code>，其 Label 為 <code>instance=&quot;10.77.30.13:8008&quot;</code>、<code>job=&quot;patroni&quot;</code>。</li>
+<li>確認 monitor01 的 <code>amtool</code> 出現這筆 <code>InstanceDown</code>。</li>
+<li>確認 <code>PatroniHasNoLeader</code> 依然是 <code>Inactive</code>，不會出現在 <code>amtool</code> 的 Active Alert 清單。</li>
+</ol>
+<p>這兩條 Alert 代表不同問題：<code>InstanceDown</code> 表示 Prometheus 無法抓取 pg03 的 Patroni Metrics；<code>PatroniHasNoLeader</code> 只在 <code>sum(patroni_primary) != 1</code> 持續 30 秒時成立。本次只停止 Replica，Leader 持續回報 <code>patroni_primary 1</code>，因此後者不應觸發。</p>
+<p><img src="../../source/Day29/day29-main-fig25.png" alt="pg03 停止 Patroni 前先確認其角色為 Replica"></p>
+<p>圖（二十五）確認 pg03 是 Replica 後停止 Patroni，避免中斷 Primary</p>
+<p><img src="../../source/Day29/day29-main-fig26.png" alt="pg03 Patroni Target 變成 Down"></p>
+<p>圖（二十六）pg03 停止 Patroni 後，Patroni 工作顯示兩個 Target 正常、一個 Down</p>
+<p><img src="../../source/Day29/day29-main-fig27.png" alt="pg03 的 InstanceDown 進入 Firing"></p>
+<p>圖（二十七）pg03 的 Patroni Target 持續失聯後，<code>InstanceDown</code> 進入 Firing</p>
+<p><img src="../../source/Day29/day29-main-fig28.png" alt="PatroniHasNoLeader 維持 Inactive"></p>
+<p>圖（二十八）單一 Replica 故障期間，Primary 正常讓 <code>PatroniHasNoLeader</code> 維持 Inactive</p>
+<h3>10.2 恢復 Replica 並確認重新加入 Cluster</h3>
+<p>在 pg03 恢復 Patroni：</p>
+<pre><code class="language-bash">sudo systemctl start patroni
+systemctl is-active patroni
+sudo systemctl status patroni --no-pager
+</code></pre>
+<p>預期服務回到 <code>active</code>。回到 pg01 重複查看 Cluster：</p>
+<pre><code class="language-bash">sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  list -e
+</code></pre>
+<p>等到 pg03 顯示 <code>Replica</code> 與 <code>streaming</code>，Timeline 與 Leader 相同，Receive LSN、Replay LSN 繼續前進。接著確認：</p>
+<ol>
+<li>Prometheus 的 <code>10.77.30.13:8008</code> Target 回到 <code>UP</code>。</li>
+<li><code>InstanceDown</code> 不再是 <code>Firing</code>。</li>
+<li>稍後該 Alert 從 <code>amtool alert query</code> 的 Active Alert 清單消失。</li>
+<li><code>PatroniHasNoLeader</code> 在整個 Replica 故障期間都沒有觸發。</li>
+</ol>
+<p>三個 Member 全部回到正常狀態後，按 <code>Ctrl+C</code> 結束 monitor01 的 <code>watch</code>。</p>
+<p><img src="../../source/Day29/day29-main-fig29.png" alt="恢復後 Prometheus 告警規則全部回到 Inactive"></p>
+<p>圖（二十九）恢復 Patroni 後，Prometheus 告警規則全部回到 Inactive</p>
+<p><img src="../../source/Day29/day29-main-fig30.png" alt="恢復後所有 Prometheus Targets 回到 Up"></p>
+<p>圖（三十）恢復後，各 Prometheus Target 回到 Up</p>
+<p><img src="../../source/Day29/day29-main-fig31.png" alt="pg03 恢復為 Replica 並重新加入叢集"></p>
+<p>圖（三十一）pg03 恢復為 Replica 並重新加入 Patroni 叢集</p>
+</main></body>
+</html>

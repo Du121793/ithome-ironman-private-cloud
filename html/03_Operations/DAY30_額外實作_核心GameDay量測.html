@@ -1,0 +1,935 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Day 30 額外實作｜核心 Game Day 端到端量測</title>
+  <style>
+    :root{color-scheme:light;--orange:#f47b20;--ink:#30343b;--muted:#667085;--line:#e6e8eb;--code:#f6f7f8}
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;line-height:1.85}
+    main{width:min(940px,calc(100% - 40px));margin:0 auto;padding:42px 0 100px}h1{font-size:2rem;line-height:1.35;margin:0 0 28px}h2{margin:42px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line);font-size:1.45rem}h3{margin-top:30px;font-size:1.15rem}
+    a{color:#e5650b}blockquote{margin:20px 0;padding:5px 18px;border-left:4px solid var(--orange);background:#fff8f2;color:#5c6470}code{padding:.15em .35em;border-radius:4px;background:var(--code);color:#b42318;font-family:Consolas,monospace}pre{overflow:auto;padding:18px;border-radius:7px;background:#20242b;color:#eef1f4}pre code{padding:0;background:transparent;color:inherit}
+    table{width:100%;border-collapse:collapse;margin:22px 0;font-size:.94rem}th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f8f9}img{display:block;max-width:100%;height:auto;margin:24px auto}hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  </style>
+</head>
+<body><main><h1>Day 30 額外實作｜核心 Game Day 端到端量測</h1>
+<p>本文件接續 <a href="./DAY30_%E6%9C%80%E7%B5%82GameDay.md">Day 30｜最終驗收：用 Game Day 檢查安全邊界、服務切換與資料復原</a>，執行正文新增證據的三項核心測試：</p>
+<ul>
+<li><code>C03／F10</code>：目前持有三組 VIP 的 Proxy VM 突然停止。</li>
+<li><code>D02／F11</code>：目前 PostgreSQL Primary VM 突然停止。</li>
+<li><code>A06／F12</code>：client01 從同一個 VLAN 直接連向 app01 TCP 22。</li>
+</ul>
+<p>完整正向、負向與元件回歸保留在正式 Runbook 的 Scenario A～I。本文件提供固定 Probe、量測計算、交易核對與實際驗證畫面，讓讀者重現正文的核心結果。</p>
+<p>原始畫面保留測試當時使用的 <code>day30-f11</code>、<code>day30-f12</code> Run ID；這兩個值只用來識別該次 Log。現行文件依驗收矩陣使用 C03、D02 與 A06，新一輪執行時會建立新的 Run ID，不影響既有量測結果。</p>
+<blockquote>
+<p>[!CAUTION]
+本文件會停止 Proxy VM 與 PostgreSQL Primary VM。只在已核准的 Lab 時段執行，每次只注入一項故障。保留 L0、PVE Console 與 OPNsense Console；目前 Primary、VIP Owner 或回復路徑不明時停止操作。</p>
+</blockquote>
+<h2>本次驗收會取得哪些證據</h2>
+<table>
+<thead>
+<tr>
+<th>證據群組</th>
+<th>內容</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>C1</td>
+<td>執行前健康基準</td>
+<td>證明故障前環境健康</td>
+</tr>
+<tr>
+<td>C2</td>
+<td>三條 Probe 連續成功</td>
+<td>固定使用者觀察方式</td>
+</tr>
+<tr>
+<td>C3</td>
+<td><code>C03／F10</code> 故障注入與 VM 狀態</td>
+<td>確定 Proxy 故障起點</td>
+</tr>
+<tr>
+<td>C4</td>
+<td><code>C03／F10</code> 三條 Probe 的量測摘要與 VIP 接手</td>
+<td>判讀 Proxy VM 故障結果</td>
+</tr>
+<tr>
+<td>C5</td>
+<td><code>C03／F10</code> 回復後完整穩態</td>
+<td>證明環境可以進入下一項測試</td>
+</tr>
+<tr>
+<td>D1</td>
+<td><code>D02／F11</code> 前的 Primary、Timeline 與 VMID</td>
+<td>確定資料庫故障目標</td>
+</tr>
+<tr>
+<td>D2</td>
+<td><code>D02／F11</code> 故障注入、新 Primary 與 Probe 恢復</td>
+<td>判讀控制面與使用者路徑</td>
+</tr>
+<tr>
+<td>D3</td>
+<td>已確認交易核對</td>
+<td>判讀本次 Failover 是否遺失已確認交易</td>
+</tr>
+<tr>
+<td>D4</td>
+<td>舊 Primary 回歸與服務元件穩態</td>
+<td>判讀備援能力修復</td>
+</tr>
+<tr>
+<td>D5</td>
+<td><code>D02／A03</code> 告警生命週期補測</td>
+<td>量測 Pending、Firing 與告警清除</td>
+</tr>
+<tr>
+<td>N1</td>
+<td><code>A06／F12</code> 同 VLAN 直接 SSH</td>
+<td>保存目前管理路徑的既有缺口</td>
+</tr>
+</tbody></table>
+<p>這些畫面分別支持故障前基準、使用者影響、控制面接手、資料核對、告警生命週期與已知安全缺口。</p>
+<h2>1. 填寫本次演練資料</h2>
+<p><strong>操作位置：管理電腦。</strong></p>
+<p>執行前先記錄：</p>
+<table>
+<thead>
+<tr>
+<th>欄位</th>
+<th>本次填寫</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Exercise ID</td>
+<td></td>
+</tr>
+<tr>
+<td>日期與核准時段</td>
+<td></td>
+</tr>
+<tr>
+<td>操作者／回復負責人</td>
+<td></td>
+</tr>
+<tr>
+<td>Proxy VM RTO</td>
+<td>未核准時填「未設定」</td>
+</tr>
+<tr>
+<td>Primary VM RTO</td>
+<td>未核准時填「未設定」</td>
+</tr>
+<tr>
+<td>Primary Failover RPO</td>
+<td>未核准時填「未設定」</td>
+</tr>
+<tr>
+<td>證據保存位置</td>
+<td></td>
+</tr>
+</tbody></table>
+<p>測得的秒數是實際能力。只有事先填入並核准的 RTO／RPO，才能用於 PASS／FAIL；未設定的項目保留為能力基線。</p>
+<h2>2. 確認開始前健康基準</h2>
+<h3>2.0 確認跨主機時間可以比較</h3>
+<p><strong>操作位置：client01、承載目標 VM 的 PVE 節點、兩台 Proxy、三台 PostgreSQL 節點與 monitor01。</strong></p>
+<pre><code class="language-bash">hostnamectl --static 2&gt;/dev/null || hostname
+date --iso-8601=ns
+timedatectl show -p NTPSynchronized --value
+chronyc tracking 2&gt;/dev/null | \
+  grep -E &#39;Reference ID|System time|Leap status&#39; || true
+</code></pre>
+<p>跨主機的 <code>fault_to_stable_recovery</code> 只有在時鐘同步時才具備量測意義。某台主機無法證明同步時，仍可使用 client01 同一份 Log 計算 <code>first_fail_to_stable_recovery</code>，跨主機故障起點到恢復時間則標示為證據不足。</p>
+<h3>2.1 PVE 與 Ceph</h3>
+<p><strong>操作位置：任一 PVE 叢集節點。</strong></p>
+<pre><code class="language-bash">hostname
+date --iso-8601=ns
+pvecm status
+ceph -s
+ha-manager status
+</code></pre>
+<p>必須確認 PVE 為 3/3 Quorate、Ceph 為 <code>HEALTH_OK</code> 且 PG 全部 <code>active+clean</code>。</p>
+<h3>2.2 PostgreSQL 與 etcd</h3>
+<p><strong>操作位置：任一 PostgreSQL 節點。</strong></p>
+<pre><code class="language-bash">hostnamectl --static
+date --iso-8601=ns
+
+sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  list -e
+
+sudo -u etcd env \
+  ETCDCTL_API=3 \
+  ETCDCTL_ENDPOINTS=&#39;https://10.77.30.11:2379,https://10.77.30.12:2379,https://10.77.30.13:2379&#39; \
+  ETCDCTL_CACERT=&#39;/etc/etcd/tls/ca.crt&#39; \
+  ETCDCTL_CERT=&#39;/etc/etcd/tls/node.crt&#39; \
+  ETCDCTL_KEY=&#39;/etc/etcd/tls/node.key&#39; \
+  etcdctl endpoint health --cluster
+</code></pre>
+<p>必須看到一台 Leader、兩台 <code>Replica / streaming</code>，而且 etcd 三個 Endpoint 都為 Healthy。</p>
+<h3>2.3 Proxy、VIP 與監控</h3>
+<p><strong>操作位置：proxy01、proxy02 各執行一次。</strong></p>
+<pre><code class="language-bash">hostnamectl --static
+date --iso-8601=ns
+systemctl is-active nginx haproxy keepalived
+
+for vip in 10.77.20.10 10.77.20.11 10.77.20.12; do
+  if ip -4 -o address show dev eth0 | grep -Fq &quot; ${vip}/24 &quot;; then
+    printf &#39;%s owner=%s\n&#39; &quot;$vip&quot; &quot;$(hostnamectl --static)&quot;
+  else
+    printf &#39;%s owner=other-node\n&#39; &quot;$vip&quot;
+  fi
+done
+</code></pre>
+<p><strong>操作位置：monitor01。</strong></p>
+<pre><code class="language-bash">hostnamectl --static
+date --iso-8601=ns
+systemctl is-active \
+  prometheus \
+  prometheus-alertmanager \
+  prometheus-blackbox-exporter \
+  grafana-server
+curl -fsS http://127.0.0.1:9090/-/ready
+curl -fsS http://127.0.0.1:9093/-/ready
+</code></pre>
+<p><img src="../../source/Day30/day30-extra-fig01.png" alt="PVE 三個節點均在成員清單且叢集維持 Quorate"></p>
+<p>圖（一）　PVE 三個節點均在成員清單且叢集維持 Quorate</p>
+<p><img src="../../source/Day30/day30-extra-fig02.png" alt="Ceph 為 HEALTH_OK 且 HA 服務處於 Started"></p>
+<p>圖（二）　Ceph 為 HEALTH_OK 且 HA 服務處於 Started</p>
+<p><img src="../../source/Day30/day30-extra-fig03.png" alt="Patroni 為一台 Leader 兩台 Replica 且 etcd 三個 Endpoint 健康"></p>
+<p>圖（三）　Patroni 為一台 Leader 兩台 Replica 且 etcd 三個 Endpoint 健康</p>
+<p><img src="../../source/Day30/day30-extra-fig04.png" alt="proxy01 持有三組 VIP"></p>
+<p>圖（四）　proxy01 持有三組 VIP</p>
+<p><img src="../../source/Day30/day30-extra-fig05.png" alt="proxy02 未持有 VIP"></p>
+<p>圖（五）　proxy02 未持有 VIP</p>
+<p><img src="../../source/Day30/day30-extra-fig06.png" alt="monitor01 的監控服務均為 active"></p>
+<p>圖（六）　monitor01 的監控服務均為 active</p>
+<h2>3. 建立固定 Probe 與量測工具</h2>
+<h3>3.1 建立測試資料表</h3>
+<p><strong>操作位置：目前 PostgreSQL Leader。</strong></p>
+<pre><code class="language-bash">hostnamectl --static
+
+sudo -u postgres psql \
+  -X -d appdb -v ON_ERROR_STOP=1 -P pager=off &lt;&lt;&#39;SQL&#39;
+CREATE TABLE IF NOT EXISTS app.day30_failover_probe (
+  run_id text NOT NULL,
+  client_seq bigint NOT NULL,
+  committed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY (run_id, client_seq)
+);
+
+ALTER TABLE app.day30_failover_probe OWNER TO app_owner;
+GRANT INSERT, SELECT ON app.day30_failover_probe TO app_rw;
+GRANT SELECT ON app.day30_failover_probe TO app_ro;
+SQL
+
+sudo -u postgres psql \
+  -X -d appdb -P pager=off \
+  -c &#39;\d+ app.day30_failover_probe&#39;
+</code></pre>
+<p>這張表只保存本次測試的 Run ID、用戶端序號與 Commit 時間。<code>run_id</code> 讓 <code>C03</code>、<code>D02</code> 與後續複測互不混淆。</p>
+<h3>3.2 建立 Probe Script</h3>
+<p><strong>操作位置：client01。</strong></p>
+<p>開始前確認 Root CA 與 <code>.pgpass</code> 已依正式 Runbook 建立；畫面不顯示 <code>.pgpass</code> 內容：</p>
+<pre><code class="language-bash">hostnamectl --static
+date --iso-8601=ns
+sudo test -r /etc/iron-app/pg-ca.crt
+printf &#39;pg_ca_readable_rc=%s\n&#39; &quot;$?&quot;
+stat -c &#39;%U %G %a %n&#39; &quot;$HOME/.pgpass&quot;
+</code></pre>
+<p>建立程式：</p>
+<pre><code class="language-bash">sudo install -d -m 0755 /opt/iron-test
+sudo install -d -m 0750 -o labadmin -g labadmin /var/log/iron-test
+
+sudo tee /opt/iron-test/day30-probe.sh &gt;/dev/null &lt;&lt;&#39;SCRIPT&#39;
+#!/bin/bash
+set -u
+
+probe_type=&quot;${1:?usage: day30-probe.sh web|rw|ro}&quot;
+run_id=&quot;${DAY30_RUN_ID:?DAY30_RUN_ID is required}&quot;
+public_host=&quot;${DAY30_PUBLIC_HOST:?DAY30_PUBLIC_HOST is required}&quot;
+seq=0
+
+while true; do
+  seq=$((seq + 1))
+  epoch=&quot;$(date +%s.%N)&quot;
+  iso=&quot;$(date --iso-8601=ns)&quot;
+  output=&#39;&#39;
+  rc=0
+
+  case &quot;$probe_type&quot; in
+    web)
+      if output=&quot;$(curl -fsS --connect-timeout 3 --max-time 5 \
+        &quot;https://${public_host}/health?day30=${run_id}-${seq}&quot; 2&gt;&amp;1)&quot;; then
+        rc=0
+      else
+        rc=$?
+      fi
+      ;;
+
+    rw)
+      if output=&quot;$(PGOPTIONS=&#39;-c statement_timeout=3000&#39; \
+        psql \
+          &#39;host=db-rw.lab.home port=5432 dbname=appdb user=app_rw sslmode=verify-full sslrootcert=/etc/iron-app/pg-ca.crt connect_timeout=3&#39; \
+          -X -qAt -F &#39;,&#39; -v ON_ERROR_STOP=1 \
+          -c &quot;INSERT INTO app.day30_failover_probe(run_id, client_seq)
+              VALUES (&#39;$run_id&#39;, $seq)
+              RETURNING client_seq,
+                        extract(epoch FROM committed_at),
+                        inet_server_addr();&quot; 2&gt;&amp;1)&quot;; then
+        rc=0
+      else
+        rc=$?
+      fi
+      ;;
+
+    ro)
+      if output=&quot;$(PGOPTIONS=&#39;-c statement_timeout=3000&#39; \
+        psql \
+          &#39;host=db-ro.lab.home port=5432 dbname=appdb user=app_ro sslmode=verify-full sslrootcert=/etc/iron-app/pg-ca.crt connect_timeout=3&#39; \
+          -X -qAt -F &#39;,&#39; -v ON_ERROR_STOP=1 \
+          -c &#39;SELECT pg_is_in_recovery(),inet_server_addr(),extract(epoch FROM clock_timestamp());&#39; \
+          2&gt;&amp;1)&quot;; then
+        rc=0
+      else
+        rc=$?
+      fi
+      ;;
+
+    *)
+      echo &#39;usage: day30-probe.sh web|rw|ro&#39; &gt;&amp;2
+      exit 2
+      ;;
+  esac
+
+  output=&quot;$(printf &#39;%s&#39; &quot;$output&quot; | tr &#39;\n|&#39; &#39;  &#39;)&quot;
+
+  if [ &quot;$rc&quot; -eq 0 ]; then
+    status=&#39;OK&#39;
+  else
+    status=&#39;FAIL&#39;
+  fi
+
+  printf &#39;%s|%s|%s|%s|rc=%s seq=%s %s\n&#39; \
+    &quot;$epoch&quot; &quot;$iso&quot; &quot;$probe_type&quot; &quot;$status&quot; &quot;$rc&quot; &quot;$seq&quot; &quot;$output&quot;
+
+  sleep 1
+done
+SCRIPT
+
+sudo chown root:root /opt/iron-test/day30-probe.sh
+sudo chmod 755 /opt/iron-test/day30-probe.sh
+sudo bash -n /opt/iron-test/day30-probe.sh
+printf &#39;probe_syntax_rc=%s\n&#39; &quot;$?&quot;
+</code></pre>
+<h3>3.3 建立量測摘要程式</h3>
+<p><strong>操作位置：client01。</strong></p>
+<pre><code class="language-bash">sudo tee /opt/iron-test/day30-summarize.awk &gt;/dev/null &lt;&lt;&#39;AWK&#39;
+BEGIN {
+  FS=&quot;|&quot;
+  first_fail=&quot;&quot;
+  stable=&quot;&quot;
+  consecutive_ok=0
+  total=0
+  ok_count=0
+  fail_count=0
+}
+
+($1 + 0) &gt;= fault {
+  total++
+
+  if ($4 == &quot;FAIL&quot;) {
+    fail_count++
+    if (first_fail == &quot;&quot;) {
+      first_fail=$1 + 0
+    }
+    consecutive_ok=0
+    next
+  }
+
+  if ($4 == &quot;OK&quot;) {
+    ok_count++
+
+    if (first_fail != &quot;&quot;) {
+      consecutive_ok++
+      if (consecutive_ok == 1) {
+        candidate=$1 + 0
+      }
+      if (consecutive_ok &gt;= 3 &amp;&amp; stable == &quot;&quot;) {
+        stable=candidate
+      }
+    }
+  }
+}
+
+END {
+  printf &quot;samples_after_fault=%d ok=%d fail=%d\n&quot;, total, ok_count, fail_count
+
+  if (first_fail == &quot;&quot;) {
+    print &quot;result=no_observed_interruption&quot;
+  } else if (stable == &quot;&quot;) {
+    printf &quot;result=insufficient_recovery_evidence first_fail=%.9f\n&quot;, first_fail
+  } else {
+    printf &quot;first_fail_epoch=%.9f\n&quot;, first_fail
+    printf &quot;stable_recovery_epoch=%.9f\n&quot;, stable
+    printf &quot;fault_to_stable_recovery=%.3f_seconds\n&quot;, stable-fault
+    printf &quot;first_fail_to_stable_recovery=%.3f_seconds\n&quot;, stable-first_fail
+  }
+}
+AWK
+
+sudo chmod 644 /opt/iron-test/day30-summarize.awk
+</code></pre>
+<p>此程式以故障後第一筆失敗為中斷起點，以連續三次成功中的第一筆為穩定恢復點。整段沒有失敗時會輸出 <code>result=no_observed_interruption</code>，不會虛構中斷秒數。</p>
+<h3>3.4 啟動一組測試 Probe</h3>
+<p><strong>操作位置：client01。先執行 <code>C03</code>，完成回復後再以新 Run ID 執行 <code>D02</code>。</strong></p>
+<p>把公開 Hostname 換成 Day 27 實際使用的名稱：</p>
+<pre><code class="language-bash">export DAY30_PUBLIC_HOST=&#39;app.example.com&#39;
+export DAY30_RUN_ID=&quot;day30-c03-$(date +%Y%m%dT%H%M%S%z)&quot;
+export DAY30_LOG_DIR=&quot;/var/log/iron-test/${DAY30_RUN_ID}&quot;
+
+install -d -m 0750 &quot;$DAY30_LOG_DIR&quot;
+
+nohup env \
+  DAY30_PUBLIC_HOST=&quot;$DAY30_PUBLIC_HOST&quot; \
+  DAY30_RUN_ID=&quot;$DAY30_RUN_ID&quot; \
+  /opt/iron-test/day30-probe.sh web \
+  &gt;&quot;$DAY30_LOG_DIR/web.log&quot; 2&gt;&amp;1 &amp;
+echo $! &gt;&quot;$DAY30_LOG_DIR/web.pid&quot;
+
+nohup env \
+  DAY30_PUBLIC_HOST=&quot;$DAY30_PUBLIC_HOST&quot; \
+  DAY30_RUN_ID=&quot;$DAY30_RUN_ID&quot; \
+  /opt/iron-test/day30-probe.sh rw \
+  &gt;&quot;$DAY30_LOG_DIR/rw.log&quot; 2&gt;&amp;1 &amp;
+echo $! &gt;&quot;$DAY30_LOG_DIR/rw.pid&quot;
+
+nohup env \
+  DAY30_PUBLIC_HOST=&quot;$DAY30_PUBLIC_HOST&quot; \
+  DAY30_RUN_ID=&quot;$DAY30_RUN_ID&quot; \
+  /opt/iron-test/day30-probe.sh ro \
+  &gt;&quot;$DAY30_LOG_DIR/ro.log&quot; 2&gt;&amp;1 &amp;
+echo $! &gt;&quot;$DAY30_LOG_DIR/ro.pid&quot;
+
+printf &#39;DAY30_RUN_ID=%s\nDAY30_LOG_DIR=%s\n&#39; \
+  &quot;$DAY30_RUN_ID&quot; &quot;$DAY30_LOG_DIR&quot; | \
+  tee &quot;$DAY30_LOG_DIR/run.env&quot;
+
+printf &#39;export DAY30_PUBLIC_HOST=%q\nexport DAY30_RUN_ID=%q\nexport DAY30_LOG_DIR=%q\n&#39; \
+  &quot;$DAY30_PUBLIC_HOST&quot; &quot;$DAY30_RUN_ID&quot; &quot;$DAY30_LOG_DIR&quot; | \
+  tee /var/tmp/day30-current.env
+</code></pre>
+<p>等待至少 30 秒，再確認三條路徑都持續成功：</p>
+<pre><code class="language-bash">hostnamectl --static
+date --iso-8601=ns
+printf &#39;run_id=%s\n&#39; &quot;$DAY30_RUN_ID&quot;
+
+for probe in web rw ro; do
+  printf &#39;%s\n&#39; &quot;--- ${probe} latest samples ---&quot;
+  tail -n 5 &quot;$DAY30_LOG_DIR/${probe}.log&quot;
+done
+</code></pre>
+<p><img src="../../source/Day30/day30-extra-fig07.png" alt="C03 故障前 Web DB-RW 與 DB-RO Probe 連續成功"></p>
+<p>圖（七）　C03 故障前 Web DB-RW 與 DB-RO Probe 連續成功</p>
+<h2>4. <code>C03</code>：Proxy VM 突然停止</h2>
+<h3>4.1 確認 VIP Owner 與 VMID</h3>
+<p><strong>操作位置：proxy01、proxy02。</strong></p>
+<pre><code class="language-bash">hostnamectl --static
+date --iso-8601=ns
+
+for vip in 10.77.20.10 10.77.20.11 10.77.20.12; do
+  if ip -4 -o address show dev eth0 | grep -Fq &quot; ${vip}/24 &quot;; then
+    printf &#39;%s owner=%s\n&#39; &quot;$vip&quot; &quot;$(hostnamectl --static)&quot;
+  fi
+done
+</code></pre>
+<p>三組 VIP 必須集中於同一台 Proxy 才執行本次測試。VMID 對照如下：</p>
+<pre><code class="language-text">proxy01 → VMID 201
+proxy02 → VMID 202
+</code></pre>
+<h3>4.2 注入 Proxy VM 故障</h3>
+<p><strong>操作位置：承載目標 Proxy VM 的 PVE 節點 Shell。</strong></p>
+<p>先將 VMID 改成目前持有三組 VIP 的節點，再執行：</p>
+<pre><code class="language-bash">TARGET_PROXY_VMID=&#39;201&#39;
+FAULT_EPOCH=&quot;$(date +%s.%N)&quot;
+FAULT_TIME=&quot;$(date --iso-8601=ns)&quot;
+
+printf &#39;scenario=C03\nfault_time=%s\nfault_epoch=%s\ntarget_vmid=%s\n&#39; \
+  &quot;$FAULT_TIME&quot; &quot;$FAULT_EPOCH&quot; &quot;$TARGET_PROXY_VMID&quot; | \
+  tee /root/day30-c03-fault.env
+
+qm status &quot;$TARGET_PROXY_VMID&quot;
+qm stop &quot;$TARGET_PROXY_VMID&quot;
+qm status &quot;$TARGET_PROXY_VMID&quot;
+</code></pre>
+<h3>4.3 確認接手並恢復原 VM</h3>
+<p><strong>操作位置：仍在線的 Proxy。</strong></p>
+<pre><code class="language-bash">hostnamectl --static
+date --iso-8601=ns
+systemctl is-active nginx haproxy keepalived
+
+for vip in 10.77.20.10 10.77.20.11 10.77.20.12; do
+  ip -4 -o address show dev eth0 | grep -F &quot; ${vip}/24 &quot;
+done
+</code></pre>
+<p>三組 VIP 都必須由存活 Proxy 持有。先保存 A02 告警證據，再回到 PVE 節點啟動原 VM。</p>
+<p>保持原 Proxy VM 停止，在 monitor01 重複查詢，直到停止中的 Proxy 對應 <code>InstanceDown</code> 進入 Firing 並出現在 Alertmanager：</p>
+<pre><code class="language-bash">curl -fsS http://127.0.0.1:9090/api/v1/alerts | \
+  jq -r &#39;.data.alerts[]? |
+         select(.labels.alertname == &quot;InstanceDown&quot;) |
+         [.labels.alertname,
+          .labels.instance,
+          .state,
+          .activeAt] | @tsv&#39;
+
+amtool alert query \
+  --alertmanager.url=http://127.0.0.1:9093
+</code></pre>
+<p>規則設有 <code>for: 2m</code>，尚未進入 Firing 前不要啟動原 VM。只把 Instance 與停止中的 Proxy 相符的告警記為 <code>A02</code>。保存證據後，回到 PVE 節點啟動原 VM：</p>
+<pre><code class="language-bash">TARGET_PROXY_VMID=&#39;201&#39;
+date --iso-8601=ns
+qm start &quot;$TARGET_PROXY_VMID&quot;
+qm status &quot;$TARGET_PROXY_VMID&quot;
+</code></pre>
+<p>等待原 Proxy 開機後，在兩台 Proxy 各執行：</p>
+<pre><code class="language-bash">hostnamectl --static
+systemctl is-active nginx haproxy keepalived
+ip -4 -o address show dev eth0 | \
+  grep -E &#39;10\.77\.20\.(10|11|12)/24&#39; || true
+</code></pre>
+<p>每個 VIP 在兩台輸出中只能出現一次。</p>
+<h3>4.4 計算 <code>C03</code> 使用者中斷</h3>
+<p><strong>操作位置：client01。把 <code>FAULT_EPOCH</code> 換成 C3 畫面的實際值。</strong></p>
+<pre><code class="language-bash">source /var/tmp/day30-current.env
+FAULT_EPOCH=&#39;1790440298.586887014&#39;
+
+hostnamectl --static
+date --iso-8601=ns
+printf &#39;run_id=%s\nfault_epoch=%s\n&#39; \
+  &quot;$DAY30_RUN_ID&quot; &quot;$FAULT_EPOCH&quot;
+
+for probe in web rw ro; do
+  printf &#39;%s\n&#39; &quot;=== ${probe} ===&quot;
+  awk -v fault=&quot;$FAULT_EPOCH&quot; \
+    -f /opt/iron-test/day30-summarize.awk \
+    &quot;$DAY30_LOG_DIR/${probe}.log&quot;
+done
+</code></pre>
+<p><img src="../../source/Day30/day30-extra-fig08.png" alt="proxy01 停止後 proxy02 接手三組 VIP"></p>
+<p>圖（八）　proxy01 停止後 proxy02 接手三組 VIP</p>
+<p><img src="../../source/Day30/day30-extra-fig09.png" alt="C03 三條 Probe 的中斷與穩定恢復摘要"></p>
+<p>圖（九）　C03 三條 Probe 的中斷與穩定恢復摘要</p>
+<h3>4.5 停止 <code>C03</code> Probe</h3>
+<p><strong>操作位置：client01。</strong></p>
+<pre><code class="language-bash">source /var/tmp/day30-current.env
+
+for pid_file in &quot;$DAY30_LOG_DIR&quot;/*.pid; do
+  kill &quot;$(cat &quot;$pid_file&quot;)&quot; 2&gt;/dev/null || true
+done
+
+sleep 2
+pgrep -af &#39;/opt/iron-test/day30-probe.sh&#39; || \
+  echo &#39;C03 probes stopped&#39;
+
+tail -n 3 &quot;$DAY30_LOG_DIR/web.log&quot;
+tail -n 3 &quot;$DAY30_LOG_DIR/rw.log&quot;
+tail -n 3 &quot;$DAY30_LOG_DIR/ro.log&quot;
+</code></pre>
+<p>在 monitor01 查詢本次 Alert：</p>
+<pre><code class="language-bash">hostnamectl --static
+date --iso-8601=ns
+
+curl -fsS http://127.0.0.1:9090/api/v1/alerts | \
+  jq -r &#39;.data.alerts[]? |
+         [.labels.alertname,
+          .labels.instance,
+          .state,
+          .activeAt] | @tsv&#39;
+
+amtool alert query \
+  --alertmanager.url=http://127.0.0.1:9093
+</code></pre>
+<p>確認 Proxy 故障對應的 <code>InstanceDown</code> 已觸發，且 Proxy 回復後相關 Target 與 Alert 已恢復；只採用名稱、Instance 與時間能對應本次故障的告警作為 <code>A02</code> 證據。</p>
+<p><img src="../../source/Day30/day30-extra-fig10.png" alt="proxy01 回歸後重新持有三組 VIP"></p>
+<p>圖（十）　proxy01 回歸後重新持有三組 VIP</p>
+<p><img src="../../source/Day30/day30-extra-fig11.png" alt="proxy02 回到不持有 VIP 的狀態"></p>
+<p>圖（十一）　proxy02 回到不持有 VIP 的狀態</p>
+<p><img src="../../source/Day30/day30-extra-fig12.png" alt="C03 結束前三條 Probe 持續成功"></p>
+<p>圖（十二）　C03 結束前三條 Probe 持續成功</p>
+<p><img src="../../source/Day30/day30-extra-fig13.png" alt="C03 回復後 Prometheus 與 Alertmanager 無殘留告警"></p>
+<p>圖（十三）　C03 回復後 Prometheus 與 Alertmanager 無殘留告警</p>
+<h2>5. <code>D02</code>：PostgreSQL Primary VM 突然停止</h2>
+<h3>5.1 建立新的 Probe Run</h3>
+<p><strong>操作位置：client01。</strong></p>
+<p>把 <code>app.example.com</code> 換成 Day 27 實際使用的公開 Hostname。</p>
+<pre><code class="language-bash">export DAY30_PUBLIC_HOST=&#39;app.example.com&#39;
+export DAY30_RUN_ID=&quot;day30-d02-$(date +%Y%m%dT%H%M%S%z)&quot;
+export DAY30_LOG_DIR=&quot;/var/log/iron-test/${DAY30_RUN_ID}&quot;
+
+install -d -m 0750 &quot;$DAY30_LOG_DIR&quot;
+
+for probe in web rw ro; do
+  nohup env \
+    DAY30_PUBLIC_HOST=&quot;$DAY30_PUBLIC_HOST&quot; \
+    DAY30_RUN_ID=&quot;$DAY30_RUN_ID&quot; \
+    /opt/iron-test/day30-probe.sh &quot;$probe&quot; \
+    &gt;&quot;$DAY30_LOG_DIR/${probe}.log&quot; 2&gt;&amp;1 &amp;
+  echo $! &gt;&quot;$DAY30_LOG_DIR/${probe}.pid&quot;
+done
+
+printf &#39;DAY30_RUN_ID=%s\nDAY30_LOG_DIR=%s\n&#39; \
+  &quot;$DAY30_RUN_ID&quot; &quot;$DAY30_LOG_DIR&quot; | \
+  tee &quot;$DAY30_LOG_DIR/run.env&quot;
+
+printf &#39;export DAY30_PUBLIC_HOST=%q\nexport DAY30_RUN_ID=%q\nexport DAY30_LOG_DIR=%q\n&#39; \
+  &quot;$DAY30_PUBLIC_HOST&quot; &quot;$DAY30_RUN_ID&quot; &quot;$DAY30_LOG_DIR&quot; | \
+  tee /var/tmp/day30-current.env
+
+sleep 30
+
+for probe in web rw ro; do
+  printf &#39;%s\n&#39; &quot;--- ${probe} latest samples ---&quot;
+  tail -n 3 &quot;$DAY30_LOG_DIR/${probe}.log&quot;
+done
+</code></pre>
+<h3>5.2 確認 Primary、Timeline 與 VMID</h3>
+<p><strong>操作位置：任一 PostgreSQL 節點。</strong></p>
+<pre><code class="language-bash">hostnamectl --static
+date --iso-8601=ns
+
+sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  list -e
+</code></pre>
+<p>VMID 對照如下：</p>
+<pre><code class="language-text">pg01 → VMID 221
+pg02 → VMID 222
+pg03 → VMID 223
+</code></pre>
+<p><img src="../../source/Day30/day30-extra-fig14.png" alt="D02 前 pg01 為 Leader 且兩台 Replica 持續串流"></p>
+<p>圖（十四）　D02 前 pg01 為 Leader 且兩台 Replica 持續串流</p>
+<h3>5.3 注入 Primary VM 故障</h3>
+<p><strong>操作位置：承載目前 Primary VM 的 PVE 節點 Shell。</strong></p>
+<p>將 VMID 改成 D1 的目前 Leader：</p>
+<pre><code class="language-bash">TARGET_PRIMARY_VMID=&#39;221&#39;
+FAULT_EPOCH=&quot;$(date +%s.%N)&quot;
+FAULT_TIME=&quot;$(date --iso-8601=ns)&quot;
+
+printf &#39;scenario=D02\nfault_time=%s\nfault_epoch=%s\ntarget_vmid=%s\n&#39; \
+  &quot;$FAULT_TIME&quot; &quot;$FAULT_EPOCH&quot; &quot;$TARGET_PRIMARY_VMID&quot; | \
+  tee /root/day30-d02-fault.env
+
+qm status &quot;$TARGET_PRIMARY_VMID&quot;
+qm stop &quot;$TARGET_PRIMARY_VMID&quot;
+qm status &quot;$TARGET_PRIMARY_VMID&quot;
+</code></pre>
+<p><strong>操作位置：任一存活 PostgreSQL 節點。</strong></p>
+<pre><code class="language-bash">watch -n 1 \
+  &#39;sudo -u postgres patronictl -c /etc/patroni/config.yml list -e&#39;
+</code></pre>
+<p>看到新 Leader 後按 <code>Ctrl+C</code>。在任一 Proxy 確認 HAProxy：</p>
+<pre><code class="language-bash">hostnamectl --static
+date --iso-8601=ns
+echo &#39;show stat&#39; | \
+  sudo socat stdio /run/haproxy/admin.sock | \
+  grep -E &#39;^pg_primary,(pg01|pg02|pg03),&#39;
+</code></pre>
+<p>只有新 Leader 在 <code>pg_primary</code> Backend 應為 <code>UP</code>。</p>
+<p>此時在 monitor01 保存仍離線的 PostgreSQL Instance、Prometheus Alert 與 Alertmanager 狀態：</p>
+<pre><code class="language-bash">hostnamectl --static
+date --iso-8601=ns
+
+curl -fsS http://127.0.0.1:9090/api/v1/alerts | \
+  jq -r &#39;.data.alerts[]? |
+         [.labels.alertname,
+          .labels.instance,
+          .state,
+          .activeAt] | @tsv&#39;
+
+amtool alert query \
+  --alertmanager.url=http://127.0.0.1:9093
+</code></pre>
+<p>保持原 Primary VM 停止並重複查詢，直到對應的 <code>InstanceDown</code> 進入 Firing 並出現在 Alertmanager。只將名稱、Instance 與時間能對應本次 Primary VM 故障的項目列為 <code>A03</code>；尚未進入 Firing 前不要啟動原 VM。</p>
+<h3>5.4 計算 <code>D02</code> 中斷並核對交易</h3>
+<p><strong>操作位置：client01。把 <code>FAULT_EPOCH</code> 換成故障注入畫面的實際值。</strong></p>
+<pre><code class="language-bash">source /var/tmp/day30-current.env
+FAULT_EPOCH=&#39;請貼上D02的fault_epoch&#39;
+
+hostnamectl --static
+date --iso-8601=ns
+printf &#39;run_id=%s\nfault_epoch=%s\n&#39; \
+  &quot;$DAY30_RUN_ID&quot; &quot;$FAULT_EPOCH&quot;
+
+for probe in web rw ro; do
+  printf &#39;%s\n&#39; &quot;=== ${probe} ===&quot;
+  awk -v fault=&quot;$FAULT_EPOCH&quot; \
+    -f /opt/iron-test/day30-summarize.awk \
+    &quot;$DAY30_LOG_DIR/${probe}.log&quot;
+done
+</code></pre>
+<p>接著核對所有 DB-RW Probe 已收到成功回覆的序號仍存在於新 Primary：</p>
+<pre><code class="language-bash">awk -F&#39;|&#39; &#39;
+  $3 == &quot;rw&quot; &amp;&amp; $4 == &quot;OK&quot; {
+    if (match($5, /seq=[0-9]+/)) {
+      value=substr($5, RSTART + 4, RLENGTH - 4)
+      print value
+    }
+  }
+&#39; &quot;$DAY30_LOG_DIR/rw.log&quot; | \
+  sort -u &gt;&quot;$DAY30_LOG_DIR/acknowledged-seq.txt&quot;
+
+psql \
+  &#39;host=db-rw.lab.home port=5432 dbname=appdb user=app_rw sslmode=verify-full sslrootcert=/etc/iron-app/pg-ca.crt connect_timeout=3&#39; \
+  -X -qAt -v ON_ERROR_STOP=1 \
+  -c &quot;SELECT client_seq
+      FROM app.day30_failover_probe
+      WHERE run_id = &#39;$DAY30_RUN_ID&#39;
+      ORDER BY client_seq;&quot; | \
+  sort -u &gt;&quot;$DAY30_LOG_DIR/database-seq.txt&quot;
+
+comm -23 \
+  &quot;$DAY30_LOG_DIR/acknowledged-seq.txt&quot; \
+  &quot;$DAY30_LOG_DIR/database-seq.txt&quot; \
+  &gt;&quot;$DAY30_LOG_DIR/missing-acknowledged-seq.txt&quot;
+
+ACK_COUNT=&quot;$(wc -l &lt;&quot;$DAY30_LOG_DIR/acknowledged-seq.txt&quot;)&quot;
+DB_COUNT=&quot;$(wc -l &lt;&quot;$DAY30_LOG_DIR/database-seq.txt&quot;)&quot;
+MISSING_ACK_COUNT=&quot;$(wc -l &lt;&quot;$DAY30_LOG_DIR/missing-acknowledged-seq.txt&quot;)&quot;
+
+printf &#39;run_id=%s\nacknowledged_rows=%s\ndatabase_rows=%s\nmissing_acknowledged_rows=%s\n&#39; \
+  &quot;$DAY30_RUN_ID&quot; &quot;$ACK_COUNT&quot; &quot;$DB_COUNT&quot; &quot;$MISSING_ACK_COUNT&quot;
+
+if [ &quot;$MISSING_ACK_COUNT&quot; -eq 0 ]; then
+  echo &#39;result=no_acknowledged_transaction_loss_observed&#39;
+else
+  echo &#39;result=acknowledged_transaction_loss_observed&#39;
+  cat &quot;$DAY30_LOG_DIR/missing-acknowledged-seq.txt&quot;
+fi
+</code></pre>
+<p><code>database_rows</code> 可能大於 <code>acknowledged_rows</code>，代表部分交易已 Commit，但用戶端在連線中斷前沒有收到成功回覆；這些交易不屬於已確認交易遺失。<code>missing_acknowledged_rows</code> 才是本次核對的核心結果。</p>
+<p><img src="../../source/Day30/day30-extra-fig15.png" alt="pg03 晉升為 Leader 且 pg02 持續串流"></p>
+<p>圖（十五）　pg03 晉升為 Leader 且 pg02 持續串流</p>
+<p><img src="../../source/Day30/day30-extra-fig16.png" alt="Primary VM 故障對應的 InstanceDown 告警進入 Firing"></p>
+<p>圖（十六）　Primary VM 故障對應的 InstanceDown 告警進入 Firing</p>
+<p><img src="../../source/Day30/day30-extra-fig17.png" alt="D02 三條 Probe 的中斷與穩定恢復摘要"></p>
+<p>圖（十七）　D02 三條 Probe 的中斷與穩定恢復摘要</p>
+<p><img src="../../source/Day30/day30-extra-fig18.png" alt="D02 已確認交易與新 Primary 可見資料核對"></p>
+<p>圖（十八）　D02 已確認交易與新 Primary 可見資料核對</p>
+<h3>5.5 啟動舊 Primary 並確認回歸</h3>
+<p><strong>操作位置：承載原 Primary 的 PVE 節點。</strong></p>
+<pre><code class="language-bash">TARGET_PRIMARY_VMID=&#39;221&#39;
+date --iso-8601=ns
+qm start &quot;$TARGET_PRIMARY_VMID&quot;
+qm status &quot;$TARGET_PRIMARY_VMID&quot;
+</code></pre>
+<p>等待節點完成開機，再到任一 PostgreSQL 節點執行：</p>
+<pre><code class="language-bash">hostnamectl --static
+date --iso-8601=ns
+
+sudo -u postgres patronictl \
+  -c /etc/patroni/config.yml \
+  list -e
+
+sudo -u etcd env \
+  ETCDCTL_API=3 \
+  ETCDCTL_ENDPOINTS=&#39;https://10.77.30.11:2379,https://10.77.30.12:2379,https://10.77.30.13:2379&#39; \
+  ETCDCTL_CACERT=&#39;/etc/etcd/tls/ca.crt&#39; \
+  ETCDCTL_CERT=&#39;/etc/etcd/tls/node.crt&#39; \
+  ETCDCTL_KEY=&#39;/etc/etcd/tls/node.key&#39; \
+  etcdctl endpoint health --cluster
+</code></pre>
+<p>預期結果為一台 Leader、兩台 <code>Replica / streaming</code>、三台 Timeline 相同、Lag 回到可接受範圍，etcd 3/3 Healthy。</p>
+<p>停止 <code>D02</code> Probe：</p>
+<pre><code class="language-bash">source /var/tmp/day30-current.env
+
+for pid_file in &quot;$DAY30_LOG_DIR&quot;/*.pid; do
+  kill &quot;$(cat &quot;$pid_file&quot;)&quot; 2&gt;/dev/null || true
+done
+
+sleep 2
+pgrep -af &#39;/opt/iron-test/day30-probe.sh&#39; || \
+  echo &#39;D02 probes stopped&#39;
+
+for probe in web rw ro; do
+  printf &#39;%s\n&#39; &quot;--- ${probe} final samples ---&quot;
+  tail -n 3 &quot;$DAY30_LOG_DIR/${probe}.log&quot;
+done
+</code></pre>
+<p><img src="../../source/Day30/day30-extra-fig19.png" alt="從 PVE 重新啟動舊 Primary pg01"></p>
+<p>圖（十九）　從 PVE 重新啟動舊 Primary pg01</p>
+<p><img src="../../source/Day30/day30-extra-fig20.png" alt="pg01 以 Replica 回歸且 etcd 三個 Endpoint 健康"></p>
+<p>圖（二十）　pg01 以 Replica 回歸且 etcd 三個 Endpoint 健康</p>
+<p><img src="../../source/Day30/day30-extra-fig21.png" alt="D02 結束前三條 Probe 持續成功"></p>
+<p>圖（二十一）　D02 結束前三條 Probe 持續成功</p>
+<p>原始 <code>D02</code> 已完成服務恢復、交易核對與舊 Primary 回歸，後續以相同故障類型補測 <code>InstanceDown</code> 的完整告警生命週期。補測對象為當時的 Primary pg03，不重複計算服務 RTO 或交易缺口。</p>
+<p><img src="../../source/Day30/day30-extra-fig22.png" alt="pg03 三個 InstanceDown 告警進入 Firing 並送達 Alertmanager"></p>
+<p>圖（二十二）　pg03 三個 InstanceDown 告警進入 Firing 並送達 Alertmanager</p>
+<p><img src="../../source/Day30/day30-extra-fig23.png" alt="重新啟動 pg03 並保存恢復操作時間"></p>
+<p>圖（二十三）　重新啟動 pg03 並保存恢復操作時間</p>
+<p><img src="../../source/Day30/day30-extra-fig24.png" alt="pg03 三個 Target 回到 Up 且告警清空"></p>
+<p>圖（二十四）　pg03 三個 Target 回到 Up 且告警清空</p>
+<p><img src="../../source/Day30/day30-extra-fig25.png" alt="D02 告警補測生命週期計算結果"></p>
+<p>圖（二十五）　D02 告警補測生命週期計算結果</p>
+<p>Prometheus 規則設有 <code>for: 2m</code>，因此 Pending 到 Firing 約需 120 秒；本次故障注入到 Firing 的 139.595 秒還包含 Prometheus 首次觀察到 Target Down 的時間。重新啟動後，三個 Target 在 28.671 秒全部 Up，告警在 40.191 秒清除。這組補測完成 <code>A03</code> 的 Pending、Firing 與清除證據鏈。</p>
+<h2>6. <code>A06</code>：同 VLAN 直接 SSH</h2>
+<p><strong>操作位置：client01。</strong></p>
+<pre><code class="language-bash">hostnamectl --static
+date --iso-8601=ns
+ip route get 10.77.20.31
+
+set +e
+nc -vz -w 3 10.77.20.31 22
+DIRECT_SSH_RC=$?
+
+printf &#39;direct_ssh_target=10.77.20.31:22\ndirect_ssh_rc=%s\n&#39; \
+  &quot;$DIRECT_SSH_RC&quot;
+</code></pre>
+<p>client01 與 app01 同在 VLAN 20，這段流量由第二層直接交換，不經 OPNsense。依目前設定，app01 的主機防火牆只限制監控 Port，TCP 22 仍可達，因此預期 <code>direct_ssh_rc=0</code>。</p>
+<p>這個結果只能證明 TCP 22 可達，無法證明 SSH 登入成功。若安全需求是所有 SSH 都必須經過 jump01，本次結果應記為功能 FAIL／已知缺口，改善方式是由 app01 主機防火牆只允許 jump01 來源，再重新執行相同測試。Game Day 保留現況，不在量測途中改規則。</p>
+<p><img src="../../source/Day30/day30-extra-fig26.png" alt="client01 可在同一 VLAN 直接連到 app01 TCP 22"></p>
+<p>圖（二十六）　client01 可在同一 VLAN 直接連到 app01 TCP 22</p>
+<h2>7. 彙整最終結果</h2>
+<p>下表依 C4、D2、D3、D4 的原始輸出彙整，Epoch 保留至小數點後六位，秒數沿用量測 Script 的三位小數結果。</p>
+<table>
+<thead>
+<tr>
+<th>情境</th>
+<th>路徑</th>
+<th>第一筆失敗 Epoch</th>
+<th>穩定恢復 Epoch</th>
+<th align="right">故障到穩定恢復</th>
+<th align="right">使用者可見中斷</th>
+<th>資料結果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>C03／F10</code> Proxy VM 突然停止</td>
+<td>公開 Web</td>
+<td>1790440299.836238</td>
+<td>1790440305.851748</td>
+<td align="right">7.265 秒</td>
+<td align="right">6.016 秒</td>
+<td>不適用</td>
+</tr>
+<tr>
+<td><code>C03／F10</code> Proxy VM 突然停止</td>
+<td>DB-RW</td>
+<td>1790440300.674049</td>
+<td>1790440304.707686</td>
+<td align="right">6.121 秒</td>
+<td align="right">4.034 秒</td>
+<td>Probe 持續完成交易</td>
+</tr>
+<tr>
+<td><code>C03／F10</code> Proxy VM 突然停止</td>
+<td>DB-RO</td>
+<td>1790440300.169436</td>
+<td>1790440304.203537</td>
+<td align="right">5.617 秒</td>
+<td align="right">4.034 秒</td>
+<td>不適用</td>
+</tr>
+<tr>
+<td><code>D02／F11</code> Primary VM 突然停止</td>
+<td>公開 Web</td>
+<td>未觀察到失敗</td>
+<td>未觀察到中斷</td>
+<td align="right">無法換算</td>
+<td align="right">無法換算</td>
+<td>不適用</td>
+</tr>
+<tr>
+<td><code>D02／F11</code> Primary VM 突然停止</td>
+<td>DB-RW</td>
+<td>1790440612.297455</td>
+<td>1790440650.275792</td>
+<td align="right">40.100 秒</td>
+<td align="right">37.978 秒</td>
+<td>已確認交易缺口：0／281</td>
+</tr>
+<tr>
+<td><code>D02／F11</code> Primary VM 突然停止</td>
+<td>DB-RO</td>
+<td>未觀察到失敗</td>
+<td>未觀察到中斷</td>
+<td align="right">無法換算</td>
+<td align="right">無法換算</td>
+<td>查詢由存活 Replica 承接</td>
+</tr>
+</tbody></table>
+<p>再填寫完整穩態與告警：</p>
+<table>
+<thead>
+<tr>
+<th>情境</th>
+<th>控制面接手</th>
+<th>完整穩態</th>
+<th>Firing</th>
+<th>Resolved</th>
+<th>功能判讀</th>
+<th>RTO／RPO 判讀</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>C03／F10</code></td>
+<td>proxy02 接手三組 VIP</td>
+<td>proxy01 回歸、VIP 維持唯一</td>
+<td><code>InstanceDown</code> 已觸發</td>
+<td>恢復後告警清除</td>
+<td>PASS</td>
+<td>以三條 Probe 的實測值建立 RTC 基線；RPC 不適用</td>
+</tr>
+<tr>
+<td><code>D02／F11</code></td>
+<td>pg03 晉升為新 Leader</td>
+<td>舊 Primary 回歸，服務元件與告警均恢復</td>
+<td>補測中故障後 139.595 秒</td>
+<td>補測中重新啟動後 40.191 秒</td>
+<td>PASS</td>
+<td>DB-RW RTC 為 40.100 秒；本次 RPC 為零筆已確認交易缺口</td>
+</tr>
+</tbody></table>
+<p>安全邊界結果另外保存：</p>
+<table>
+<thead>
+<tr>
+<th>情境</th>
+<th>正向路徑</th>
+<th>負向路徑</th>
+<th>控制點證據</th>
+<th>功能判讀</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>A06／F12</code> 同 VLAN SSH</td>
+<td>ProxyJump 既有正向證據</td>
+<td>client01 直連 app01 TCP 22</td>
+<td>client01 Route／TCP 結果</td>
+<td>FAIL，確認目前管理入口缺口</td>
+</tr>
+</tbody></table>
+<p>判讀規則：</p>
+<ul>
+<li><code>result=no_observed_interruption</code>：本次取樣沒有觀察到失敗，保留樣本數與探測間隔。</li>
+<li><code>result=insufficient_recovery_evidence</code>：失敗後尚未取得連續三次成功，需要延長觀察或處理故障。</li>
+<li><code>missing_acknowledged_rows=0</code>：本次未觀察到已確認交易遺失。</li>
+<li>有核准目標：用實際觀察值判讀 PASS／FAIL。</li>
+<li>沒有核准目標：將數值列為能力基線。</li>
+</ul>
+<p>取得所有原始證據後，將表格直接填入本文件，不需要把 Markdown 表格另外截成圖片。空白欄位、未執行項目與證據不足都照實保留。</p>
+<h2>8. 結束檢查</h2>
+<p>在正式 Runbook 的「結束與回復」逐層確認 PVE／Ceph、etcd／Patroni、Proxy、App、Backup、Monitoring 與公開服務。最後在 client01 確認沒有殘留 Probe：</p>
+<pre><code class="language-bash">pgrep -af &#39;/opt/iron-test/day30-probe.sh&#39; || \
+  echo &#39;all Day 30 probes stopped&#39;
+
+find /var/log/iron-test \
+  -maxdepth 2 \
+  -type f \
+  -name &#39;*.log&#39; \
+  -printf &#39;%TY-%Tm-%Td %TH:%TM:%TS %p\n&#39; | \
+  sort
+</code></pre>
+<p>依演練證據保存政策保留 Script、原始 Log、故障時間與彙整表。測試資料表可以留下供下一次 Game Day 使用；每次以新的 <code>run_id</code> 隔離資料，不需為了複測重新建表。</p>
+</main></body>
+</html>

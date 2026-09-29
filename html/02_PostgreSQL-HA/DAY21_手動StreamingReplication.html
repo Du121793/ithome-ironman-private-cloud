@@ -13,7 +13,7 @@
   </style>
 </head>
 <body><main><h1>Day 21｜讓三台 PostgreSQL 保持資料同步：串流複寫、WAL、複寫槽與熱待命</h1>
-<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 21｜讓三台 PostgreSQL 保持資料同步：串流複寫、WAL、複寫槽與熱待命</a></p>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/articles/10414669">Day 21｜讓三台 PostgreSQL 保持資料同步：串流複寫、WAL、複寫槽與熱待命</a></p>
 <p>本日以 pg01 為主節點（Primary），pg02／pg03 為實體待命節點（Physical Standby），先理解 WAL、LSN、複寫槽（Replication Slot）與同步狀態。完成原生複寫觀察後，後續會重建為 Patroni 管理的叢集。</p>
 <blockquote>
 <p>部分驗證畫面保留較早期的測試值：測試資料顯示 <code>day22-*</code>，複寫連線名稱可能顯示套件預設的 <code>18/main</code>。操作請以本文的 <code>day21-*</code> 與 <code>PGAPPNAME=pg02／pg03</code> 為準；複寫狀態與判讀方式不受影響。</p>

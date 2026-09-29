@@ -1,6 +1,6 @@
 # Day 30｜最終驗收：用 Game Day 檢查安全邊界、服務切換與資料復原
 
-對應文章：[Day 30｜最終驗收：用 Game Day 檢查安全邊界、服務切換與資料復原](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 30｜最終驗收：用 Game Day 檢查安全邊界、服務切換與資料復原](https://ithelp.ithome.com.tw/articles/10419098)
 
 本系列 Day 01～30 的實際結果、證據代號與 PASS／FAIL 另存於 [三十天驗收結果](../../08_三十天驗收結果.md)。讀者執行本文件時應在空白表格填入自己的環境、時間與結果。
 

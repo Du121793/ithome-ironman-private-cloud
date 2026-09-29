@@ -1,6 +1,6 @@
 # Day 25｜為 Web 與資料庫建立服務入口：Nginx 負載平衡、TLS 邊界與 HAProxy 讀寫分流
 
-對應文章：[Day 25｜為 Web 與資料庫建立服務入口：Nginx 負載平衡、TLS 邊界與 HAProxy 讀寫分流](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 25｜為 Web 與資料庫建立服務入口：Nginx 負載平衡、TLS 邊界與 HAProxy 讀寫分流](https://ithelp.ithome.com.tw/articles/10416821)
 
 本日建立 proxy01／02、app02 與 client01，並沿用既有的 app01。Nginx 負責 Web Reverse Proxy；HAProxy 使用 Patroni REST API 判斷 Primary／Replica 角色。
 

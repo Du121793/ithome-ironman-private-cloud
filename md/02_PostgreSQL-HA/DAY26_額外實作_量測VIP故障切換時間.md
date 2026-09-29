@@ -1,5 +1,7 @@
 # Day 26 額外實作：量測三組 VIP 的故障切換時間
 
+對應文章：[Day 26｜讓代理節點故障後自動接管：Keepalived、VRRP 與三組高可用 VIP](https://ithelp.ithome.com.tw/articles/10417280)
+
 本篇接續 [Day 26 Keepalived 與三組 VIP](./DAY26_Keepalived與三組VIP.md)。主實作先完成三組固定入口與接管驗證；這裡改用 0.2 秒探測保存每次請求結果，自動計算故障注入到穩定恢復，以及用戶端真正觀察到的中斷時間。
 
 本次補測三種情境：

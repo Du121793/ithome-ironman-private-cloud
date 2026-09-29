@@ -1,6 +1,6 @@
 # Day 28｜PostgreSQL 資料誤刪如何復原？使用 pgBackRest、WAL Archive 與 PITR 回到指定時間點
 
-對應文章：[Day 28｜PostgreSQL 資料誤刪如何復原？使用 pgBackRest、WAL Archive 與 PITR 回到指定時間點](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 28｜PostgreSQL 資料誤刪如何復原？使用 pgBackRest、WAL Archive 與 PITR 回到指定時間點](https://ithelp.ithome.com.tw/articles/10418150)
 
 本日建立 backup01 專用 Repository Host，完成 Full Backup、WAL Archive 與獨立 Restore VM 的 Point-in-Time Recovery。禁止直接在運作中的 Patroni Cluster 上覆寫還原。
 

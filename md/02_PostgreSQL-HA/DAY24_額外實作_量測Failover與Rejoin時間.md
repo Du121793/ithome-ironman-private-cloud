@@ -1,6 +1,6 @@
 # Day 24 額外實作｜量測 Primary 故障切換與舊 Primary 重新加入時間
 
-對應文章：[Day 24｜PostgreSQL HA 叢集實作（下）：計畫性切換、故障切換與舊 Primary 安全回歸](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 24｜PostgreSQL HA 叢集實作（下）：計畫性切換、故障切換與舊 Primary 安全回歸](https://ithelp.ithome.com.tw/articles/10416307)
 
 本文件接續 Day 24 主實作，以 0.2 秒探測分開記錄新 Primary 角色端點恢復、第一筆直接 SQL 寫入成功，以及舊 Primary 以 Replica 身分重新加入的時間。實驗會強制停止當下的 Primary VM，只適合可丟棄的 Lab。
 

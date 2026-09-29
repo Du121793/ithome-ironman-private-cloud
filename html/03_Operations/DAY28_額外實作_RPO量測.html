@@ -13,6 +13,7 @@
   </style>
 </head>
 <body><main><h1>Day 28 額外實作｜量測 WAL Archive 中斷時的 RPO</h1>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/articles/10418150">Day 28｜PostgreSQL 資料誤刪如何復原？使用 pgBackRest、WAL Archive 與 PITR 回到指定時間點</a></p>
 <p>本文件接續 <a href="./DAY28_pgBackRest_WAL%E8%88%87PITR.md">Day 28｜PostgreSQL 資料誤刪如何復原？使用 pgBackRest、WAL Archive 與 PITR 回到指定時間點</a>。主實作完成備份、WAL Archive 與指定時間 PITR；本額外實作建立受控的 Archive 中斷，量測事故發生時的資料缺口、隔離還原階段耗時，以及恢復 Archive 後追上 Repository 的時間。</p>
 <p>本次測試把「基準 WAL 已封存」到「事故時間」放進同一支腳本，先驗證 Archive 停止前進，再產生測試交易，讓資料缺口只反映受控的 Archive 中斷。</p>
 <p>本次同時取得三組彼此獨立的結果：</p>

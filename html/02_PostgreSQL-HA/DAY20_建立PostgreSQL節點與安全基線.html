@@ -13,7 +13,7 @@
   </style>
 </head>
 <body><main><h1>Day 20｜準備 PostgreSQL HA 的三個資料庫節點：PostgreSQL 18、資料磁碟、TLS 與 SCRAM-SHA-256</h1>
-<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 20｜準備 PostgreSQL HA 的三個資料庫節點：PostgreSQL 18、資料磁碟、TLS 與 SCRAM-SHA-256</a></p>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/articles/10414350">Day 20｜準備 PostgreSQL HA 的三個資料庫節點：PostgreSQL 18、資料磁碟、TLS 與 SCRAM-SHA-256</a></p>
 <p>本日建立 pg01～pg03，逐台完成 Data Disk、PGDG Repository、PostgreSQL 18、名稱解析與 TLS，形成三台可獨立驗收的資料庫節點。</p>
 <h2>本日操作原則</h2>
 <ul>
@@ -108,7 +108,7 @@ chronyc sources -n -v
 timedatectl
 </code></pre>
 <p>完成後，在 pg02、pg03 逐台執行完全相同的指令。</p>
-<p><code>10.77.30.1</code> 是 Database VLAN 上的 OPNsense Gateway。三台使用相同的內部時間來源，不依賴各自能否直接連到公用 NTP。新增 <code>opnsense.sources</code> 不需要刪除套件原有的來源；<code>prefer</code> 只表示可用時優先選擇 OPNsense。</p>
+<p><code>10.77.30.1</code> 是 Database VLAN 上的 OPNsense Gateway。三台統一使用 OPNsense 作為優先時間來源，套件原有的來源可以保留；<code>prefer</code> 表示 OPNsense 可用時優先選用。</p>
 <p>檢查結果必須符合：</p>
 <ul>
 <li><code>systemctl is-enabled chrony</code> 顯示 <code>enabled</code>。</li>
@@ -416,20 +416,21 @@ sudo journalctl -u postgresql -b -n 50 --no-pager
 <p><code>pg_hba_file_rules.error</code> 必須全部為空。Data Directory 必須位於掛載的 Data Disk 之下。</p>
 <p><img src="../../source/Day20/day20-fig13.png" alt="pg01 重新啟動後的 PostgreSQL 18 服務基線"></p>
 <p>圖（十三）重新啟動後，<code>18/main</code> 維持 online，資料目錄位於 <code>/var/lib/postgresql/18/main</code>，TLS 已啟用並使用預期的 pg_hba.conf。</p>
-<h2>16. 建立本日管理 Role</h2>
+<h2>16. 建立本日登入角色</h2>
 <p>操作位置：只在 pg01。</p>
 <pre><code class="language-bash">sudo -u postgres psql
 </code></pre>
 <p>在 psql 內執行：</p>
 <pre><code class="language-sql">CREATE DATABASE appdb;
+REVOKE CONNECT ON DATABASE appdb FROM PUBLIC;
 CREATE ROLE dba_admin LOGIN;
 \password dba_admin
 GRANT CONNECT ON DATABASE appdb TO dba_admin;
 \du dba_admin
 \q
 </code></pre>
-<p>使用 <code>\password</code> 互動輸入，避免把密碼寫進 Shell History。本日以 <code>dba_admin</code> 完成管理角色基線。</p>
-<p><img src="../../source/Day20/day20-fig14.png" alt="pg01 建立 appdb 與 dba_admin 管理角色"></p>
+<p>使用 <code>\password</code> 互動輸入，避免把密碼寫進 Shell History。本日先撤銷 <code>PUBLIC</code> 的預設連線權限，再以 <code>dba_admin</code> 完成登入角色基線。</p>
+<p><img src="../../source/Day20/day20-fig14.png" alt="pg01 建立 appdb 與 dba_admin 登入角色"></p>
 <p>圖（十四）pg01 建立 <code>appdb</code> 與具備 LOGIN 的 <code>dba_admin</code>，並授予該角色資料庫 CONNECT 權限。</p>
 <p><img src="../../source/Day20/day20-fig15.png" alt="pg02 的資料磁碟、PostgreSQL 18 與伺服器憑證基準"></p>
 <p>圖（十五）再抽查 pg02，資料磁碟掛載、<code>18/main</code> 狀態、資料目錄與憑證 SAN 均符合該節點的規劃值。</p>

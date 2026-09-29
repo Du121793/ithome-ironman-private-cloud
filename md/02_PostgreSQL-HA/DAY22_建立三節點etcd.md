@@ -1,6 +1,6 @@
 # Day 22｜Patroni 如何讓 PostgreSQL 叢集取得一致決策？三節點 etcd、Raft 與 mTLS
 
-對應文章：[Day 22｜Patroni 如何讓 PostgreSQL 叢集取得一致決策？三節點 etcd、Raft 與 mTLS](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 22｜Patroni 如何讓 PostgreSQL 叢集取得一致決策？三節點 etcd、Raft 與 mTLS](https://ithelp.ithome.com.tw/articles/10415212)
 
 etcd01～03 分別部署在 pg01～03，同一組 Database VLAN。Lab 可以演示 Quorum，容錯範圍則限於三台 VM，三者共用的 L0 Host 是共同故障域。
 

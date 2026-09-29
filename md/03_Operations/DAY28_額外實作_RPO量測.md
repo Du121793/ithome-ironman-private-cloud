@@ -1,5 +1,7 @@
 # Day 28 額外實作｜量測 WAL Archive 中斷時的 RPO
 
+對應文章：[Day 28｜PostgreSQL 資料誤刪如何復原？使用 pgBackRest、WAL Archive 與 PITR 回到指定時間點](https://ithelp.ithome.com.tw/articles/10418150)
+
 本文件接續 [Day 28｜PostgreSQL 資料誤刪如何復原？使用 pgBackRest、WAL Archive 與 PITR 回到指定時間點](./DAY28_pgBackRest_WAL與PITR.md)。主實作完成備份、WAL Archive 與指定時間 PITR；本額外實作建立受控的 Archive 中斷，量測事故發生時的資料缺口、隔離還原階段耗時，以及恢復 Archive 後追上 Repository 的時間。
 
 本次測試把「基準 WAL 已封存」到「事故時間」放進同一支腳本，先驗證 Archive 停止前進，再產生測試交易，讓資料缺口只反映受控的 Archive 中斷。

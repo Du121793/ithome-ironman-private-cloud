@@ -1,6 +1,6 @@
 # Day 16｜SSH 跳板機的部署與權限設計（下）：ProxyJump 與多人權限隔離
 
-對應文章：[Day 16｜SSH 跳板機的部署與權限設計（下）：ProxyJump 與多人權限隔離](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 16｜SSH 跳板機的部署與權限設計（下）：ProxyJump 與多人權限隔離](https://ithelp.ithome.com.tw/articles/10411735)
 
 本日建立兩台最小化 Guest VM 作為 SSH 管理目標：Alice 只能管理 app01，Bob 只能管理 monitor01。一般使用者不登入 pve01～pve03，也不透過 Day 16 取得 PVE Web UI 權限；PVE Web UI 會在 Day 17 由獨立 VPN-Admin 路徑處理。
 

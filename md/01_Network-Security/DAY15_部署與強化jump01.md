@@ -1,6 +1,6 @@
 # Day 15｜SSH 跳板機的部署與權限設計（上）：Linux 路由切換與建立安全入口
 
-對應文章：[Day 15｜SSH 跳板機的部署與權限設計（上）：Linux 路由切換與建立安全入口](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 15｜SSH 跳板機的部署與權限設計（上）：Linux 路由切換與建立安全入口](https://ithelp.ithome.com.tw/articles/10410985)
 
 本日先將 pve01～pve03 的預設出口從現有路由器切換到 OPNsense，再建立 VMID `231`、IP `10.77.50.11/24` 的 jump01。WAN 使用 TCP `45222` 轉送到 jump01 TCP `22`。
 

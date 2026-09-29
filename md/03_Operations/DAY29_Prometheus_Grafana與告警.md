@@ -1,6 +1,6 @@
 # Day 29｜在使用者回報前看見異常：Prometheus、Grafana、Exporter 與 Alertmanager 告警
 
-對應文章：[Day 29｜在使用者回報前看見異常：Prometheus、Grafana、Exporter 與 Alertmanager 告警](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 29｜在使用者回報前看見異常：Prometheus、Grafana、Exporter 與 Alertmanager 告警](https://ithelp.ithome.com.tw/articles/10418598)
 
 本日沿用 Day 16 已建立的 monitor01，安裝 Prometheus、Grafana 與 Alertmanager，收集 Linux、Patroni、PostgreSQL、HAProxy，並從公開 Hostname 探測 Day 27 建立的 Cloudflare HTTPS。本次以單台 VM 完成監控流程，監控平台高可用性列為正式環境延伸。
 

@@ -13,7 +13,7 @@
   </style>
 </head>
 <body><main><h1>Day 24｜PostgreSQL HA 叢集實作（下）：計畫性切換、故障切換與舊 Primary 安全回歸</h1>
-<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 24｜PostgreSQL HA 叢集實作（下）：計畫性切換、故障切換與舊 Primary 安全回歸</a></p>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/articles/10416307">Day 24｜PostgreSQL HA 叢集實作（下）：計畫性切換、故障切換與舊 Primary 安全回歸</a></p>
 <p>本日使用先前串流複寫實作建立的 <code>appdb.public.replication_demo</code> 測試資料。開始前要確認 3／3 etcd 與 3／3 Patroni 成員健康，並保存目前時間軸（Timeline）、Leader 與複寫狀態。</p>
 <blockquote>
 <p>額外量測：<a href="./DAY24_%E9%A1%8D%E5%A4%96%E5%AF%A6%E4%BD%9C_%E9%87%8F%E6%B8%ACFailover%E8%88%87Rejoin%E6%99%82%E9%96%93.md">Primary 故障切換與舊 Primary 重新加入時間</a></p>

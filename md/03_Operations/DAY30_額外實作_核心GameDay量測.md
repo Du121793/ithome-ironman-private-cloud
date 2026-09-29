@@ -1,5 +1,7 @@
 # Day 30 額外實作｜核心 Game Day 端到端量測
 
+對應文章：[Day 30｜最終驗收：用 Game Day 檢查安全邊界、服務切換與資料復原](https://ithelp.ithome.com.tw/articles/10419098)
+
 本文件接續 [Day 30｜最終驗收：用 Game Day 檢查安全邊界、服務切換與資料復原](./DAY30_最終GameDay.md)，執行正文新增證據的三項核心測試：
 
 - `C03／F10`：目前持有三組 VIP 的 Proxy VM 突然停止。

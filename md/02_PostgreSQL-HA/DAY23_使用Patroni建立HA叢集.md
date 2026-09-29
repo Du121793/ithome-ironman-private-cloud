@@ -1,6 +1,6 @@
 # Day 23｜PostgreSQL HA 叢集實作（上）：使用 Patroni 完成自動選主與狀態管理
 
-對應文章：[Day 23｜PostgreSQL HA 叢集實作（上）：使用 Patroni 完成自動選主與狀態管理](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 23｜PostgreSQL HA 叢集實作（上）：使用 Patroni 完成自動選主與狀態管理](https://ithelp.ithome.com.tw/articles/10415847)
 
 既有的手動串流複寫已完成教學目的。本日先保存邏輯備份與舊資料目錄，再建立新的 Patroni 資料目錄；後續由 Patroni 統一管理資料庫角色與生命週期。
 

@@ -1,6 +1,6 @@
 # Day 20｜準備 PostgreSQL HA 的三個資料庫節點：PostgreSQL 18、資料磁碟、TLS 與 SCRAM-SHA-256
 
-對應文章：[Day 20｜準備 PostgreSQL HA 的三個資料庫節點：PostgreSQL 18、資料磁碟、TLS 與 SCRAM-SHA-256](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 20｜準備 PostgreSQL HA 的三個資料庫節點：PostgreSQL 18、資料磁碟、TLS 與 SCRAM-SHA-256](https://ithelp.ithome.com.tw/articles/10414350)
 
 本日建立 pg01～pg03，逐台完成 Data Disk、PGDG Repository、PostgreSQL 18、名稱解析與 TLS，形成三台可獨立驗收的資料庫節點。
 
@@ -122,7 +122,7 @@ timedatectl
 
 完成後，在 pg02、pg03 逐台執行完全相同的指令。
 
-`10.77.30.1` 是 Database VLAN 上的 OPNsense Gateway。三台使用相同的內部時間來源，不依賴各自能否直接連到公用 NTP。新增 `opnsense.sources` 不需要刪除套件原有的來源；`prefer` 只表示可用時優先選擇 OPNsense。
+`10.77.30.1` 是 Database VLAN 上的 OPNsense Gateway。三台統一使用 OPNsense 作為優先時間來源，套件原有的來源可以保留；`prefer` 表示 OPNsense 可用時優先選用。
 
 檢查結果必須符合：
 
@@ -569,7 +569,7 @@ sudo journalctl -u postgresql -b -n 50 --no-pager
 
 圖（十三）重新啟動後，`18/main` 維持 online，資料目錄位於 `/var/lib/postgresql/18/main`，TLS 已啟用並使用預期的 pg_hba.conf。
 
-## 16. 建立本日管理 Role
+## 16. 建立本日登入角色
 
 操作位置：只在 pg01。
 
@@ -581,6 +581,7 @@ sudo -u postgres psql
 
 ```sql
 CREATE DATABASE appdb;
+REVOKE CONNECT ON DATABASE appdb FROM PUBLIC;
 CREATE ROLE dba_admin LOGIN;
 \password dba_admin
 GRANT CONNECT ON DATABASE appdb TO dba_admin;
@@ -588,9 +589,9 @@ GRANT CONNECT ON DATABASE appdb TO dba_admin;
 \q
 ```
 
-使用 `\password` 互動輸入，避免把密碼寫進 Shell History。本日以 `dba_admin` 完成管理角色基線。
+使用 `\password` 互動輸入，避免把密碼寫進 Shell History。本日先撤銷 `PUBLIC` 的預設連線權限，再以 `dba_admin` 完成登入角色基線。
 
-![pg01 建立 appdb 與 dba_admin 管理角色](../../source/Day20/day20-fig14.png)
+![pg01 建立 appdb 與 dba_admin 登入角色](../../source/Day20/day20-fig14.png)
 
 圖（十四）pg01 建立 `appdb` 與具備 LOGIN 的 `dba_admin`，並授予該角色資料庫 CONNECT 權限。
 

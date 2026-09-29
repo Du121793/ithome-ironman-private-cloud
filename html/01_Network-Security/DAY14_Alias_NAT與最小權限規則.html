@@ -13,7 +13,7 @@
   </style>
 </head>
 <body><main><h1>Day 14｜從預設拒絕到最小權限：OPNsense 防火牆的別名與規則順序</h1>
-<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 14｜從預設拒絕到最小權限：OPNsense 防火牆的別名與規則順序</a></p>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/articles/10410151">Day 14｜從預設拒絕到最小權限：OPNsense 防火牆的別名與規則順序</a></p>
 <p>Day 14 會實際建立 Alias 與 VLAN 的基礎規則。由於 proxy、PostgreSQL、jump01 等 VM 還沒有建立，服務專屬的跨區規則、WAN NAT 與連線測試只記錄規格，不在今天啟用。</p>
 <p>今天也不在尚未完成規則前修改 PVE Default Gateway。Day 15 會先新增 <code>PVE_NODES</code> Alias 與 LAN 出口規則，再逐台將 pve01～pve03 切到 Management VLAN 10。</p>
 <h2>1. 建立 INTERNAL_NETWORKS</h2>

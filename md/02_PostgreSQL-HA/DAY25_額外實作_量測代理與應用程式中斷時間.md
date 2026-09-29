@@ -1,5 +1,7 @@
 # Day 25 額外實作｜量測代理與應用程式中斷時間
 
+對應文章：[Day 25｜為 Web 與資料庫建立服務入口：Nginx 負載平衡、TLS 邊界與 HAProxy 讀寫分流](https://ithelp.ithome.com.tw/articles/10416821)
+
 本文件接續 [Day 25 主實作](./DAY25_Nginx_HAProxy與WebBackend.md)，量測兩個使用者實際會遇到的結果：
 
 1. `app01` 停止服務時，經 Nginx 存取 Web 服務是否出現可見中斷。

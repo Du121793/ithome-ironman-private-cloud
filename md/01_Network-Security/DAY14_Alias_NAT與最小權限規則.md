@@ -1,6 +1,6 @@
 # Day 14｜從預設拒絕到最小權限：OPNsense 防火牆的別名與規則順序
 
-對應文章：[Day 14｜從預設拒絕到最小權限：OPNsense 防火牆的別名與規則順序](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 14｜從預設拒絕到最小權限：OPNsense 防火牆的別名與規則順序](https://ithelp.ithome.com.tw/articles/10410151)
 
 Day 14 會實際建立 Alias 與 VLAN 的基礎規則。由於 proxy、PostgreSQL、jump01 等 VM 還沒有建立，服務專屬的跨區規則、WAN NAT 與連線測試只記錄規格，不在今天啟用。
 

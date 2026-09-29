@@ -1,6 +1,6 @@
 # Day 27 額外實作｜公開 HTTPS 驗證與故障恢復量測
 
-對應文章：[Day 27｜將私有雲服務安全發布至網際網路：Cloudflare DNS、CDN、WAF 與 Full (strict)](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 27｜將私有雲服務安全發布至網際網路：Cloudflare DNS、CDN、WAF 與 Full (strict)](https://ithelp.ithome.com.tw/articles/10417717)
 
 本文件接續 Day 27 主實作，驗證公開 DNS、Cloudflare 代理、兩段 TLS、Origin 保護、真實用戶端 IP、Web VIP 故障接管與 WAF。主實作負責完成建置；本文件負責留下可重現的正向、負向與故障恢復證據。
 

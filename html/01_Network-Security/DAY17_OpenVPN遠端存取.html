@@ -13,7 +13,7 @@
   </style>
 </head>
 <body><main><h1>Day 17｜外部人員如何安全連入內部服務？OpenVPN、Road Warrior 與 Split Tunnel</h1>
-<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 17｜外部人員如何安全連入內部服務？OpenVPN、Road Warrior 與 Split Tunnel</a></p>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/articles/10412460">Day 17｜外部人員如何安全連入內部服務？OpenVPN、Road Warrior 與 Split Tunnel</a></p>
 <p>本日建立 OPNsense OpenVPN Road Warrior。Tunnel Network 固定為 <code>10.77.60.0/24</code>。一般 VPN 使用者只能連固定服務入口；只有獨立 <code>vpn-admin</code> 群組可以連 PVE Web UI 8006，而且仍不能直接連 pg01～pg03、Patroni 或 etcd。</p>
 <h2>1. 確認內建 OpenVPN 功能</h2>
 <p>OPNsense 26.7 已將 OpenVPN 與新版 <code>Instances</code>、<code>Client Export</code> 功能整合在基礎系統。</p>

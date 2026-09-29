@@ -1,6 +1,6 @@
 # Day 26｜讓代理節點故障後自動接管：Keepalived、VRRP 與三組高可用 VIP
 
-對應文章：[Day 26｜讓代理節點故障後自動接管：Keepalived、VRRP 與三組高可用 VIP](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 26｜讓代理節點故障後自動接管：Keepalived、VRRP 與三組高可用 VIP](https://ithelp.ithome.com.tw/articles/10417280)
 
 本日由 proxy01／02 提供三組獨立 VIP：Web `10.77.20.10`、DB RW `10.77.20.11`、DB RO `10.77.20.12`。VIP 不配置在 OPNsense。
 

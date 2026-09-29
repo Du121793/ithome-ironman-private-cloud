@@ -1,6 +1,6 @@
 # Day 13｜從 VLAN 到安全區域：802.1Q、跨網段路由與 OPNsense 介面
 
-對應文章：[Day 13｜從 VLAN 到安全區域：802.1Q、跨網段路由與 OPNsense 介面](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 13｜從 VLAN 到安全區域：802.1Q、跨網段路由與 OPNsense 介面](https://ithelp.ithome.com.tw/articles/10409827)
 
 本日讓 OPNsense 的 `vtnet2` 承載 VLAN 20～50。Management 使用獨立 `vtnet1`，不在 Trunk 上重複建立 VLAN 10。
 

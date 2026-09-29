@@ -1,6 +1,6 @@
 # Day 27｜將私有雲服務安全發布至網際網路：Cloudflare DNS、CDN、WAF 與 Full (strict)
 
-對應文章：[Day 27｜將私有雲服務安全發布至網際網路：Cloudflare DNS、CDN、WAF 與 Full (strict)](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 27｜將私有雲服務安全發布至網際網路：Cloudflare DNS、CDN、WAF 與 Full (strict)](https://ithelp.ithome.com.tw/articles/10417717)
 
 完成建置後，可接著執行 [Day 27 額外實作｜公開 HTTPS 驗證與故障恢復量測](./DAY27_額外實作_公開HTTPS驗證與故障恢復量測.md)，補齊完整證據鏈與恢復時間。
 

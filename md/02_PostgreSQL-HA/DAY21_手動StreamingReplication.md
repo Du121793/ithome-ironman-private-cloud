@@ -1,6 +1,6 @@
 # Day 21｜讓三台 PostgreSQL 保持資料同步：串流複寫、WAL、複寫槽與熱待命
 
-對應文章：[Day 21｜讓三台 PostgreSQL 保持資料同步：串流複寫、WAL、複寫槽與熱待命](https://ithelp.ithome.com.tw/users/20183351/ironman/9461)
+對應文章：[Day 21｜讓三台 PostgreSQL 保持資料同步：串流複寫、WAL、複寫槽與熱待命](https://ithelp.ithome.com.tw/articles/10414669)
 
 本日以 pg01 為主節點（Primary），pg02／pg03 為實體待命節點（Physical Standby），先理解 WAL、LSN、複寫槽（Replication Slot）與同步狀態。完成原生複寫觀察後，後續會重建為 Patroni 管理的叢集。
 

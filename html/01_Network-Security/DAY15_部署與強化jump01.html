@@ -13,7 +13,7 @@
   </style>
 </head>
 <body><main><h1>Day 15｜SSH 跳板機的部署與權限設計（上）：Linux 路由切換與建立安全入口</h1>
-<p>對應文章：<a href="https://ithelp.ithome.com.tw/users/20183351/ironman/9461">Day 15｜SSH 跳板機的部署與權限設計（上）：Linux 路由切換與建立安全入口</a></p>
+<p>對應文章：<a href="https://ithelp.ithome.com.tw/articles/10410985">Day 15｜SSH 跳板機的部署與權限設計（上）：Linux 路由切換與建立安全入口</a></p>
 <p>本日先將 pve01～pve03 的預設出口從現有路由器切換到 OPNsense，再建立 VMID <code>231</code>、IP <code>10.77.50.11/24</code> 的 jump01。WAN 使用 TCP <code>45222</code> 轉送到 jump01 TCP <code>22</code>。</p>
 <h2>1. 切換三台 PVE 的對外出口</h2>
 <p>Day 03～15 使用現有路由器是為了在 OPNsense 尚未完成時安裝、建立 Cluster 與保留救援路徑，不是長期安全架構。Day 14 已完成 OPNsense VLAN、Alias 與基礎規則，現在把三台 L1 PVE 的 Default Gateway 切到 VLAN 10，讓它們的 DNS、NTP 與套件更新經過 OPNsense。</p>
